@@ -63,6 +63,34 @@ def build() -> dict:
         raise SystemExit(f"Could not find {AGENT_SRC}")
     agent_body = AGENT_SRC.read_text()
 
+    # Fail fast (with a clear message) if the PRIVATE hybrid-lib-wheel dataset
+    # was not attached as a notebook Input. It must be added via the kernel's
+    # dataset_sources (kernel-metadata.json) so Kaggle mounts it at
+    # /kaggle/input/hybrid-lib-wheel — never fetched from a kaggle.com URL,
+    # since internet is disabled at runtime. This turns a cryptic pip error
+    # into an actionable one and lists exactly which wheel was found.
+    verify_dataset_cell = code_cell(
+        dedent(
+            """\
+            import glob, os
+
+            WHEEL_DIR = '/kaggle/input/hybrid-lib-wheel'
+            assert os.path.isdir(WHEEL_DIR), (
+                f'{WHEEL_DIR} is not mounted. The private dataset '
+                \"'kethansaikoneru/hybrid-lib-wheel' must be attached as an Input \"
+                '(kernel-metadata.json -> dataset_sources). Do NOT use a '
+                'kaggle.com URL: runtime internet is disabled.'
+            )
+            wheels = sorted(glob.glob(os.path.join(WHEEL_DIR, '*.whl')))
+            assert wheels, (
+                f'No .whl found in {WHEEL_DIR}. Contents: {os.listdir(WHEEL_DIR)}. '
+                'Re-upload the dataset with hybrid_lib-<version>-py3-none-any.whl.'
+            )
+            print('hybrid-lib wheel(s) available offline:', wheels)
+            """
+        )
+    )
+
     install_cell = code_cell(
         "!pip install --no-index --find-links \\\n"
         "    /kaggle/input/competitions/arc-prize-2026-arc-agi-3/arc_agi_3_wheels \\\n"
@@ -191,6 +219,7 @@ def build() -> dict:
                 "Do not edit cells directly — edit the source file and re-run "
                 "`make submit`."
             ),
+            verify_dataset_cell,
             install_cell,
             write_agent_cell,
             run_cell,
