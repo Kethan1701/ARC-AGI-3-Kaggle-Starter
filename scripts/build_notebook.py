@@ -66,7 +66,10 @@ def build() -> dict:
     install_cell = code_cell(
         "!pip install --no-index --find-links \\\n"
         "    /kaggle/input/competitions/arc-prize-2026-arc-agi-3/arc_agi_3_wheels \\\n"
-        "    arc-agi python-dotenv"
+        "    arc-agi python-dotenv\n"
+        "!pip install --no-index --find-links \\\n"
+        "    /kaggle/input/hybrid-lib-wheel \\\n"
+        "    hybrid-lib"
     )
 
     # We write the agent to /tmp/ (not /kaggle/working/) so it does NOT appear
