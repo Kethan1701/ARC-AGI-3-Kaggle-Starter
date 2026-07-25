@@ -131,13 +131,15 @@ twice.
 
 ### Choosing an accelerator
 
-The notebook is generated with a **T4 GPU** by default (matches Kaggle's
-sample submission). To change it, open
+This kit's agent is a pure-Python search with no model, so the notebook
+is generated for **CPU**. Asking for a GPU it never touches would consume
+GPU quota and add a provisioning failure mode to every run for no gain.
+To change it, open
 [`scripts/build_notebook.py`](scripts/build_notebook.py) and edit **one
 line** near the top:
 
 ```python
-ACCELERATOR = "t4"     # change "t4" to one of: cpu, t4, p100, rtx6000
+ACCELERATOR = "cpu"    # change "cpu" to one of: cpu, t4, p100, rtx6000
 ```
 
 Then re-run `make submit`. That's it — both the notebook metadata and
@@ -146,8 +148,8 @@ updated automatically.
 
 | Value | Hardware | When to use |
 |---|---|---|
-| `"cpu"` | No GPU | The random starter, or any non-ML agent |
-| `"t4"` | Nvidia T4 ×2 | **Default.** Small models, fast iteration |
+| `"cpu"` | No GPU | **Default.** The random starter, or any non-ML agent — including this kit's search agent |
+| `"t4"` | Nvidia T4 ×2 | Small models, fast iteration |
 | `"p100"` | Nvidia P100 | Single big-memory GPU |
 | `"rtx6000"` | Nvidia RTX 6000 (`g4-standard-48`) | Heavy ML; **ARC-AGI-3 exclusive**, burns GPU quota faster |
 
