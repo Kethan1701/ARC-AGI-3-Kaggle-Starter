@@ -561,7 +561,8 @@ class MyAgent(Agent):
         if frame.guid:
             self.guid = frame.guid
         if (
-            self._recorded < KEEP_RECORDINGS
+            KEEP_RECORDINGS
+            and self._recorded < KEEP_RECORDINGS
             and hasattr(self, "recorder")
             and not self.is_playback
         ):
