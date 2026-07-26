@@ -121,6 +121,7 @@ import os
 import random
 import time
 from collections import Counter, deque
+from itertools import chain
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
@@ -559,6 +560,9 @@ class MyAgent(Agent):
         self._steps = 0
         self._recorded = 0
         self._graph_full = False
+        # Last raw frame and its conversion; see _convert_raw_frame_data.
+        self._raw_seen: Any = None
+        self._frame_seen: Optional[FrameData] = None
 
         # --- exploit/replay ------------------------------------------
         # Shortest known action sequence for each level index, harvested
@@ -609,7 +613,11 @@ class MyAgent(Agent):
     ) -> GameAction:
         self._steps += 1
         grid = grid_of(latest_frame)
-        flat = tuple(value for row in grid for value in row)
+        # 4096 cells per action, and under the GIL every agent thread is
+        # competing for one core: chain.from_iterable does this in C,
+        # where the equivalent generator expression cost ~8% of total run
+        # time in 4096 x N interpreter steps.
+        flat = tuple(chain.from_iterable(grid))
 
         # 0. Once the HUD mask is known, every node id computed before it
         #    was keyed on different cells, so the graph has to be dropped.
@@ -726,6 +734,29 @@ class MyAgent(Agent):
             action, data=dict(self._pending_data), reasoning=self._pending_reasoning
         )
         return self._convert_raw_frame_data(raw)
+
+    def _convert_raw_frame_data(self, raw: Any) -> FrameData:
+        """Convert once per raw frame, not twice.
+
+        `Agent.main()` converts `arc_env.observation_space` to build the
+        `latest_frame` argument, and `do_action_request` converts the
+        object `step()` returned. `EnvironmentWrapper.step()` stores that
+        very object as `_last_response`, which `observation_space` hands
+        back -- so the two calls are given the identical raw frame and
+        rebuild the identical model.
+
+        That rebuild is not cheap: it copies 4096 cells out of numpy and
+        pays pydantic validation, together ~20% of the run. Memoizing the
+        last one halves it. The check is identity against the retained
+        object rather than `id()`, so a freed frame's address cannot be
+        reused by a later one and alias to a stale conversion.
+        """
+        if raw is not None and self._raw_seen is raw:
+            return self._frame_seen
+        converted = super()._convert_raw_frame_data(raw)
+        self._raw_seen = raw
+        self._frame_seen = converted
+        return converted
 
     # -- internals ----------------------------------------------------
     def _emit(
