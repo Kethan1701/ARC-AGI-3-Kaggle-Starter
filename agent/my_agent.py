@@ -72,34 +72,41 @@ maps the state space to find level 1 spends thousands of actions on a
 22-action level and scores (22/5000)^2*100 ~= 0.002. Completing a level
 is worth almost nothing; completing it *quickly* is worth everything.
 
-Two further facts make this recoverable, both verified by experiment
-against the installed engine rather than assumed:
+There is no way to buy that back with a second attempt. The Kaggle
+gateway runs `arc_agi.api.RestAPI` with `competition_mode=True`, and
+that flag turns off both halves of the obvious exploit (verified against
+the real Flask app in `tests/test_competition_rules.py`):
 
-* A game's environment score is `max(run.score for run in runs)` --
-  the best attempt, not the last or the mean. Extra attempts are free:
-  a bad run can never lower the score.
-* `Card.inc_play_count` starts a new run, with a ZEROED action counter,
-  whenever a RESET arrives with `full_reset` set. `BaseGame.handle_reset`
-  sets it when `_action_count == 0`, and `level_reset()` -> `set_level()`
-  zeroes `_action_count`. So RESET twice in a row always opens a fresh,
-  independently-scored run.
-* Replay is deterministic: the same action sequence from a full reset
-  reproduces the same frames (checked on ls20, vc33 and tu93).
+* `_get_or_create_environment` returns None once the scorecard already
+  has the game, so there is exactly ONE run per game and
+  `max(run.score for run in runs)` has a single candidate. Extra
+  attempts are not free, they are impossible.
+* A RESET sent when `_action_count == 0` -- exactly the condition
+  `BaseGame.handle_reset` uses to choose `full_reset()` -- is swallowed
+  by the server, which returns `g.observation_space` without stepping
+  the game, and still bills an action. So "RESET twice to open a fresh
+  run" cannot open one, and costs an action each time it tries.
 
-So the agent explores to *learn* and then replays to *score*:
+Note what this means for measurement: any harness that drives the
+environment wrapper directly, `scripts/score_local.py` included, never
+executes `api.py` and therefore never applies these rules. Two
+submissions measured 0.053 and 2.10 that way and both scored exactly
+0.19 on the leaderboard. Use `scripts/score_competition.py`, which
+stands up the genuine gateway with competition rules on.
 
-  a. While solving a level, record every observed transition into a
-     solution graph rooted at the node the level started from.
-  b. The moment the level falls, BFS that graph for the SHORTEST route
-     from the level's start node to the state the winning action was
-     taken in. Keep only that action sequence, then drop the graph.
-  c. When exploration stalls, RESET twice to open a fresh run, replay
-     the banked routes to arrive at the frontier level having spent
-     near-baseline actions, and explore onward from there.
+So the only thing that scores is finishing a level near baseline on the
+first and only pass, and the search is tuned for billed actions rather
+than coverage:
 
-Step (c) compounds: each cycle banks one more level cheaply, and the
-levels already banked keep their good action counts because scoring
-splits a run's actions at each level transition.
+  a. Probe at most `BREADTH_INITIAL` candidates at a node before moving
+     on, and widen only when every reachable node is exhausted -- a node
+     offers ~117 codes and draining them is rarely where the answer is.
+  b. Repeat an action that just reached a new state (`MOMENTUM_LIMIT`
+     times at most). Corridors, pushes and falls all reward repetition,
+     and a pure state-graph search throws that hint away every step.
+  c. Keep the solution graph and the BFS route extraction. They cost no
+     actions, and they are what a within-level retry would replay if the
+     rules ever allow one again (`ARC_ENABLE_CYCLE=1`).
 
 --------------------------------------------------------------------
 MEMORY
@@ -186,15 +193,55 @@ RUN_BUDGET_SECONDS = _env_float("ARC_RUN_BUDGET_SECONDS", 7.5 * 3600)
 # `is_done`; this is only a runaway guard.
 #
 # `Agent.main()` loops on `action_counter <= MAX_ACTIONS`, so this is a
-# HARD stop that silently ends the game early if it binds first. At the
-# throughput 25 concurrent games actually sustain, 250k was reached in
-# well under an hour and threw away most of the budget -- and since
-# levels reached is now the binding constraint on score, those discarded
-# hours were the difference between one level and three.
+# HARD stop that silently ends the game early if it binds first. Left high
+# because a low cap can only lose levels; on Kaggle the binding constraint
+# is the 9h wall clock against ~55 actions/s of gateway round-trips, not
+# this number.
 MAX_ACTIONS_PER_GAME = _env_int("ARC_MAX_ACTIONS", 5_000_000)
+
+# Replaying a banked route into a *fresh scored run* is worthless on Kaggle
+# and actively harmful, so it is off by default. Two facts, both verified
+# against the real `arc_agi.api` with `competition_mode=True`:
+#
+#   * `_get_or_create_environment` returns None once the scorecard already
+#     has the game, so there is exactly one run per game and
+#     `max(run.score for run in runs)` has a single candidate.
+#   * a RESET sent when `_action_count == 0` -- precisely the condition
+#     `arcengine.base_game.handle_reset` uses to choose `full_reset()` --
+#     is swallowed by the server (`response = g.observation_space`, the
+#     game is never stepped) yet still bills an action.
+#
+# So the cycle can never open the fresh run it exists to open, and every
+# attempt costs an action against the level being scored. Set
+# ARC_ENABLE_CYCLE=1 only when playing a non-competition scorecard.
+ENABLE_CYCLE = _env_int("ARC_ENABLE_CYCLE", 0)
 
 # Object-derived click targets considered per distinct frame.
 MAX_CLICK_CANDIDATES = _env_int("ARC_MAX_CLICKS", 48)
+
+# How many candidates a node may consume before we move on, and the ceiling
+# it deepens to. A node offers ~117 codes (a few simple actions, up to 48
+# object clicks, then a 64-point lattice sweep), and the old search drained
+# all of them before routing anywhere else. Under competition rules that is
+# the single largest source of waste: every probe is billed against the
+# level being scored, and the metric is quadratic, so ls20 finishing level 1
+# in 983 actions against a 22-action baseline scores 0.05 out of 100.
+#
+# Breadth-first over the *first few* candidates at many nodes finds the
+# productive action far cheaper than draining one node, and nothing is lost
+# permanently: when every reachable node is exhausted the breadth doubles
+# and the same nodes reopen, with cursors still valid because candidate
+# order is a pure function of the grid.
+BREADTH_INITIAL = _env_int("ARC_BREADTH", 12)
+BREADTH_MAX = _env_int("ARC_BREADTH_MAX", 256)
+
+# Consecutive repeats of an action that keeps producing new states. Bounded
+# so a game that animates forever cannot turn momentum into an infinite
+# walk that never returns to systematic search.
+MOMENTUM_LIMIT = _env_int("ARC_MOMENTUM", 16)
+
+# Shared empty mapping for `_edges` lookups on unmapped nodes.
+EMPTY_EDGES: dict[int, int] = {}
 
 # Coarse fallback sweep, tried only after every object click has been
 # tried from a node: stride 8 over 64x64 => 64 extra targets.
@@ -553,6 +600,11 @@ class MyAgent(Agent):
         # --- the learned state graph, two ints + edges per node ------
         self._total: dict[int, int] = {}          # node -> candidate count
         self._cursor: dict[int, int] = {}         # node -> next index to try
+        self._breadth = BREADTH_INITIAL           # candidates per node, deepens
+        self._why_counts: Counter[str] = Counter()  # billed actions by reason
+        self._last_code: Optional[int] = None     # code of the previous action
+        self._last_productive = False             # ...and did it reach a new state
+        self._momentum = 0                        # consecutive repeats so far
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
@@ -791,7 +843,26 @@ class MyAgent(Agent):
         else:
             self._pending_data = {"game_id": "", "x": x, "y": y}
         self._pending_reasoning = {"why": why}
+        self._why_counts[why] += 1
         return GameAction.from_id(action_id)
+
+    def _report_budget(self, tag: str) -> None:
+        """Log where the level's billed actions actually went.
+
+        Under competition rules every action is charged against the level
+        being scored, so this breakdown is the only honest guide to what to
+        optimise -- guessing produced a 'fix' that changed nothing.
+        """
+        if not self._why_counts:
+            return
+        mix = " ".join(
+            f"{why}={n}" for why, n in self._why_counts.most_common()
+        )
+        logger.info(
+            "%s: %s after %d actions (breadth=%d, nodes=%d) | %s",
+            self.game_id, tag, self._steps, self._breadth, len(self._total), mix,
+        )
+        self._why_counts.clear()
 
     def _observe(self, node: int, latest_frame: FrameData) -> None:
         """Fold the outcome of the previous action into the graph."""
@@ -804,6 +875,7 @@ class MyAgent(Agent):
             self._begin_level(node)
 
         if levels != self._level:
+            self._report_budget(f"left level {self._level} for {levels}")
             if levels > self._level and pending is not None:
                 # The action we are being shown the result of is the one
                 # that beat the level, so it is the last step of the route.
@@ -863,12 +935,27 @@ class MyAgent(Agent):
         if prev_node in self._total:
             self._edges.setdefault(prev_node, {})[code] = node
 
+        # A code that just moved us somewhere genuinely new is the single
+        # best hint available about which direction this game rewards.
+        # Systematic search discards that hint the moment it lands, and on a
+        # movement game that means re-deriving the same direction at every
+        # node along a corridor.
+        # `_total` gains `node` later, in `_candidates`, so "not in `_total`"
+        # is exactly "never expanded before" -- no extra bookkeeping needed.
+        self._last_code = code
+        self._last_productive = node != prev_node and node not in self._total
+
     def _begin_level(self, node: int) -> None:
         """Root a fresh solution graph at the state the level starts in."""
         self._sol_edges = {}
         self._sol_start = node
         self._sol_full = False
         self._sol_count = 0
+        # Each level is scored on its own actions, so each level gets its own
+        # cheap-first search. Carrying a widened breadth across a level
+        # boundary would spend the new level's budget at the old level's
+        # difficulty.
+        self._breadth = BREADTH_INITIAL
 
     def _harvest(self, level: int, winning: tuple[int, int]) -> None:
         """Extract and bank the shortest route through a level just beaten.
@@ -1024,7 +1111,9 @@ class MyAgent(Agent):
         return codes
 
     def _has_untried(self, node: int) -> bool:
-        return self._cursor.get(node, 0) < self._total.get(node, 0)
+        return self._cursor.get(node, 0) < min(
+            self._total.get(node, 0), self._breadth
+        )
 
     def _select(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
@@ -1057,8 +1146,26 @@ class MyAgent(Agent):
         #     available, so take it. The cursor is why this works with
         #     only an int per node: `codes` is deterministic for a grid,
         #     so index i always means the same action.
+        # (b0) Momentum. If the last action landed us somewhere new, try it
+        #      again before anything else. Corridors, pushes and falls all
+        #      reward repetition, and this costs nothing when it is wrong:
+        #      the outcome is recorded either way, and `_edges` already
+        #      holds the answer for any code tried from this node, so we
+        #      never pay twice for the same probe.
+        if (
+            self._last_productive
+            and self._momentum < MOMENTUM_LIMIT
+            and self._last_code is not None
+            and self._last_code not in self._edges.get(node, EMPTY_EDGES)
+            and (node, self._last_code) not in self._fatal
+        ):
+            self._momentum += 1
+            self._stuck_steps = 0
+            return self._last_code, "momentum"
+        self._momentum = 0
+
         index = self._cursor.get(node, 0)
-        if index < len(codes) and node in self._total:
+        if index < min(len(codes), self._breadth) and node in self._total:
             self._cursor[node] = index + 1
             self._stuck_steps = 0
             return codes[index], "probe-untried"
@@ -1089,6 +1196,22 @@ class MyAgent(Agent):
             if self._replayable():
                 self._start_cycle()
                 return encode_action(_RESET_ID, None, None), "exploit-cycle"
+
+            # Exhausted only at the current breadth. Widening reopens every
+            # node we shallow-probed, and costs nothing but the widening
+            # itself -- cursors stay valid because candidate order is a pure
+            # function of the grid, so index i still means action i. This is
+            # strictly better than the RESET below, which throws away a map
+            # that took thousands of billed actions to build.
+            if self._breadth < BREADTH_MAX:
+                self._breadth = min(self._breadth * 2, BREADTH_MAX)
+                self._stuck_steps = 0
+                logger.info(
+                    "%s: map exhausted after %d actions; widening breadth to %d",
+                    self.game_id, self._steps, self._breadth,
+                )
+                return self._select(node, grid, latest_frame)
+
             logger.info(
                 "%s: reachable map exhausted after %d actions; re-exploring",
                 self.game_id, self._steps,
@@ -1119,7 +1242,10 @@ class MyAgent(Agent):
         return route
 
     def _replayable(self) -> bool:
-        return 0 in self._solutions
+        # Gating here disables both cycle entry points at once: the
+        # post-harvest branch and the exhausted-map branch each require a
+        # replayable route before they will spend a RESET.
+        return bool(ENABLE_CYCLE) and 0 in self._solutions
 
     def _start_cycle(self) -> None:
         """Open a fresh scored run and queue the banked route into it."""
