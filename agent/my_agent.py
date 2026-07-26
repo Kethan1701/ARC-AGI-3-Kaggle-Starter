@@ -59,6 +59,49 @@ already known:
    instead of being rediscovered.
 
 --------------------------------------------------------------------
+SCORING -- why exploration alone scores ~0
+--------------------------------------------------------------------
+Read `arc_agi/scorecard.py` before changing any of this. The metric is
+NOT "levels completed"; it is efficiency, and it is quadratic:
+
+    level_score = min((baseline_actions / actions_taken) ** 2 * 100, 115)
+
+`baseline_actions` ships in each game's `metadata.json` and is small --
+ls20's seven levels are [22, 123, 73, 84, 96, 192, 186]. A run that
+maps the state space to find level 1 spends thousands of actions on a
+22-action level and scores (22/5000)^2*100 ~= 0.002. Completing a level
+is worth almost nothing; completing it *quickly* is worth everything.
+
+Two further facts make this recoverable, both verified by experiment
+against the installed engine rather than assumed:
+
+* A game's environment score is `max(run.score for run in runs)` --
+  the best attempt, not the last or the mean. Extra attempts are free:
+  a bad run can never lower the score.
+* `Card.inc_play_count` starts a new run, with a ZEROED action counter,
+  whenever a RESET arrives with `full_reset` set. `BaseGame.handle_reset`
+  sets it when `_action_count == 0`, and `level_reset()` -> `set_level()`
+  zeroes `_action_count`. So RESET twice in a row always opens a fresh,
+  independently-scored run.
+* Replay is deterministic: the same action sequence from a full reset
+  reproduces the same frames (checked on ls20, vc33 and tu93).
+
+So the agent explores to *learn* and then replays to *score*:
+
+  a. While solving a level, record every observed transition into a
+     solution graph rooted at the node the level started from.
+  b. The moment the level falls, BFS that graph for the SHORTEST route
+     from the level's start node to the state the winning action was
+     taken in. Keep only that action sequence, then drop the graph.
+  c. When exploration stalls, RESET twice to open a fresh run, replay
+     the banked routes to arrive at the frontier level having spent
+     near-baseline actions, and explore onward from there.
+
+Step (c) compounds: each cycle banks one more level cheaply, and the
+levels already banked keep their good action counts because scoring
+splits a run's actions at each level transition.
+
+--------------------------------------------------------------------
 MEMORY
 --------------------------------------------------------------------
 25 games run concurrently for hours, so per-node storage has to be tiny.
@@ -116,7 +159,14 @@ RUN_BUDGET_SECONDS = _env_float("ARC_RUN_BUDGET_SECONDS", 7.5 * 3600)
 # value: locally the engine sustains >200 actions/sec, so 80 actions is
 # ~0.4 seconds of a 9-hour budget. Real termination is the deadline in
 # `is_done`; this is only a runaway guard.
-MAX_ACTIONS_PER_GAME = _env_int("ARC_MAX_ACTIONS", 250_000)
+#
+# `Agent.main()` loops on `action_counter <= MAX_ACTIONS`, so this is a
+# HARD stop that silently ends the game early if it binds first. At the
+# throughput 25 concurrent games actually sustain, 250k was reached in
+# well under an hour and threw away most of the budget -- and since
+# levels reached is now the binding constraint on score, those discarded
+# hours were the difference between one level and three.
+MAX_ACTIONS_PER_GAME = _env_int("ARC_MAX_ACTIONS", 5_000_000)
 
 # Object-derived click targets considered per distinct frame.
 MAX_CLICK_CANDIDATES = _env_int("ARC_MAX_CLICKS", 48)
@@ -197,6 +247,24 @@ MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 # RECORDINGS_DIR is consumed only by the framework's `Playback` agent.
 FRAME_HISTORY = _env_int("ARC_FRAME_HISTORY", 8)
 KEEP_RECORDINGS = _env_int("ARC_KEEP_RECORDINGS", 0)
+
+# --- exploit/replay (see the SCORING section of the module docstring) --
+#
+# Transitions observed on the level currently being solved, kept so the
+# shortest route through it can be recovered once it is beaten. This is
+# separate from the exploration graph (`_edges`), which gets dropped
+# whenever the search restarts; the solution graph must survive that.
+# Bounded because a level that is never solved would otherwise grow it
+# for the whole run. Counted in EDGES, not source nodes: one node can
+# hold ~116 of them, so a node-based cap understates the real footprint
+# by two orders of magnitude across 25 concurrent games.
+SOLUTION_EDGE_CAP = _env_int("ARC_SOL_EDGE_CAP", 150_000)
+
+# A replayed solution is re-verified as it executes. If the level does
+# not fall exactly where the recorded route says it should, the route is
+# stale (the state key is not fully Markovian for this game) and we drop
+# back to exploring rather than burning the run on a dead plan.
+REPLAY_STRICT = _env_int("ARC_REPLAY_STRICT", 1)
 
 _DEADLINE = time.monotonic() + RUN_BUDGET_SECONDS
 
@@ -492,6 +560,33 @@ class MyAgent(Agent):
         self._recorded = 0
         self._graph_full = False
 
+        # --- exploit/replay ------------------------------------------
+        # Shortest known action sequence for each level index, harvested
+        # when that level was first beaten.
+        self._solutions: dict[int, list[int]] = {}
+        # Transitions seen on the level being solved now, rooted at
+        # `_sol_start`. Survives `_reset_graph()`; cleared per level.
+        self._sol_edges: dict[int, dict[int, int]] = {}
+        self._sol_start: Optional[int] = None
+        self._sol_full = False
+        self._sol_count = 0
+        # Live level index (drops back to 0 on a full reset), as opposed
+        # to `_best_levels`, which is a high-water mark.
+        self._level = 0
+        # Queued RESETs used to open a fresh scored run, then the banked
+        # route being replayed into it.
+        self._resets_queued = 0
+        self._replay: deque[int] = deque()
+        # Level the replay expects to be on, so a stale route is caught
+        # the moment reality diverges.
+        self._replay_level = 0
+        self._cycles = 0
+        # Set when a level is banked for the FIRST time, which is exactly
+        # when a fresh run would score better than the one we are in.
+        # Re-banking the same level during a replay must not set it, or
+        # the agent would cycle forever without ever exploring.
+        self._want_cycle = False
+
     # -- framework hooks ---------------------------------------------
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -528,6 +623,11 @@ class MyAgent(Agent):
             )
             self._reset_graph()
             self._pending = None
+            # Every node id recorded so far was keyed on different cells,
+            # so the route through the current level is unrecoverable too.
+            # Banked routes are plain action sequences and stay valid.
+            self._sol_start = None
+            self._sol_edges = {}
 
         node = self._node_key(flat)
 
@@ -535,13 +635,50 @@ class MyAgent(Agent):
         #    exactly the frame we are being handed now.
         self._observe(node, latest_frame)
 
-        # 2. A dead or unstarted game can only be RESET.
+        # 2. A dead or unstarted game can only be RESET. Dying mid-replay
+        #    means the banked route no longer applies, so drop it.
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
             self._plan.clear()
+            self._replay.clear()
             self._pending = None
             return self._emit(_RESET_ID, None, None, "reset")
 
-        # 3. Decide.
+        # 3. Finish opening a fresh scored run. Two RESETs in a row always
+        #    produce one (see the SCORING section); the first may only
+        #    reset the level, but it zeroes the engine's action counter,
+        #    which is what makes the second a full reset.
+        if self._resets_queued > 0:
+            self._resets_queued -= 1
+            self._plan.clear()
+            self._pending = None
+            if self._resets_queued == 0:
+                # The game is about to jump back to the start of level 0.
+                # If we were already on level 0 the level counter does not
+                # move, so `_observe` would not re-root the solution graph
+                # and it would still point at a node from the old run.
+                self._sol_start = None
+                self._sol_edges = {}
+                self._sol_count = 0
+            return self._emit(_RESET_ID, None, None, "full-reset")
+
+        # 4. Replay a banked route, validating each step against the level
+        #    it was recorded on before trusting it.
+        while self._replay:
+            expected, code = self._replay[0]
+            if REPLAY_STRICT and expected != self._level:
+                logger.info(
+                    "%s: replay diverged at level %d (expected %d); "
+                    "dropping the route and exploring",
+                    self.game_id, self._level, expected,
+                )
+                self._replay.clear()
+                break
+            self._replay.popleft()
+            self._pending = (node, code)
+            action_id, x, y = decode_action(code)
+            return self._emit(action_id, x, y, "replay")
+
+        # 5. Decide.
         code, why = self._select(node, grid, latest_frame)
         self._pending = (node, code)
         action_id, x, y = decode_action(code)
@@ -603,7 +740,26 @@ class MyAgent(Agent):
 
     def _observe(self, node: int, latest_frame: FrameData) -> None:
         """Fold the outcome of the previous action into the graph."""
+        pending, self._pending = self._pending, None
         levels = latest_frame.levels_completed
+
+        # First frame of the run, or the state key just changed under us
+        # when the HUD mask was adopted: root the solution graph here.
+        if self._sol_start is None:
+            self._begin_level(node)
+
+        if levels != self._level:
+            if levels > self._level and pending is not None:
+                # The action we are being shown the result of is the one
+                # that beat the level, so it is the last step of the route.
+                self._harvest(self._level, pending)
+            elif levels < self._level:
+                # Only a full reset moves the counter backwards, and it
+                # puts us back at the start of level 0.
+                self._cycles += 1
+            self._level = levels
+            self._begin_level(node)
+
         if levels > self._best_levels:
             logger.info(
                 "%s: reached level %d at action %d (%d nodes mapped)",
@@ -616,7 +772,6 @@ class MyAgent(Agent):
             # proportional to the level being played, not the whole run.
             self._reset_graph()
 
-        pending, self._pending = self._pending, None
         if pending is None:
             return
         prev_node, code = pending
@@ -635,8 +790,87 @@ class MyAgent(Agent):
             self._plan.clear()
             return
 
+        # The solution graph records unconditionally -- including during a
+        # replay, and including nodes the explorer never budgeted -- because
+        # its only job is to make the route through this level recoverable.
+        if not self._sol_full:
+            outgoing = self._sol_edges.setdefault(prev_node, {})
+            if code not in outgoing:
+                outgoing[code] = node
+                self._sol_count += 1
+                if self._sol_count >= SOLUTION_EDGE_CAP:
+                    self._sol_full = True
+                    logger.info(
+                        "%s: solution-graph cap reached at action %d",
+                        self.game_id, self._steps,
+                    )
+
         if prev_node in self._total:
             self._edges.setdefault(prev_node, {})[code] = node
+
+    def _begin_level(self, node: int) -> None:
+        """Root a fresh solution graph at the state the level starts in."""
+        self._sol_edges = {}
+        self._sol_start = node
+        self._sol_full = False
+        self._sol_count = 0
+
+    def _harvest(self, level: int, winning: tuple[int, int]) -> None:
+        """Extract and bank the shortest route through a level just beaten.
+
+        `winning` is the (node, code) that ended it. The route is the
+        shortest path through the observed transitions from the level's
+        start node to that node, plus the winning action itself. Keeping
+        only this sequence -- not the graph -- is what bounds memory.
+        """
+        prev_node, code = winning
+        start = self._sol_start
+        if start is None:
+            return
+
+        path = self._shortest_path(start, prev_node)
+        if path is None:
+            return
+        route = path + [code]
+
+        previous = self._solutions.get(level)
+        if previous is not None and len(previous) <= len(route):
+            return
+        if previous is None:
+            self._want_cycle = True
+        self._solutions[level] = route
+        logger.info(
+            "%s: banked a %d-action route through level %d (action %d)",
+            self.game_id, len(route), level + 1, self._steps,
+        )
+
+    def _shortest_path(self, start: int, goal: int) -> Optional[list[int]]:
+        """BFS the solution graph for the fewest actions from start to goal."""
+        if start == goal:
+            return []
+        queue: deque[int] = deque([start])
+        came_from: dict[int, Optional[tuple[int, int]]] = {start: None}
+
+        while queue:
+            current = queue.popleft()
+            for code, nxt in self._sol_edges.get(current, {}).items():
+                if nxt in came_from:
+                    continue
+                came_from[nxt] = (current, code)
+                if nxt == goal:
+                    route: list[int] = []
+                    cursor: Optional[int] = goal
+                    while True:
+                        edge = came_from[cursor]
+                        if edge is None:
+                            break
+                        prev, taken = edge
+                        route.append(taken)
+                        cursor = prev
+                    route.reverse()
+                    return route
+                queue.append(nxt)
+        return None
 
     def _learn_mask(self, flat: tuple[int, ...], width: int, height: int) -> bool:
         """Accumulate change rates; freeze the HUD mask when ready.
@@ -740,6 +974,14 @@ class MyAgent(Agent):
     def _select(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
     ) -> tuple[int, str]:
+        # (0) A level was just banked for the first time. The run we are in
+        #     paid full exploration price for it; a fresh one replaying the
+        #     banked route pays near-baseline, and only the best run counts.
+        if self._want_cycle and self._replayable():
+            self._want_cycle = False
+            self._start_cycle()
+            return encode_action(_RESET_ID, None, None), "exploit-cycle"
+
         codes = self._candidates(node, grid, latest_frame)
 
         # (a) Follow a route to a frontier node, as long as reality still
@@ -785,6 +1027,13 @@ class MyAgent(Agent):
         # fatal set is cleared with it, edges wrongly pruned by a
         # step-budget death get another chance.
         if self._stuck_steps >= STUCK_REEXPLORE_AFTER:
+            # With routes banked, the far better move than re-exploring in
+            # place is to open a fresh run and replay into the frontier
+            # level: it costs the same restart but banks every level below
+            # at near-baseline action counts, which is where the score is.
+            if self._replayable():
+                self._start_cycle()
+                return encode_action(_RESET_ID, None, None), "exploit-cycle"
             logger.info(
                 "%s: reachable map exhausted after %d actions; re-exploring",
                 self.game_id, self._steps,
@@ -800,6 +1049,36 @@ class MyAgent(Agent):
             self._plan.clear()
             return encode_action(_RESET_ID, None, None), "stuck-reset"
         return self._random_code(latest_frame), "stuck-random"
+
+    def _banked_route(self) -> list[tuple[int, int]]:
+        """The contiguous replayable prefix, as [(level, code), ...].
+
+        A gap matters: level 3's route starts from wherever level 2 left
+        off, so it is only valid if every level below it is replayed too.
+        """
+        route: list[tuple[int, int]] = []
+        level = 0
+        while level in self._solutions:
+            route.extend((level, code) for code in self._solutions[level])
+            level += 1
+        return route
+
+    def _replayable(self) -> bool:
+        return 0 in self._solutions
+
+    def _start_cycle(self) -> None:
+        """Open a fresh scored run and queue the banked route into it."""
+        route = self._banked_route()
+        self._reset_graph()
+        self._stuck_steps = 0
+        self._replay = deque(route)
+        # One RESET is emitted by the caller; this is the second, which is
+        # the one that actually opens the new run.
+        self._resets_queued = 1
+        logger.info(
+            "%s: exploit cycle %d -- replaying %d actions to reach level %d",
+            self.game_id, self._cycles + 1, len(route), len(self._solutions),
+        )
 
     def _random_code(self, latest_frame: FrameData) -> int:
         live = [a for a in latest_frame.available_actions if a != _RESET_ID]
