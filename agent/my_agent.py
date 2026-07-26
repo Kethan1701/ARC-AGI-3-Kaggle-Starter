@@ -131,6 +131,30 @@ from agents.agent import Agent
 logger = logging.getLogger()
 
 
+# `Agent.main()` emits one INFO line per action on the ROOT logger, and
+# `arc_agi` installs a root handler, so those lines really are written.
+# At the stock 80-action cap that is 80 lines; with this agent's budget it
+# is millions per run across 25 games -- enough I/O to eat into the action
+# budget it is meant to report on, and enough output to risk tripping the
+# notebook's log limit. Only that one message is dropped; everything else,
+# including this agent's own progress logs, still comes through.
+#
+# The message is matched by content because the framework logs it through
+# the root logger, which this agent also uses -- there is no separate
+# logger to silence.
+class _DropPerActionLine(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "avg fps" not in record.getMessage()
+
+
+# Set ARC_KEEP_ACTION_LOG=1 to get the per-action line back for debugging.
+if not os.environ.get("ARC_KEEP_ACTION_LOG"):
+    try:
+        logger.addFilter(_DropPerActionLine())
+    except Exception:  # pragma: no cover - logging must never break the run
+        pass
+
+
 # ---------------------------------------------------------------------
 # Tuning. Every knob is env-overridable so a Kaggle run can be retuned
 # without editing (and re-uploading) code.
