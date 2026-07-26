@@ -53,6 +53,9 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 play-local: ## Run agent/my_agent.py against ALL games (or GAME=ls20 for a single one)
 	$(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)
 
+score: ## Score against the REAL leaderboard metric (efficiency, not levels)
+	$(VENV_PY) scripts/score_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS) --quiet
+
 verify-local: ## Quick smoke test: 50 steps on ls20 + vc33 only
 	$(VENV_PY) scripts/play_local.py --game ls20,vc33 --max-steps 50
 
