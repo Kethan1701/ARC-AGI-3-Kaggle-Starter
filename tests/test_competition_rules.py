@@ -12,6 +12,7 @@ ever change.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -213,6 +214,43 @@ def test_the_dead_action_record_survives_a_level_boundary():
     assert agent._is_dead(module.encode_action(1, None, None)) is True
     # ...and breadth still restarts cheap, which is a per-level property.
     assert agent._breadth == module.BREADTH_INITIAL
+
+
+def test_the_agent_seed_is_stable_across_processes():
+    """`hash()` of a str is salted per process (PEP 456), so seeding the
+    tie-break RNG from it silently re-randomised every run -- turning each
+    A/B into a comparison of two configs at two uncontrolled seeds. The
+    seed must depend only on the game id."""
+    import subprocess
+    import sys as _sys
+
+    src = (
+        "import zlib;"
+        "print(zlib.crc32(b'lp85-305b61c3') & 0xFFFFFFFF)"
+    )
+    seeds = set()
+    for salt in ("0", "1", "2"):
+        out = subprocess.run(
+            [_sys.executable, "-c", src],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": salt},
+            check=True,
+        )
+        seeds.add(out.stdout.strip())
+    assert len(seeds) == 1, f"seed varies with PYTHONHASHSEED: {seeds}"
+
+    # And the agent really uses that stable derivation.
+    module = _load_agent_class()
+    agent = module.MyAgent.__new__(module.MyAgent)
+    agent.game_id = "lp85-305b61c3"
+    expected = module.random.Random(
+        module.zlib.crc32(b"lp85-305b61c3") & 0xFFFFFFFF
+    ).random()
+    rng = module.random.Random(
+        module.zlib.crc32(agent.game_id.encode()) & 0xFFFFFFFF
+    )
+    assert rng.random() == expected
 
 
 def test_cycling_is_disabled_by_default():

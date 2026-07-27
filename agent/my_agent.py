@@ -127,6 +127,7 @@ import logging
 import os
 import random
 import time
+import zlib
 from collections import Counter, deque
 from itertools import chain
 from typing import Any, Optional
@@ -627,7 +628,17 @@ class MyAgent(Agent):
 
         # Deterministic per game, but different across games, so two
         # games don't tie-break identically for no reason.
-        self._rng = random.Random(hash(self.game_id) & 0xFFFFFFFF)
+        #
+        # crc32, not hash(): Python salts str hashing per process (PEP 456),
+        # so `hash(self.game_id)` seeded this differently on every single
+        # run. The agent looked deterministic -- candidate order is a pure
+        # function of the grid -- while the `stuck-random` path silently
+        # drew from a different stream each time. That made every A/B a
+        # comparison of two configs at two uncontrolled seeds: measured on
+        # lp85, whose level 1 spends 21% of its actions on `stuck-random`,
+        # the same code took 51, 67 and 235 actions on three runs. crc32 is
+        # stable across processes, so a run is now reproducible.
+        self._rng = random.Random(zlib.crc32(self.game_id.encode()) & 0xFFFFFFFF)
 
         # --- the learned state graph, two ints + edges per node ------
         self._total: dict[int, int] = {}          # node -> candidate count
