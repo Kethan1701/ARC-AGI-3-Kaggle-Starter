@@ -65,6 +65,75 @@ step 8 is the deliberate moment when you spend a daily submission.
 
 ---
 
+## Read this before optimising anything
+
+**The score is not "levels completed". It is efficiency, and it is
+quadratic.** From `arc_agi/scorecard.py`:
+
+```python
+level_score = min((baseline_actions / actions_taken) ** 2 * 100, 115)
+```
+
+`baseline_actions` ships in every game's `environment_files/<id>/*/metadata.json`.
+ls20's seven levels are `[22, 123, 73, 84, 96, 192, 186]`. An agent that
+maps the state space for 5,000 actions to find a **22-action** level scores
+`(22/5000)² × 100 ≈ 0.002` for it. Completing a level is worth almost
+nothing; completing it *quickly* is worth everything.
+
+A game's score is then the weighted mean over **all** its levels, with
+level *i* weighted *i* — so unreached levels still divide the total. In
+practice this means a level only contributes once it is solved at or near
+baseline, and the ceiling for solving the first *k* of *L* levels is
+`k(k+1) / L(L+1) × 100`.
+
+### Measure with `score_competition.py`, not `score_local.py`
+
+**This is the part that has already cost two submissions.** The Kaggle
+rerun does not drive the environment wrapper directly. It runs
+`main.py --agent myagent` against a gateway sidecar over HTTP, and that
+gateway runs `arc_agi.api.RestAPI` with **`competition_mode=True`**. The
+competition rules live in `api.py`, so any harness that talks to the
+wrapper — including `scripts/score_local.py` — measures a strictly more
+permissive game than the leaderboard plays.
+
+Two rules only exist in competition mode (`tests/test_competition_rules.py`
+pins both against the real Flask app):
+
+1. **One run per game, forever.** `_get_or_create_environment` returns
+   `None` once `scorecard.has_environment(game_id)`, so
+   `max(run.score for run in runs)` has exactly one candidate. Extra
+   attempts are *not* free — they are impossible.
+2. **The double-RESET trick is specifically defeated.** A RESET sent when
+   `_action_count == 0` — precisely the condition
+   `BaseGame.handle_reset()` uses to pick `full_reset()` — is swallowed
+   by the server (`response = g.observation_space`; the game is never
+   stepped) and **still bills an action**.
+
+So there is no explore-then-replay. Every action you spend searching is
+charged against the level you are searching, and nothing redeems it. The
+only thing that scores is **finishing a level near baseline on the first
+and only pass**.
+
+How badly the wrong harness misleads, same agent, same games:
+
+| harness | ls20 level 1 | ls20 score |
+|---|---|---|
+| `score_local.py` (permissive) | replayed cheaply | 12.32 |
+| `score_competition.py` (real rules) | 983 actions vs baseline 22 | 0.00 |
+
+Two submissions measured 0.053 and 2.10 under the permissive harness and
+both scored **exactly 0.19** on Kaggle. The difference never existed.
+
+```bash
+.venv/bin/python scripts/score_competition.py --game ls20 --max-steps 3000
+```
+
+`play-local` reports levels completed, which hides the metric entirely;
+`score_local.py` reports the right formula under the wrong rules, which
+is worse, because it looks authoritative.
+
+---
+
 ## The one file you edit: `agent/my_agent.py`
 
 This is the only file you normally touch. It defines a class called `MyAgent`
