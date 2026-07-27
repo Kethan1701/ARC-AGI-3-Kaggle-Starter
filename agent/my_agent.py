@@ -236,10 +236,29 @@ MAX_CLICK_CANDIDATES = _env_int("ARC_MAX_CLICKS", 48)
 BREADTH_INITIAL = _env_int("ARC_BREADTH", 12)
 BREADTH_MAX = _env_int("ARC_BREADTH_MAX", 256)
 
-# Consecutive repeats of an action that keeps producing new states. Bounded
-# so a game that animates forever cannot turn momentum into an infinite
-# walk that never returns to systematic search.
-MOMENTUM_LIMIT = _env_int("ARC_MOMENTUM", 16)
+# Consecutive repeats of an action that keeps producing new states.
+#
+# OFF by default: measured, this is the single most expensive thing the
+# agent was doing. On sp80 level 1, isolated with everything else held
+# fixed:
+#
+#     momentum on   668 actions  (momentum=376 of them)
+#     momentum off   78 actions
+#
+# An 8.6x regression, and sp80 is the game that carries the score -- at 78
+# actions against a baseline of 39 it scores (39/78)^2*100 = 25 points; at
+# 668 it scores 0.34. One game, 1.2 of a 1.33 aggregate.
+#
+# The trap was that "keeps producing new states" is not the same as
+# "making progress". A game with any animation or scrolling emits a fresh
+# frame for every repeat, so momentum reads its own motion as success and
+# walks away from the frontier, then pays route-to-frontier to walk back.
+# It was adopted on an 8% gain on ls20 (983 -> 904) without checking
+# whether that held anywhere else. It does not.
+#
+# Kept behind the env var rather than deleted so the behaviour is still
+# reachable for experiments, but nothing enables it by default.
+MOMENTUM_LIMIT = _env_int("ARC_MOMENTUM", 0)
 
 # An action id that has been tried this many times within a level without
 # ever changing the state is treated as not wired up in this game, and is

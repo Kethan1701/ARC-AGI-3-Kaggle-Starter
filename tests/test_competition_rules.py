@@ -253,6 +253,21 @@ def test_the_agent_seed_is_stable_across_processes():
     assert rng.random() == expected
 
 
+def test_momentum_is_disabled_by_default():
+    """Repeating an action that keeps changing the frame conflates motion
+    with progress. Measured on sp80 level 1 with everything else fixed:
+    668 actions with momentum, 78 without -- and sp80 is the game that
+    carries the aggregate."""
+    module = _load_agent_class()
+    assert module.MOMENTUM_LIMIT == 0
+
+    agent = module.MyAgent.__new__(module.MyAgent)
+    agent._momentum = 0
+    # The guard is `_momentum < MOMENTUM_LIMIT`, so a limit of 0 can never
+    # admit a repeat no matter how productive the last action looked.
+    assert not (agent._momentum < module.MOMENTUM_LIMIT)
+
+
 def test_cycling_is_disabled_by_default():
     """Banking a route must not make the agent spend RESETs, because on a
     competition scorecard those RESETs are billed no-ops."""
