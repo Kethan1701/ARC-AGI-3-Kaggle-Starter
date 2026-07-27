@@ -995,10 +995,23 @@ class MyAgent(Agent):
         # boundary would spend the new level's budget at the old level's
         # difficulty.
         self._breadth = BREADTH_INITIAL
-        # Levels can introduce mechanics, so an action written off on the
-        # previous level starts the new one with a clean record.
-        self._act_tried.clear()
-        self._act_changed.clear()
+        # The dead-action record deliberately survives the level boundary.
+        # Which actions a game wires up is a property of the *game*, not of
+        # the level, so clearing it made every level re-pay the cost of
+        # discovering that the same buttons are still inert -- and deeper
+        # levels are where the points are, since level i carries weight i.
+        #
+        # Measured: tu93 cleared level 1 at 42.7x baseline and level 2 at
+        # 11.8x, so what is learned early is exactly what makes later
+        # levels cheap. Re-learning it each time taxes the levels that
+        # matter most.
+        #
+        # The risk is a level introducing a mechanic on an action that was
+        # inert before, leaving it suppressed. That is already covered: an
+        # action that has *ever* changed anything is never written off, and
+        # the stall path widens breadth and wipes both counters -- which
+        # fires precisely when the agent is stuck, the symptom of having
+        # suppressed something it needed.
 
     def _harvest(self, level: int, winning: tuple[int, int]) -> None:
         """Extract and bank the shortest route through a level just beaten.

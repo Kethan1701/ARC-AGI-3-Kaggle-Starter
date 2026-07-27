@@ -197,6 +197,24 @@ def test_dead_is_judged_per_action_id_not_per_click_target():
     assert agent._is_dead(module.encode_action(1, None, None)) is False
 
 
+def test_the_dead_action_record_survives_a_level_boundary():
+    """Which actions a game wires up is a property of the game. Levels
+    carry weight i, so deeper levels are worth the most -- making them
+    re-discover the same inert buttons taxes exactly the wrong levels."""
+    module = _load_agent_class()
+    agent = _bare_agent(module)
+    agent._act_tried[1] = module.DEAD_ACTION_TRIALS
+    agent._act_changed[2] = 5
+
+    agent._begin_level(node=1234)
+
+    assert agent._act_tried[1] == module.DEAD_ACTION_TRIALS
+    assert agent._act_changed[2] == 5
+    assert agent._is_dead(module.encode_action(1, None, None)) is True
+    # ...and breadth still restarts cheap, which is a per-level property.
+    assert agent._breadth == module.BREADTH_INITIAL
+
+
 def test_cycling_is_disabled_by_default():
     """Banking a route must not make the agent spend RESETs, because on a
     competition scorecard those RESETs are billed no-ops."""
