@@ -350,7 +350,38 @@ STUCK_REEXPLORE_AFTER = _env_int("ARC_STUCK_REEXPLORE", 1_500)
 # no single cell reached 90%. So we track per-cell, per-row and
 # per-column rates during warm-up and mask whichever cross the
 # threshold.
-VOLATILE_WARMUP = _env_int("ARC_VOLATILE_WARMUP", 400)
+# The warm-up length is not a free parameter: freezing the mask calls
+# `_reset_graph()`, so every node learned during warm-up is discarded.
+# The old 400 therefore put a ~400-action floor under level 1 on any game
+# needing a mask -- against level-1 baselines of 7 to 78. Since a level
+# scores (baseline/actions)^2, that floor alone forecloses any score,
+# which is why doubling the action budget from 5k to 10k per game moved
+# the aggregate by nothing: the constraint was never how many actions
+# were available, it was that the first 400 were spent and thrown away.
+#
+# The clear times gave it away -- every masked game cleared just after the
+# floor, and the one game that scores cleared before it:
+#
+#     tn36 426   r11l 473   vc33 475   lp85 502      sp80 78
+#
+# Swept, level-1 actions (baseline in brackets):
+#
+#     warmup      25    50   100   400
+#     tn36 [32]   53    87   697   426
+#     r11l [22]  113   172   235   473
+#     vc33  [7]  100   118   169   475
+#     ls20 [22]  527   874   681   984
+#     tu93 [19]  397   489   540   813
+#     sp80 [39]   79   390    78    78
+#
+# 25 wins or ties nearly everywhere, and takes tn36 to 1.66x baseline --
+# a 36-point level where it used to score 0.02. The row rates the mask
+# keys on are extreme by design (measured on ls20: 98.3% for the bar's
+# rows against 26% for the next busiest), so they separate on far fewer
+# samples than 400. sp80 pays one extra action; ls20 and tu93 nearly
+# halve. Note the sweep is not monotone -- sp80 costs 390 at warmup 50 --
+# so this is a floor worth re-measuring rather than tuning blindly.
+VOLATILE_WARMUP = _env_int("ARC_VOLATILE_WARMUP", 25)
 VOLATILE_THRESHOLD = _env_float("ARC_VOLATILE_THRESHOLD", 0.9)
 
 # Refuse to mask more than this fraction of the frame. If that much of
