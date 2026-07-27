@@ -138,13 +138,36 @@ def _bare_agent(module):
 def test_dead_action_needs_a_fair_trial_before_being_skipped():
     module = _load_agent_class()
     agent = _bare_agent(module)
+    press = module.encode_action(1, None, None)
+
+    assert agent._is_dead(press) is False
+    agent._act_tried[1] = module.DEAD_ACTION_TRIALS - 1
+    assert agent._is_dead(press) is False
+
+    agent._act_tried[1] = module.DEAD_ACTION_TRIALS
+    assert agent._is_dead(press) is True
+
+
+def test_a_click_gets_a_far_longer_trial_than_a_button():
+    """A click that misses is not evidence -- there are ~112 targets per
+    node. Writing ACTION6 off on a button-sized sample would disable the
+    only winning action on a click game, so the click trial must exceed
+    the per-node target count by a wide margin."""
+    module = _load_agent_class()
+    assert module.DEAD_CLICK_TRIALS > module.DEAD_ACTION_TRIALS * 10
+    assert module.DEAD_CLICK_TRIALS > 112
+
+    agent = _bare_agent(module)
     click = module.encode_action(module._ACTION6_ID, 3, 4)
 
-    assert agent._is_dead(click) is False
-    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS - 1
+    # A sample that would condemn a button leaves clicks fully live.
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS
     assert agent._is_dead(click) is False
 
-    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_CLICK_TRIALS - 1
+    assert agent._is_dead(click) is False
+
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_CLICK_TRIALS
     assert agent._is_dead(click) is True
 
 
@@ -153,7 +176,7 @@ def test_an_action_that_ever_worked_is_never_written_off():
     agent = _bare_agent(module)
     click = module.encode_action(module._ACTION6_ID, 3, 4)
 
-    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS * 10
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_CLICK_TRIALS * 10
     agent._act_changed[module._ACTION6_ID] = 1
     assert agent._is_dead(click) is False
 
@@ -163,7 +186,7 @@ def test_dead_is_judged_per_action_id_not_per_click_target():
     one coordinate must write off ACTION6 as a whole or nothing at all."""
     module = _load_agent_class()
     agent = _bare_agent(module)
-    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_CLICK_TRIALS
 
     missed = module.encode_action(module._ACTION6_ID, 3, 4)
     never_tried = module.encode_action(module._ACTION6_ID, 61, 12)

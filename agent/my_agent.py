@@ -250,7 +250,27 @@ MOMENTUM_LIMIT = _env_int("ARC_MOMENTUM", 16)
 # simple-action slots. The threshold is per action *id*, not per code, so a
 # click that misses tells us nothing -- only ACTION6 never doing anything
 # anywhere does.
-DEAD_ACTION_TRIALS = _env_int("ARC_DEAD_TRIALS", 40)
+#
+# The two thresholds are wildly different on purpose, because the evidence
+# is not comparable:
+#
+#   ACTION1-5 are global -- they take no coordinate, so pressing one from
+#   half a dozen unrelated states and seeing the frame never move is strong
+#   evidence the game does not wire it up. A fair trial is cheap.
+#
+#   ACTION6 is a click, and a miss is not evidence. There are ~112 targets
+#   per node; writing clicks off after a few dozen misses is not merely
+#   wasteful, it is *unsafe* -- on a game whose only progress comes from
+#   one specific cell it disables the sole winning action until the next
+#   widening. The click trial is therefore set above the per-node target
+#   count, so "clicks do nothing" only fires once every target class has
+#   been sampled several times over.
+#
+# Scoring makes the cheap half urgent: a level scores (baseline/actions)^2,
+# level-1 baselines run ~7-78 actions, so 200 actions spent merely learning
+# which buttons are inert already puts a near-perfect solve out of reach.
+DEAD_ACTION_TRIALS = _env_int("ARC_DEAD_TRIALS", 6)
+DEAD_CLICK_TRIALS = _env_int("ARC_DEAD_CLICK_TRIALS", 240)
 
 # Shared empty mapping for `_edges` lookups on unmapped nodes.
 EMPTY_EDGES: dict[int, int] = {}
@@ -1140,10 +1160,14 @@ class MyAgent(Agent):
         uninformative, but ACTION6 doing nothing anywhere after a real
         sample means this game does not use clicks at all, and skipping
         them frees ~112 of the ~117 codes a node offers.
+
+        What counts as "fair" differs by an order of magnitude between a
+        global button and a click; see the threshold constants.
         """
         action_id = code >> (2 * _COORD_BITS)
+        trials = DEAD_CLICK_TRIALS if action_id == _ACTION6_ID else DEAD_ACTION_TRIALS
         return (
-            self._act_tried[action_id] >= DEAD_ACTION_TRIALS
+            self._act_tried[action_id] >= trials
             and not self._act_changed[action_id]
         )
 
