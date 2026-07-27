@@ -185,6 +185,14 @@ def main() -> None:
             f"{gid:7} {env_score.score:7.2f} {len(env_score.runs):5} "
             f"{best.levels_completed:5}   {pairs}"
         )
+        # `_calculate_score` has silent zeroing paths -- "size mismatch"
+        # fires when a game records more level transitions than it has
+        # levels, which repeated deaths can cause, and it zeroes the whole
+        # game no matter how well it was played. Without surfacing the
+        # message that is indistinguishable from simply playing badly.
+        messages = {run.message for run in env_score.runs if run.message}
+        for message in sorted(messages):
+            print(f"{'':7} {'':>7} !! {message}")
         total += env_score.score
 
     n = len(scorecard.environments)

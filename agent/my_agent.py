@@ -240,6 +240,18 @@ BREADTH_MAX = _env_int("ARC_BREADTH_MAX", 256)
 # walk that never returns to systematic search.
 MOMENTUM_LIMIT = _env_int("ARC_MOMENTUM", 16)
 
+# An action id that has been tried this many times within a level without
+# ever changing the state is treated as not wired up in this game, and is
+# skipped until the next widening.
+#
+# This is worth far more than it looks. A node offers ~117 codes and ~112
+# of them are ACTION6 clicks, so a game that ignores clicks entirely wastes
+# almost every probe on them; conversely a pure click game wastes its cheap
+# simple-action slots. The threshold is per action *id*, not per code, so a
+# click that misses tells us nothing -- only ACTION6 never doing anything
+# anywhere does.
+DEAD_ACTION_TRIALS = _env_int("ARC_DEAD_TRIALS", 40)
+
 # Shared empty mapping for `_edges` lookups on unmapped nodes.
 EMPTY_EDGES: dict[int, int] = {}
 
@@ -605,6 +617,8 @@ class MyAgent(Agent):
         self._last_code: Optional[int] = None     # code of the previous action
         self._last_productive = False             # ...and did it reach a new state
         self._momentum = 0                        # consecutive repeats so far
+        self._act_tried: Counter[int] = Counter()    # action id -> probes
+        self._act_changed: Counter[int] = Counter()  # action id -> state changes
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
@@ -945,6 +959,11 @@ class MyAgent(Agent):
         self._last_code = code
         self._last_productive = node != prev_node and node not in self._total
 
+        action_id = code >> (2 * _COORD_BITS)
+        self._act_tried[action_id] += 1
+        if node != prev_node:
+            self._act_changed[action_id] += 1
+
     def _begin_level(self, node: int) -> None:
         """Root a fresh solution graph at the state the level starts in."""
         self._sol_edges = {}
@@ -956,6 +975,10 @@ class MyAgent(Agent):
         # boundary would spend the new level's budget at the old level's
         # difficulty.
         self._breadth = BREADTH_INITIAL
+        # Levels can introduce mechanics, so an action written off on the
+        # previous level starts the new one with a clean record.
+        self._act_tried.clear()
+        self._act_changed.clear()
 
     def _harvest(self, level: int, winning: tuple[int, int]) -> None:
         """Extract and bank the shortest route through a level just beaten.
@@ -1110,6 +1133,20 @@ class MyAgent(Agent):
                 )
         return codes
 
+    def _is_dead(self, code: int) -> bool:
+        """Has this action id had a fair trial and never changed anything?
+
+        Judged per action *id*, never per code: a click that misses is
+        uninformative, but ACTION6 doing nothing anywhere after a real
+        sample means this game does not use clicks at all, and skipping
+        them frees ~112 of the ~117 codes a node offers.
+        """
+        action_id = code >> (2 * _COORD_BITS)
+        return (
+            self._act_tried[action_id] >= DEAD_ACTION_TRIALS
+            and not self._act_changed[action_id]
+        )
+
     def _has_untried(self, node: int) -> bool:
         return self._cursor.get(node, 0) < min(
             self._total.get(node, 0), self._breadth
@@ -1142,10 +1179,6 @@ class MyAgent(Agent):
                 break
             return code, "route-to-frontier"
 
-        # (b) Anything untried right here is the cheapest information
-        #     available, so take it. The cursor is why this works with
-        #     only an int per node: `codes` is deterministic for a grid,
-        #     so index i always means the same action.
         # (b0) Momentum. If the last action landed us somewhere new, try it
         #      again before anything else. Corridors, pushes and falls all
         #      reward repetition, and this costs nothing when it is wrong:
@@ -1164,11 +1197,20 @@ class MyAgent(Agent):
             return self._last_code, "momentum"
         self._momentum = 0
 
+        # (b) Anything untried right here is the cheapest information
+        #     available, so take it -- skipping action ids this game has
+        #     shown it does not respond to. Skipping only ever advances the
+        #     cursor, so "index i means action i" still holds and the graph
+        #     bookkeeping stays valid.
+        limit = min(len(codes), self._breadth)
         index = self._cursor.get(node, 0)
-        if index < min(len(codes), self._breadth) and node in self._total:
+        while index < limit and self._is_dead(codes[index]):
+            index += 1
+        if index < limit and node in self._total:
             self._cursor[node] = index + 1
             self._stuck_steps = 0
             return codes[index], "probe-untried"
+        self._cursor[node] = index
 
         # (c) This node is exhausted. Walk to the nearest node that
         #     isn't, using only edges already verified by experience.
@@ -1206,6 +1248,11 @@ class MyAgent(Agent):
             if self._breadth < BREADTH_MAX:
                 self._breadth = min(self._breadth * 2, BREADTH_MAX)
                 self._stuck_steps = 0
+                # Give written-off actions another chance: an action that
+                # did nothing everywhere we had been may simply have needed
+                # a precondition we had not reached yet.
+                self._act_tried.clear()
+                self._act_changed.clear()
                 logger.info(
                     "%s: map exhausted after %d actions; widening breadth to %d",
                     self.game_id, self._steps, self._breadth,

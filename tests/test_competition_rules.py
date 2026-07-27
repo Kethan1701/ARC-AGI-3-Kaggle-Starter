@@ -128,6 +128,52 @@ def _load_agent_class():
     return module
 
 
+def _bare_agent(module):
+    agent = module.MyAgent.__new__(module.MyAgent)
+    agent._act_tried = module.Counter()
+    agent._act_changed = module.Counter()
+    return agent
+
+
+def test_dead_action_needs_a_fair_trial_before_being_skipped():
+    module = _load_agent_class()
+    agent = _bare_agent(module)
+    click = module.encode_action(module._ACTION6_ID, 3, 4)
+
+    assert agent._is_dead(click) is False
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS - 1
+    assert agent._is_dead(click) is False
+
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS
+    assert agent._is_dead(click) is True
+
+
+def test_an_action_that_ever_worked_is_never_written_off():
+    module = _load_agent_class()
+    agent = _bare_agent(module)
+    click = module.encode_action(module._ACTION6_ID, 3, 4)
+
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS * 10
+    agent._act_changed[module._ACTION6_ID] = 1
+    assert agent._is_dead(click) is False
+
+
+def test_dead_is_judged_per_action_id_not_per_click_target():
+    """A click that misses says nothing about other targets, so writing off
+    one coordinate must write off ACTION6 as a whole or nothing at all."""
+    module = _load_agent_class()
+    agent = _bare_agent(module)
+    agent._act_tried[module._ACTION6_ID] = module.DEAD_ACTION_TRIALS
+
+    missed = module.encode_action(module._ACTION6_ID, 3, 4)
+    never_tried = module.encode_action(module._ACTION6_ID, 61, 12)
+    assert agent._is_dead(missed) is True
+    assert agent._is_dead(never_tried) is True
+
+    # ...and a different action id is judged on its own record.
+    assert agent._is_dead(module.encode_action(1, None, None)) is False
+
+
 def test_cycling_is_disabled_by_default():
     """Banking a route must not make the agent spend RESETs, because on a
     competition scorecard those RESETs are billed no-ops."""
