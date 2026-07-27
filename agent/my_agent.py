@@ -664,6 +664,7 @@ class MyAgent(Agent):
         self._cursor: dict[int, int] = {}         # node -> next index to try
         self._breadth = BREADTH_INITIAL           # candidates per node, deepens
         self._why_counts: Counter[str] = Counter()  # billed actions by reason
+        self._class_counts: Counter[str] = Counter()  # click/press hit rate
         self._last_code: Optional[int] = None     # code of the previous action
         self._last_productive = False             # ...and did it reach a new state
         self._momentum = 0                        # consecutive repeats so far
@@ -922,11 +923,20 @@ class MyAgent(Agent):
         mix = " ".join(
             f"{why}={n}" for why, n in self._why_counts.most_common()
         )
+        clicks = self._class_counts["click"]
+        presses = self._class_counts["press"]
+        billed = clicks + presses
+        hit = self._class_counts["click-live"] / clicks if clicks else 0.0
         logger.info(
-            "%s: %s after %d actions (breadth=%d, nodes=%d) | %s",
+            "%s: %s after %d actions (breadth=%d, nodes=%d) | %s "
+            "|| clicks=%d (%.0f%% of spend, %.1f%% moved) presses=%d (%.1f%% moved)",
             self.game_id, tag, self._steps, self._breadth, len(self._total), mix,
+            clicks, 100.0 * clicks / billed if billed else 0.0, 100.0 * hit,
+            presses,
+            100.0 * self._class_counts["press-live"] / presses if presses else 0.0,
         )
         self._why_counts.clear()
+        self._class_counts.clear()
 
     def _observe(self, node: int, latest_frame: FrameData) -> None:
         """Fold the outcome of the previous action into the graph."""
@@ -1013,6 +1023,15 @@ class MyAgent(Agent):
         self._act_tried[action_id] += 1
         if node != prev_node:
             self._act_changed[action_id] += 1
+
+        # Split the level's spend by action class. ~112 of the ~117 codes a
+        # node offers are ACTION6 clicks, so if clicks dominate the bill and
+        # almost none of them move the state, the branching factor -- not the
+        # search policy -- is what puts a near-baseline clear out of reach.
+        kind = "click" if action_id == _ACTION6_ID else "press"
+        self._class_counts[kind] += 1
+        if node != prev_node:
+            self._class_counts[kind + "-live"] += 1
 
     def _begin_level(self, node: int) -> None:
         """Root a fresh solution graph at the state the level starts in."""
