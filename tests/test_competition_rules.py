@@ -133,6 +133,12 @@ def _bare_agent(module):
     agent = module.MyAgent.__new__(module.MyAgent)
     agent._act_tried = module.Counter()
     agent._act_changed = module.Counter()
+    # No model. These tests are about the search -- and the search is
+    # exactly what runs on the leaderboard whenever the policy is off or
+    # unavailable, so `None` here is the shipping configuration rather
+    # than a stub standing in for one.
+    agent._policy = None
+    agent._act_history = []
     return agent
 
 

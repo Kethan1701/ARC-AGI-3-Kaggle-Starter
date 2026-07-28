@@ -125,7 +125,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import random
+import re
+import threading
 import time
 import zlib
 from collections import Counter, deque
@@ -483,6 +486,110 @@ SOLUTION_EDGE_CAP = _env_int("ARC_SOL_EDGE_CAP", 150_000)
 # back to exploring rather than burning the run on a dead plan.
 REPLAY_STRICT = _env_int("ARC_REPLAY_STRICT", 1)
 
+# The cursor is not the only thing that spends a node's candidates:
+# replay, stuck-random, momentum and the model policy all take codes out
+# of turn, and `_edges` records the outcome. Without this the cursor
+# later walks back over those codes and pays a second billed action for
+# an answer already in hand. Off by default only because it is a genuine
+# behaviour change to the agent that scored 0.26 and every such change
+# here gets measured before it ships; it is forced on when the policy is
+# driving, where skipping is load-bearing rather than an optimisation.
+SKIP_RECORDED = _env_int("ARC_SKIP_RECORDED", 0)
+
+# --- the model policy ------------------------------------------------
+#
+# Everything above is a pure-Python search, and it scored 0.26. Its
+# measured failure is not that it searches badly but that it searches
+# *blind*: on the 15 dev games that never clear level 1, 950-980 of every
+# 1000 actions are "probe-untried", drawn in an order that is arbitrary
+# with respect to the game (simple actions shuffled on the node id, then
+# clicks by size-and-rarity). That is a random walk with extra steps.
+#
+# So the model is wired in as a *ranker over the candidates the search
+# already generated*, never as a free generator of actions. This is the
+# whole safety argument:
+#
+#   - It cannot emit an illegal action. It returns an index into a list
+#     we built, or nothing.
+#   - Dead actions, the fatal set, the state graph, replay and the level
+#     budget all keep working exactly as they do today.
+#   - Every failure mode -- no GPU, no vLLM, OOM, a timeout, a garbage
+#     reply -- lands on `None`, and `None` means "run the search that
+#     already scored 0.26". The floor is structural, not a promise.
+#
+# Off by default: `ARC_POLICY=1` opts in. With it off, not one line of
+# model code executes and the agent is byte-for-byte the 0.26 submission.
+POLICY_ENABLED = _env_int("ARC_POLICY", 0)
+
+# Verified present on the competition image; see the Kaggle mount layout
+# note -- ARC-AGI-3 nests inputs under /kaggle/input/models/... rather
+# than the flat /kaggle/input/<slug> used elsewhere on Kaggle.
+POLICY_MODEL = os.environ.get(
+    "ARC_POLICY_MODEL",
+    "/kaggle/input/models/michaelpoluektov/qwen3-6-27b-fp8/transformers/default/1",
+)
+
+# 25 games run as 25 threads against one engine. Generating for them one
+# at a time measured 0.4 actions/s; batching the 25 together measured
+# 47.8. So requests are queued and served in batches, and these two
+# numbers are the whole tuning surface: wait long enough to actually
+# collect a batch, never long enough to stall a game thread.
+POLICY_BATCH_WAIT = _env_float("ARC_POLICY_BATCH_WAIT", 0.05)
+POLICY_BATCH_MAX = _env_int("ARC_POLICY_BATCH_MAX", 32)
+
+# A game thread blocks on the model. If the engine wedges, this is what
+# stops it taking the whole run down with it: the wait expires, the
+# caller gets None, and the search carries on unaided.
+POLICY_TIMEOUT = _env_float("ARC_POLICY_TIMEOUT", 45.0)
+
+# We ask for an integer, so the reply is tiny. The allowance is for the
+# <think> block this model opens unprompted -- see `parse_choice`, which
+# strips it. Thinking is disabled via the chat template where supported,
+# and this is the belt to that braces.
+POLICY_MAX_TOKENS = _env_int("ARC_POLICY_MAX_TOKENS", 24)
+POLICY_TEMPERATURE = _env_float("ARC_POLICY_TEMPERATURE", 0.0)
+
+# How many of the search's candidates to show. The first few are the
+# simple actions; the rest are clicks, already sorted smallest-and-rarest
+# first, which is a real prior worth keeping. Showing all ~117 would bury
+# the useful ones and cost tokens for no signal.
+POLICY_CANDIDATES = _env_int("ARC_POLICY_CANDIDATES", 24)
+
+# Collapse runs of identical rows to one labelled line. Lossless: the
+# label carries the row range. Measured on a representative board, the
+# rendered grid is 70% of the prompt and the prompt is ~1900 tokens, so
+# 25 games prefill ~46k tokens per batch; these boards are mostly
+# background, and collapsing them is the cheapest large saving available.
+POLICY_COLLAPSE_ROWS = _env_int("ARC_POLICY_COLLAPSE", 1)
+
+# Recent (action, did-the-board-move) pairs shown to the model. This is
+# the only history it gets: the state graph is the agent's memory, not
+# the model's, and re-serialising it every step would cost more tokens
+# than the grid.
+POLICY_HISTORY = _env_int("ARC_POLICY_HISTORY", 6)
+
+# Engine sizing. 27B at FP8 is ~28GB of weights on a 95GB card, so the
+# default leaves room for KV cache without crowding the box.
+POLICY_GPU_FRACTION = _env_float("ARC_POLICY_GPU_FRACTION", 0.85)
+POLICY_MAX_LEN = _env_int("ARC_POLICY_MAX_LEN", 8192)
+
+# NEVER set this. enforce_eager=True disables CUDA-graph capture and
+# measured 0.4 actions/s against 47.8 with capture on -- a 120x
+# difference, on the same card, same model, same batch. It exists only
+# because eager mode gives readable tracebacks when the engine will not
+# start at all.
+POLICY_EAGER = _env_int("ARC_POLICY_EAGER", 0)
+
+# Consult the model at most every N actions. The search is free and the
+# model is not; on a game that is making progress there is no reason to
+# ask. 1 asks every step.
+POLICY_EVERY = _env_int("ARC_POLICY_EVERY", 1)
+
+# Stop asking after this many consecutive refusals to pick a live
+# candidate. A model that cannot help this game should not keep being
+# paid to say so.
+POLICY_GIVE_UP = _env_int("ARC_POLICY_GIVE_UP", 40)
+
 _DEADLINE = time.monotonic() + RUN_BUDGET_SECONDS
 
 _RESET_ID = GameAction.RESET.value
@@ -728,6 +835,461 @@ def candidate_actions(
 
 
 # ---------------------------------------------------------------------
+# The model policy
+# ---------------------------------------------------------------------
+_HEX = "0123456789abcdefghijklmnopqrstuv"
+
+# The model opens a reasoning block whether or not we ask for one. Both
+# spellings appear, and an unclosed block is common when the token budget
+# runs out mid-thought -- which is exactly when we still want an answer.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
+_FIRST_INT = re.compile(r"-?\d+")
+
+
+def render_grid(
+    grid: tuple[tuple[int, ...], ...], ignore: frozenset[int] = frozenset()
+) -> str:
+    """The frame as labelled text, one character per cell.
+
+    Rulers matter more than they look. The model's whole job here is to
+    connect something it can see in the grid to a CLICK(x, y) in the
+    option list, and without coordinate labels it has to count columns --
+    which it does badly, at 64 wide.
+
+    Volatile cells render as '?'. Those are the HUD the agent already
+    identified and excluded from the state key (see `_learn_mask`);
+    showing them as real content invites the model to click a step
+    counter, which is the single most common way a frame-differ gets
+    fooled on this benchmark.
+
+    Identical neighbouring rows collapse to one labelled line. This is
+    lossless -- the label carries the range, so every coordinate is still
+    recoverable -- and it is the difference between a prompt that fits
+    the run's time budget and one that does not: the board is 70% of the
+    prompt, 25 games are prefilled per batch, and these boards are mostly
+    background. See POLICY_COLLAPSE_ROWS.
+    """
+    height = len(grid)
+    if height == 0:
+        return "(empty)"
+    width = len(grid[0])
+    if width == 0:
+        return "(empty)"
+
+    rows = []
+    for y, row in enumerate(grid):
+        base = y * width
+        rows.append(
+            "".join(
+                "?" if (base + x) in ignore else _HEX[v] if v < len(_HEX) else "*"
+                for x, v in enumerate(row)
+            )
+        )
+
+    label = len(str(height - 1)) if not POLICY_COLLAPSE_ROWS else len(
+        f"{height - 1}-{height - 1}"
+    )
+    pad = " " * label
+    tens = "".join(str((x // 10) % 10) for x in range(width))
+    ones = "".join(str(x % 10) for x in range(width))
+    lines = [f"{pad}  {tens}", f"{pad}  {ones}"]
+
+    y = 0
+    while y < height:
+        end = y
+        if POLICY_COLLAPSE_ROWS:
+            while end + 1 < height and rows[end + 1] == rows[y]:
+                end += 1
+        tag = str(y) if end == y else f"{y}-{end}"
+        lines.append(f"{tag:>{label}}  {rows[y]}")
+        y = end + 1
+    return "\n".join(lines)
+
+
+def describe_code(code: int, grid: tuple[tuple[int, ...], ...]) -> str:
+    """One option line for the model.
+
+    Simple actions are named but deliberately not *interpreted*. Calling
+    ACTION1 "move up" would be a guess: the mapping differs per game and
+    nothing in the frame data declares it. Telling the model a fact we do
+    not have is worse than telling it nothing, because it will act on it.
+    """
+    action_id, x, y = decode_action(code)
+    if action_id == _RESET_ID:
+        return "RESET (restart the level)"
+    if x is None or y is None:
+        return f"ACTION{action_id} (unlabelled control)"
+    colour = "?"
+    if 0 <= y < len(grid) and 0 <= x < len(grid[y]):
+        v = grid[y][x]
+        colour = _HEX[v] if v < len(_HEX) else "*"
+    return f"CLICK at column {x}, row {y} (cell colour {colour})"
+
+
+def build_prompt(
+    grid: tuple[tuple[int, ...], ...],
+    codes: list[int],
+    history: list[tuple[int, bool]],
+    level: int,
+    ignore: frozenset[int] = frozenset(),
+) -> str:
+    """Assemble the ranking prompt.
+
+    A pure function of its arguments, so the tests can pin it exactly.
+    """
+    board = render_grid(grid, ignore)
+
+    if history:
+        seen = "\n".join(
+            f"  {describe_code(c, grid)} -> "
+            f"{'the board changed' if moved else 'nothing happened'}"
+            for c, moved in history[-POLICY_HISTORY:]
+        )
+        recent = f"\nWhat I have tried most recently:\n{seen}\n"
+    else:
+        recent = ""
+
+    options = "\n".join(
+        f"  {i}: {describe_code(c, grid)}" for i, c in enumerate(codes)
+    )
+
+    return (
+        "You are playing an unfamiliar puzzle video game. You see one "
+        "frame at a time and choose one action.\n\n"
+        "The board below is a grid of coloured cells. Each character is "
+        "one cell; the character is that cell's colour as a digit. "
+        "Column numbers are the two rows above the board (read them "
+        "vertically: tens digit, then ones digit). Row numbers are down "
+        "the left, and a label like '20-43' means every row from 20 to 43 "
+        "is identical to the one shown. Cells shown as '?' are a "
+        "scoreboard or timer, not part of the puzzle -- ignore them.\n\n"
+        f"You are on level {level}.\n\n"
+        f"{board}\n"
+        f"{recent}\n"
+        "Your goal is to work out the rule of this game and beat the "
+        "level. Prefer an action that tests a real idea about the board "
+        "over one that just changes something.\n\n"
+        f"Options:\n{options}\n\n"
+        "Reply with the number of the single best option. "
+        "Reply with that number and nothing else."
+    )
+
+
+def parse_choice(text: Optional[str], count: int) -> Optional[int]:
+    """The model's reply as an index into the option list, or None.
+
+    Everything that is not a usable index is None: a refusal, an
+    explanation, an out-of-range number, an empty string, a reply that is
+    nothing but an unterminated thought. The caller treats None as "the
+    model has no opinion" and searches instead, so being strict here
+    costs one action of nothing and buys immunity from parsing garbage
+    into a real move.
+    """
+    if not text or count <= 0:
+        return None
+    cleaned = _THINK_BLOCK.sub(" ", text)
+    cleaned = _THINK_OPEN.sub(" ", cleaned)
+    match = _FIRST_INT.search(cleaned)
+    if match is None:
+        return None
+    try:
+        index = int(match.group())
+    except ValueError:
+        return None
+    if 0 <= index < count:
+        return index
+    return None
+
+
+class _Request:
+    """One prompt in flight, and the thread waiting on its answer."""
+
+    __slots__ = ("prompt", "done", "reply", "abandoned")
+
+    def __init__(self, prompt: str) -> None:
+        self.prompt = prompt
+        self.done = threading.Event()
+        self.reply: Optional[str] = None
+        self.abandoned = False
+
+
+class _PolicyEngine:
+    """One vLLM engine, shared by every game thread in the process.
+
+    Two things make this more than a wrapper.
+
+    *Loading happens exactly once.* All 25 game threads reach their first
+    action at the same moment and every one of them would otherwise try
+    to load 28GB of weights. The first thread through takes ~5 minutes;
+    the rest wait on the same lock and then find it ready.
+
+    That wait is deliberate rather than overlooked. Loading in the
+    background would let the search play during those 5 minutes, but it
+    costs no billed actions to wait -- only wall clock, ~1% of the
+    budget -- and the framework imposes no per-action timeout (the Swarm
+    runs plain daemon threads). Paying 1% to keep the failure path free
+    of a load-in-flight race is the right trade for the one component
+    whose entire job is to fail safely.
+
+    *Requests are batched.* vLLM's throughput comes from serving many
+    sequences together: measured 0.4 actions/s one at a time against 47.8
+    in batches of 25, on the same card. Game threads therefore hand their
+    prompt to a queue and block, and a single worker drains the queue in
+    batches.
+
+    Nothing here raises. A failure to load is recorded once and turns
+    every later call into an immediate None.
+    """
+
+    _instance: Optional["_PolicyEngine"] = None
+    _instance_lock = threading.Lock()
+
+    @classmethod
+    def get(cls) -> "_PolicyEngine":
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def __init__(self) -> None:
+        self._llm: Any = None
+        self._sampling: Any = None
+        self._wrap: Any = None
+        self._failed = False
+        self._load_lock = threading.Lock()
+        self._queue: "queue.Queue[_Request]" = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self.load_seconds = 0.0
+        self.batches = 0
+        self.prompts = 0
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def submit(self, prompt: str) -> Optional[str]:
+        """Block until this prompt is answered. None on any failure."""
+        if self._failed or not self._ensure():
+            return None
+        box = _Request(prompt)
+        try:
+            self._queue.put(box)
+        except Exception:
+            return None
+        if not box.done.wait(POLICY_TIMEOUT):
+            # Do not tear the engine down: a slow batch is not a broken
+            # one, and the other 24 threads are probably in it. Mark the
+            # request so the worker does not pay to finish it.
+            box.abandoned = True
+            logger.warning("policy: request timed out after %.0fs", POLICY_TIMEOUT)
+            return None
+        return box.reply
+
+    def _ensure(self) -> bool:
+        if self._llm is not None:
+            return True
+        if self._failed:
+            return False
+        with self._load_lock:
+            if self._llm is not None:
+                return True
+            if self._failed:
+                return False
+            try:
+                self._load()
+            except BaseException as exc:      # noqa: BLE001 - see below
+                # Deliberately the widest catch in this file. The entire
+                # value of this class is that a model problem degrades to
+                # the search that already scored, and vLLM failures are
+                # not all Exceptions -- a failed engine bootstrap can
+                # surface as SystemExit from a worker process. The one
+                # thing we must not swallow is the user interrupting.
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                logger.exception("policy: engine unavailable, using search only")
+                self._failed = True
+                return False
+        return True
+
+    def _load(self) -> None:
+        from vllm import LLM, SamplingParams
+
+        logger.info("policy: loading %s", POLICY_MODEL)
+        started = time.monotonic()
+        llm = LLM(
+            model=POLICY_MODEL,
+            gpu_memory_utilization=POLICY_GPU_FRACTION,
+            max_model_len=POLICY_MAX_LEN,
+            # Consecutive steps of one game share almost the whole prompt
+            # -- system text, rulers, and every unchanged row of the
+            # board -- so this is close to free and large.
+            enable_prefix_caching=True,
+            enforce_eager=bool(POLICY_EAGER),
+            trust_remote_code=True,
+        )
+        self._sampling = SamplingParams(
+            temperature=POLICY_TEMPERATURE,
+            max_tokens=POLICY_MAX_TOKENS,
+        )
+        self._wrap = self._build_wrapper(llm)
+        self.load_seconds = time.monotonic() - started
+
+        worker = threading.Thread(
+            target=self._serve, name="policy-batcher", daemon=True
+        )
+        worker.start()
+        self._worker = worker
+        # Published last and only on success: `_ensure` tests this, so
+        # until it is set every thread takes the loading path.
+        self._llm = llm
+        logger.info("policy: ready in %.0fs", self.load_seconds)
+
+    @staticmethod
+    def _build_wrapper(llm: Any) -> Any:
+        """Return prompt -> model-ready text.
+
+        Chat models need their template applied or they answer as if
+        completing a document. `enable_thinking` is a Qwen extension; it
+        is probed once here rather than per call, and a template that
+        rejects it still works without it.
+        """
+        try:
+            tok = llm.get_tokenizer()
+        except Exception:
+            logger.warning("policy: no tokenizer, sending raw prompts")
+            return lambda text: text
+
+        def apply(text: str, thinking: bool) -> str:
+            kwargs = {} if thinking else {"enable_thinking": False}
+            return tok.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False,
+                add_generation_prompt=True,
+                **kwargs,
+            )
+
+        try:
+            apply("ping", thinking=False)
+            return lambda text: apply(text, thinking=False)
+        except Exception:
+            pass
+        try:
+            apply("ping", thinking=True)
+            logger.info("policy: template has no thinking switch")
+            return lambda text: apply(text, thinking=True)
+        except Exception:
+            logger.warning("policy: no chat template, sending raw prompts")
+            return lambda text: text
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                batch = [self._queue.get()]
+            except Exception:
+                return
+            deadline = time.monotonic() + POLICY_BATCH_WAIT
+            while len(batch) < POLICY_BATCH_MAX:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(self._queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+            self._run(batch)
+
+    def _run(self, batch: list[_Request]) -> None:
+        live = [box for box in batch if not box.abandoned]
+        try:
+            if live:
+                outputs = self._llm.generate(
+                    [self._wrap(box.prompt) for box in live],
+                    self._sampling,
+                    use_tqdm=False,
+                )
+                # vLLM returns outputs in submission order.
+                for box, out in zip(live, outputs):
+                    if out.outputs:
+                        box.reply = out.outputs[0].text
+                self.batches += 1
+                self.prompts += len(live)
+        except BaseException as exc:          # noqa: BLE001
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            # One bad batch is not a dead engine -- a single over-long
+            # prompt can do this -- so the engine is left up and the
+            # callers simply get None for this round.
+            logger.exception("policy: batch of %d failed", len(live))
+        finally:
+            # Every waiter is released on every path. Missing one here
+            # would park a game thread until its timeout, every step.
+            for box in batch:
+                box.done.set()
+
+
+class VisionPolicy:
+    """Ranks the search's candidates with the model. Never raises.
+
+    Held per game, so `asked`/`used` read as per-game diagnostics, but
+    the engine underneath is process-wide.
+    """
+
+    def __init__(self, game_id: str) -> None:
+        self.game_id = game_id
+        self.asked = 0
+        self.used = 0
+        self.refused = 0
+        self._streak = 0
+        self._retired = False
+
+    @property
+    def retired(self) -> bool:
+        return self._retired
+
+    def rank(
+        self,
+        grid: tuple[tuple[int, ...], ...],
+        codes: list[int],
+        history: list[tuple[int, bool]],
+        level: int,
+        ignore: frozenset[int] = frozenset(),
+    ) -> Optional[int]:
+        """Index into `codes`, or None to let the search decide."""
+        if self._retired or not codes:
+            return None
+        engine = _PolicyEngine.get()
+        if engine.failed:
+            self._retired = True
+            return None
+
+        shown = codes[:POLICY_CANDIDATES]
+        self.asked += 1
+        try:
+            prompt = build_prompt(grid, shown, history, level, ignore)
+        except Exception:
+            logger.exception("%s: policy could not build a prompt", self.game_id)
+            return None
+
+        choice = parse_choice(engine.submit(prompt), len(shown))
+        if choice is None:
+            self.refused += 1
+            self._streak += 1
+            if POLICY_GIVE_UP and self._streak >= POLICY_GIVE_UP:
+                logger.info(
+                    "%s: policy gave no usable answer %d times running; "
+                    "searching unaided from here",
+                    self.game_id, self._streak,
+                )
+                self._retired = True
+            return None
+
+        self._streak = 0
+        self.used += 1
+        return choice
+
+
+# ---------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------
 class MyAgent(Agent):
@@ -795,6 +1357,14 @@ class MyAgent(Agent):
         self._novel_steps = 0
         self._novel_new = 0
         self._exploding = False
+
+        # --- the model policy (see POLICY_ENABLED) --------------------
+        # None means "no model in this run", and every call site is
+        # written so that None is the ordinary case, not an error path.
+        self._policy = VisionPolicy(self.game_id) if POLICY_ENABLED else None
+        # (code, did-the-board-change) for the last few actions, which is
+        # all the history the model is given.
+        self._act_history: list[tuple[int, bool]] = []
 
         self._best_levels = 0
         self._stuck_steps = 0
@@ -1122,6 +1692,17 @@ class MyAgent(Agent):
         self._last_code = code
         self._last_productive = node != prev_node and node not in self._total
 
+        # The model's entire memory of this game. `node != prev_node` is
+        # "the board changed", which is the one thing about an action a
+        # frame-differ can assert without interpreting the game. Kept
+        # short deliberately: the agent's memory is the state graph, and
+        # re-serialising that every step would cost more tokens than the
+        # board does.
+        if self._policy is not None:
+            self._act_history.append((code, node != prev_node))
+            if len(self._act_history) > POLICY_HISTORY:
+                del self._act_history[:-POLICY_HISTORY]
+
         # Is the map closing at all? Measured on the dev set: ar25 creates
         # 0.66 new nodes per action and sc25 0.60, versus ft09's 0.02. Above
         # the threshold there is no graph to search -- every node is fresh,
@@ -1412,14 +1993,77 @@ class MyAgent(Agent):
             return self._last_code, "momentum"
         self._momentum = 0
 
+        # (b1) Ask the model which candidate to spend the next probe on.
+        #
+        #      This is the only point where a model influences anything,
+        #      and it influences exactly one thing: the order in which
+        #      the search spends probes it was going to spend anyway. It
+        #      picks an index into a list we built and filtered, so it
+        #      cannot propose an illegal, dead, fatal or already-tried
+        #      action, and `None` -- no model, no GPU, a timeout, a
+        #      garbage reply -- simply falls through to (b) below.
+        #
+        #      Why order is the right lever: on the 15 dev games that
+        #      never clear level 1, 950-980 of every 1000 actions are
+        #      "probe-untried", and their order is arbitrary with respect
+        #      to the game. The search is not losing because it searches
+        #      badly; it is losing because it cannot see the board.
+        #
+        #      The window is capped at the breadth the search would have
+        #      used, widened only far enough to give the model a real
+        #      menu. Letting it range over all ~117 candidates would
+        #      change how much the agent spends per node, and the point
+        #      of this experiment is to change only *which* probe is
+        #      first.
+        if (
+            self._policy is not None
+            and not self._policy.retired
+            and node in self._total
+            and (POLICY_EVERY <= 1 or self._steps % POLICY_EVERY == 0)
+        ):
+            tried = self._edges.get(node, EMPTY_EDGES)
+            window = max(self._breadth, POLICY_CANDIDATES)
+            live = [
+                code
+                for code in codes[:window]
+                if code not in tried
+                and not self._is_dead(code)
+                and (node, code) not in self._fatal
+            ]
+            if live:
+                pick = self._policy.rank(
+                    grid, live, self._act_history, self._level, self._volatile
+                )
+                if pick is not None:
+                    self._stuck_steps = 0
+                    return live[pick], "policy"
+
         # (b) Anything untried right here is the cheapest information
         #     available, so take it -- skipping action ids this game has
         #     shown it does not respond to. Skipping only ever advances the
         #     cursor, so "index i means action i" still holds and the graph
         #     bookkeeping stays valid.
+        #
+        #     Already-recorded codes are skipped for the same reason. The
+        #     cursor is not the only thing that spends a node's
+        #     candidates -- momentum and (b1) both take codes out of turn
+        #     -- and without this the cursor walks back over them and
+        #     pays a second time for an outcome `_edges` already holds.
+        #     Gated, because it is a real behaviour change and not only a
+        #     policy concern: replay and stuck-random already record
+        #     edges out of turn today. It is forced on whenever a model
+        #     is driving, where it is load-bearing, and otherwise defaults
+        #     off so the no-model agent stays exactly the one that scored.
         limit = min(len(codes), self._breadth)
         index = self._cursor.get(node, 0)
-        while index < limit and self._is_dead(codes[index]):
+        recorded = (
+            self._edges.get(node, EMPTY_EDGES)
+            if (SKIP_RECORDED or self._policy is not None)
+            else EMPTY_EDGES
+        )
+        while index < limit and (
+            self._is_dead(codes[index]) or codes[index] in recorded
+        ):
             index += 1
         if index < limit and node in self._total:
             self._cursor[node] = index + 1

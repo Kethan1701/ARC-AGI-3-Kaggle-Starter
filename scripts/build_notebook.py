@@ -35,6 +35,31 @@ from textwrap import dedent
 # ─────────────────────────────────────────────────────────────────────────────
 ACCELERATOR = "cpu"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL POLICY (ARC_POLICY)
+# ─────────────────────────────────────────────────────────────────────────────
+# False ships the pure-Python search that scored 0.26 -- no GPU, no weights,
+# no extra mounts, nothing to provision and nothing to fail.
+#
+# True additionally mounts a 27B model and an offline vLLM wheelhouse and
+# sets ARC_POLICY=1, which lets the model choose *which* candidate the
+# search probes next. It requires a GPU accelerator, and `build()` refuses
+# the combination if you forget -- the agent would otherwise spend five
+# minutes failing to load 28GB of weights on a CPU box before falling back.
+POLICY = False
+
+# vLLM is not on the competition image and the run has no internet, so it
+# comes from a mounted wheelhouse. Despite the "h100" in the name, this
+# one's vllm 0.19.0 wheel carries sm_120 kernels and runs on the Blackwell
+# RTX PRO 6000 -- verified by probe, not assumed from the title.
+WHEELHOUSE = "driessmit1/arc3-vllm-h100-wheelhouse-v3"
+
+# Kaggle model slug, and the path it mounts at. ARC-AGI-3 nests inputs
+# under /kaggle/input/models/... rather than the flat /kaggle/input/<slug>
+# used elsewhere on Kaggle; assuming the flat layout cost a probe cycle.
+POLICY_MODEL = "michaelpoluektov/qwen3-6-27b-fp8/transformers/default/1"
+POLICY_MODEL_DIR = f"/kaggle/input/models/{POLICY_MODEL}"
+
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
 # "name" goes in the *notebook* metadata, which is what the web editor reads.
@@ -100,6 +125,42 @@ def build() -> dict:
         "    arc-agi python-dotenv"
     )
 
+    # Installed from a mount, offline. The wheelhouse directory is located
+    # by search rather than by a hardcoded path: the first attempt at this
+    # assumed the flat /kaggle/input/<slug> layout used elsewhere on
+    # Kaggle, and ARC-AGI-3 nests under /kaggle/input/datasets/<owner>/.
+    # It reports loudly on failure -- a silently absent vLLM would look
+    # exactly like a model that merely declined to answer, and the agent
+    # would fall back to search and score 0.26 while appearing to work.
+    vllm_cell = code_cell(
+        dedent(
+            f"""\
+            import pathlib, subprocess, sys
+
+            lock = next(
+                pathlib.Path('/kaggle/input').rglob('requirements.lock'), None)
+            if lock is None:
+                print('WHEELHOUSE NOT FOUND -- is {WHEELHOUSE} attached?')
+                for p in sorted(pathlib.Path('/kaggle/input').glob('*/*')):
+                    print('  ', p)
+            else:
+                print('wheelhouse:', lock.parent)
+                rc = subprocess.call([
+                    sys.executable, '-m', 'pip', 'install', '--no-index',
+                    '--find-links', str(lock.parent),
+                    '--requirement', str(lock),
+                ])
+                print('pip rc:', rc)
+                import importlib
+                try:
+                    v = importlib.import_module('vllm')
+                    print('vllm', v.__version__, 'ready')
+                except Exception as exc:
+                    print('vllm UNUSABLE:', exc)
+            """
+        )
+    )
+
     # We write the agent to /tmp/ (not /kaggle/working/) so it does NOT appear
     # as a notebook output. Otherwise the "Submit to Competition" UI would
     # offer it as a candidate submission file alongside submission.parquet,
@@ -159,8 +220,17 @@ def build() -> dict:
             # Run it. The gateway records every action and emits submission.parquet.
             !cd /kaggle/working/ARC-AGI-3-Agents && \\
                 MPLBACKEND=agg \\
-                python main.py --agent myagent
+                __POLICY_ENV__python main.py --agent myagent
         """
+    )
+    # Substituted rather than interpolated so the CPU notebook carries no
+    # trace of the policy at all -- not even an ARC_POLICY=0 that a later
+    # reader might flip without mounting the weights.
+    run_cell_source = run_cell_source.replace(
+        "__POLICY_ENV__",
+        f"ARC_POLICY=1 \\\n        ARC_POLICY_MODEL={POLICY_MODEL_DIR} \\\n        "
+        if POLICY
+        else "",
     )
     run_cell = code_cell(run_cell_source)
 
@@ -188,6 +258,16 @@ def build() -> dict:
             f"{sorted(_ACCELERATORS)}"
         )
     accel = _ACCELERATORS[ACCELERATOR]
+
+    # Caught here rather than on Kaggle. A policy run without a GPU loads
+    # nothing, falls back to search, and scores what the search scores --
+    # while having spent a GPU-quota-free submission slot looking like a
+    # model run that simply did not help.
+    if POLICY and not accel["gpu"]:
+        raise SystemExit(
+            f"POLICY=True needs a GPU, but ACCELERATOR={ACCELERATOR!r}. "
+            f"Set ACCELERATOR='rtx6000'."
+        )
 
     notebook = {
         "metadata": {
@@ -220,6 +300,7 @@ def build() -> dict:
                 "`make submit`."
             ),
             install_cell,
+            *([vllm_cell] if POLICY else []),
             write_agent_cell,
             run_cell,
             dummy_submission_cell,
@@ -256,6 +337,18 @@ def main() -> None:
         elif meta.get("machine_shape") != accel["shape"]:
             meta["machine_shape"] = accel["shape"]
             changed.append(f"machine_shape={accel['shape']}")
+
+        # The weights and the vLLM wheelhouse have to be *attached*, not
+        # merely referenced: with internet disabled an unmounted source is
+        # not a download that fails, it is a path that does not exist.
+        wanted_datasets = [WHEELHOUSE] if POLICY else []
+        wanted_models = [POLICY_MODEL] if POLICY else []
+        if meta.get("dataset_sources") != wanted_datasets:
+            meta["dataset_sources"] = wanted_datasets
+            changed.append(f"dataset_sources={wanted_datasets}")
+        if meta.get("model_sources") != wanted_models:
+            meta["model_sources"] = wanted_models
+            changed.append(f"model_sources={wanted_models}")
 
         if changed:
             METADATA_PATH.write_text(json.dumps(meta, indent=2) + "\n")
