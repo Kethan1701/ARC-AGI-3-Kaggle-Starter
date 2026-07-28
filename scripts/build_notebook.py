@@ -36,11 +36,30 @@ from textwrap import dedent
 ACCELERATOR = "cpu"
 
 # Internal mapping; don't edit unless Kaggle adds new options.
+#
+# "name" goes in the *notebook* metadata, which is what the web editor reads.
+# "shape" goes in kernel-metadata.json as `machine_shape`, which is the ONLY
+# channel the API push path honours:
+#
+#     request.machine_shape = acc if acc else meta_data.get("machine_shape")
+#         -- kaggle/api/kaggle_api_extended.py
+#
+# `make submit` runs `kaggle kernels push` with no --accelerator, so without
+# `machine_shape` the notebook metadata is ignored and `enable_gpu: true`
+# silently falls back to the server default: a P100. That is not an error and
+# emits no warning -- verified by probing a pushed kernel, which reported
+# "Tesla P100-PCIE-16GB". On a P100 the preinstalled torch 2.10.0+cu128 is
+# unusable anyway; it supports sm_70-sm_120 and P100 is sm_60.
+#
+# An unrecognised shape is likewise accepted silently and yields a P100, so
+# these strings must match Kaggle's enum exactly -- "NvidiaRtx6000" is wrong
+# and was swallowed. "NvidiaRtxPro6000" is verified: it returned "NVIDIA RTX
+# PRO 6000 Blackwell Server Edition", 95GB VRAM, sm_120.
 _ACCELERATORS = {
-    "cpu":     {"name": "none",            "gpu": False},
-    "t4":      {"name": "nvidiaTeslaT4",   "gpu": True},
-    "p100":    {"name": "nvidiaTeslaP100", "gpu": True},
-    "rtx6000": {"name": "nvidiaRtx6000",   "gpu": True},
+    "cpu":     {"name": "none",            "gpu": False, "shape": None},
+    "t4":      {"name": "nvidiaTeslaT4",   "gpu": True,  "shape": "NvidiaTeslaT4"},
+    "p100":    {"name": "nvidiaTeslaP100", "gpu": True,  "shape": "NvidiaTeslaP100"},
+    "rtx6000": {"name": "nvidiaRtx6000",   "gpu": True,  "shape": "NvidiaRtxPro6000"},
 }
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -216,14 +235,31 @@ def main() -> None:
           f"(accelerator: {ACCELERATOR})")
 
     # Keep notebooks/kernel-metadata.json in sync so the user never has to
-    # edit it just to flip CPU ↔ GPU.
+    # edit it just to flip CPU <-> GPU. `machine_shape` matters as much as
+    # `enable_gpu`: it is the only field the API push path reads, and getting
+    # it wrong costs you a P100 with no error. See _ACCELERATORS.
     if METADATA_PATH.exists():
         meta = json.loads(METADATA_PATH.read_text())
-        wanted = _ACCELERATORS[ACCELERATOR]["gpu"]
-        if meta.get("enable_gpu") != wanted:
-            meta["enable_gpu"] = wanted
+        accel = _ACCELERATORS[ACCELERATOR]
+        changed = []
+
+        if meta.get("enable_gpu") != accel["gpu"]:
+            meta["enable_gpu"] = accel["gpu"]
+            changed.append(f"enable_gpu={accel['gpu']}")
+
+        # Drop the key entirely for CPU rather than writing null -- the API
+        # treats a missing shape and a null shape the same, and an explicit
+        # null invites the reader to think a shape was requested.
+        if accel["shape"] is None:
+            if meta.pop("machine_shape", None) is not None:
+                changed.append("machine_shape removed")
+        elif meta.get("machine_shape") != accel["shape"]:
+            meta["machine_shape"] = accel["shape"]
+            changed.append(f"machine_shape={accel['shape']}")
+
+        if changed:
             METADATA_PATH.write_text(json.dumps(meta, indent=2) + "\n")
-            print(f"[build_notebook] Synced enable_gpu={wanted} in "
+            print(f"[build_notebook] Synced {', '.join(changed)} in "
                   f"{METADATA_PATH.relative_to(ROOT)}")
 
 

@@ -381,6 +381,61 @@ STUCK_REEXPLORE_AFTER = _env_int("ARC_STUCK_REEXPLORE", 1_500)
 # samples than 400. sp80 pays one extra action; ls20 and tu93 nearly
 # halve. Note the sweep is not monotone -- sp80 costs 390 at warmup 50 --
 # so this is a floor worth re-measuring rather than tuning blindly.
+# MEASUREMENT ONLY -- 0 reproduces shipped behaviour exactly (n ^ 0 == n).
+#
+# On the games that never close their map the agent is effectively taking a
+# node-hash-seeded random walk, so the aggregate is decided by which one or
+# two games happen to stumble into a level quickly. Two configs can then
+# differ by 40% for reasons that are pure trajectory luck rather than merit.
+# Varying this re-rolls the walk without changing anything else, which is
+# the only way to tell a real effect from a lucky draw.
+AGENT_SEED = _env_int("ARC_SEED", 0)
+
+# Widen breadth the moment the map is exhausted, rather than after
+# STUCK_REEXPLORE_AFTER actions of random flailing. Widening costs zero
+# billed actions; flailing costs one per step. 0 restores the old order for
+# A/B measurement.
+# MEASURED AND REJECTED, kept as a flag because the mechanism is sound and
+# the verdict may flip once the movement games stop random-walking.
+#
+# Widening on exhaustion costs zero billed actions where flailing costs one
+# per step, so this looked like a free win, and on the games that flail it
+# is one: lp85 501 -> 169, lf52 ~515 -> ~290, s5i5 5001 -> 2630, identical
+# across three seeds. But it costs tn36 52 -> 86, also identical across
+# three seeds, and tn36 is the single highest-scoring game on the dev set.
+# Under a quadratic score that one game outweighs all three gains:
+#
+#   seed      off      on     delta
+#     0    0.1129  0.0802   -0.0327
+#   101    0.1223  0.0895   -0.0328
+#   202    0.1651  0.1324   -0.0327
+#
+# Sum of per-game deltas across the 25 games is -2.46, so it is negative in
+# expectation on this sample, not merely unlucky. Preserving the
+# dead-action record through the widen (ARC_WIDEN_CLEARS_DEAD=0) was tested
+# as the suspected cause and changed nothing: tn36 stayed at 86 and the
+# aggregate moved by 0.0002. tn36 is click-only, so what the widen actually
+# does there is admit lower-ranked click targets, and those turn out to be
+# worse than the random coordinates the old stuck path was probing.
+EAGER_WIDEN = _env_int("ARC_EAGER_WIDEN", 0)
+WIDEN_CLEARS_DEAD = _env_int("ARC_WIDEN_CLEARS_DEAD", 1)
+
+# 15 of the 25 dev games never clear level 1 at all, and the diagnostic
+# splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
+# action, so the reachable map never closes and the search degenerates into
+# a random walk. These control the detector for that state and the momentum
+# it switches on. Set ADAPTIVE_MOMENTUM to 0 to restore a single global
+# MOMENTUM_LIMIT for A/B measurement.
+# MEASURED: no effect. At limits 8 and 24, across seeds 101 and 202, the
+# aggregate matched the baseline to within 0.0001 (0.1224 vs 0.1223, 0.1650
+# vs 0.1651). Either the detector does not fire where it matters or momentum
+# changes nothing where it does. Off by default; the detector is left in
+# because `_exploding` is the cheapest available signal that the search has
+# degenerated, and it costs one counter per action.
+EXPLODE_WINDOW = _env_int("ARC_EXPLODE_WINDOW", 200)
+EXPLODE_THRESHOLD = _env_float("ARC_EXPLODE_THRESHOLD", 0.4)
+ADAPTIVE_MOMENTUM = _env_int("ARC_ADAPTIVE_MOMENTUM", 0)
+
 VOLATILE_WARMUP = _env_int("ARC_VOLATILE_WARMUP", 25)
 VOLATILE_THRESHOLD = _env_float("ARC_VOLATILE_THRESHOLD", 0.9)
 
@@ -400,6 +455,13 @@ MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 # Nothing in the scoring path reads either: `submission.parquet` is
 # produced by the gateway sidecar from its own server-side record, and
 # RECORDINGS_DIR is consumed only by the framework's `Playback` agent.
+# Diagnostics only. The budget report normally fires at level transitions,
+# which means the games that never clear level 1 -- 15 of 25 on the dev set,
+# and the whole of the remaining headroom -- are precisely the ones it never
+# says anything about. Set this to e.g. 1000 to get a periodic breakdown.
+# 0 keeps it silent, which is what ships.
+BUDGET_REPORT_EVERY = _env_int("ARC_BUDGET_EVERY", 0)
+
 FRAME_HISTORY = _env_int("ARC_FRAME_HISTORY", 8)
 KEEP_RECORDINGS = _env_int("ARC_KEEP_RECORDINGS", 0)
 
@@ -649,7 +711,7 @@ def candidate_actions(
         live = [a.value for a in GameAction if a is not GameAction.RESET]
 
     simple = [encode_action(a, None, None) for a in live if a != _ACTION6_ID]
-    random.Random(node & 0xFFFFFFFF).shuffle(simple)
+    random.Random((node ^ AGENT_SEED) & 0xFFFFFFFF).shuffle(simple)
 
     codes = simple
     if _ACTION6_ID in live:
@@ -726,6 +788,13 @@ class MyAgent(Agent):
         self._pending_reasoning: Optional[dict[str, Any]] = None
         # queued route to a frontier node: [(node_we_must_be_in, code), ...]
         self._plan: deque[tuple[int, int]] = deque()
+
+        # Rolling estimate of how often an action lands on a node never seen
+        # before. Near 1.0 the map is not closing and the search has
+        # degenerated into a random walk; see EXPLODE_THRESHOLD.
+        self._novel_steps = 0
+        self._novel_new = 0
+        self._exploding = False
 
         self._best_levels = 0
         self._stuck_steps = 0
@@ -810,6 +879,9 @@ class MyAgent(Agent):
             self._sol_edges = {}
 
         node = self._node_key(flat)
+
+        if BUDGET_REPORT_EVERY and self._steps % BUDGET_REPORT_EVERY == 0:
+            self._report_budget(f"still on level {self._level}")
 
         # 1. Learn from the action taken last call, whose outcome is
         #    exactly the frame we are being handed now.
@@ -1049,6 +1121,22 @@ class MyAgent(Agent):
         # is exactly "never expanded before" -- no extra bookkeeping needed.
         self._last_code = code
         self._last_productive = node != prev_node and node not in self._total
+
+        # Is the map closing at all? Measured on the dev set: ar25 creates
+        # 0.66 new nodes per action and sc25 0.60, versus ft09's 0.02. Above
+        # the threshold there is no graph to search -- every node is fresh,
+        # so the cursor is always 0 and "probe-untried" just takes a
+        # node-hash-seeded action. That is a random walk, and a random walk
+        # covers ~sqrt(n) of a grid where a persistent one covers ~n.
+        self._novel_steps += 1
+        if self._last_productive:
+            self._novel_new += 1
+        if self._novel_steps >= EXPLODE_WINDOW:
+            self._exploding = (
+                self._novel_new / self._novel_steps >= EXPLODE_THRESHOLD
+            )
+            self._novel_steps = 0
+            self._novel_new = 0
 
         action_id = code >> (2 * _COORD_BITS)
         self._act_tried[action_id] += 1
@@ -1302,9 +1390,19 @@ class MyAgent(Agent):
         #      the outcome is recorded either way, and `_edges` already
         #      holds the answer for any code tried from this node, so we
         #      never pay twice for the same probe.
+        # Momentum is off by default because on a game whose map *does*
+        # close it conflates motion with progress -- measured at 668 actions
+        # against 78 on sp80. But that argument only holds where there is a
+        # graph to search. On an exploding map there is none, and repeating
+        # a direction is what separates a persistent walk from a random one.
+        momentum_limit = (
+            ADAPTIVE_MOMENTUM
+            if (self._exploding and ADAPTIVE_MOMENTUM)
+            else MOMENTUM_LIMIT
+        )
         if (
             self._last_productive
-            and self._momentum < MOMENTUM_LIMIT
+            and self._momentum < momentum_limit
             and self._last_code is not None
             and self._last_code not in self._edges.get(node, EMPTY_EDGES)
             and (node, self._last_code) not in self._fatal
@@ -1338,7 +1436,45 @@ class MyAgent(Agent):
             self._stuck_steps = 0
             return code, "route-to-frontier"
 
-        # (d) Every reachable node is exhausted.
+        # (d) Every reachable node is exhausted *at the current breadth*.
+        #
+        #     Widening is the only response here that costs zero billed
+        #     actions: cursors stay valid because candidate order is a pure
+        #     function of the grid, so index i still means action i, and
+        #     every node we shallow-probed reopens at once. It therefore has
+        #     to come before anything that spends an action.
+        #
+        #     It used to come *after* STUCK_REEXPLORE_AFTER, so the agent
+        #     paid up to 1500 actions of "stuck-random" -- the least
+        #     informative move available -- before trying the free one.
+        #     Measured on lp85, whose level 1 has a baseline of 17: 369 of
+        #     its 502 level-1 actions were stuck-random. Under a quadratic
+        #     score those actions are not merely wasted, they are the
+        #     difference between ~30x and ~3x baseline.
+        if EAGER_WIDEN and self._breadth < BREADTH_MAX:
+            self._breadth = min(self._breadth * 2, BREADTH_MAX)
+            self._stuck_steps = 0
+            # Give written-off actions another chance: an action that did
+            # nothing everywhere we had been may simply have needed a
+            # precondition we had not reached yet.
+            #
+            # But this used to fire only after 1500 stuck actions, i.e.
+            # almost never. Widening eagerly makes it fire early and often,
+            # which throws away the dead-action record precisely when it is
+            # most valuable. Measured across 3 seeds, eager widening cost
+            # tn36 52 -> 86 actions identically every time; wiping the
+            # record is the suspect, since it re-admits click ids the game
+            # has already shown to be inert.
+            if WIDEN_CLEARS_DEAD:
+                self._act_tried.clear()
+                self._act_changed.clear()
+            logger.info(
+                "%s: map exhausted after %d actions; widening breadth to %d",
+                self.game_id, self._steps, self._breadth,
+            )
+            return self._select(node, grid, latest_frame)
+
+        # Genuinely exhausted: every node probed to BREADTH_MAX.
         self._stuck_steps += 1
 
         # Measured on ls20: the reachable map closes after ~1.6k actions
@@ -1355,26 +1491,6 @@ class MyAgent(Agent):
             if self._replayable():
                 self._start_cycle()
                 return encode_action(_RESET_ID, None, None), "exploit-cycle"
-
-            # Exhausted only at the current breadth. Widening reopens every
-            # node we shallow-probed, and costs nothing but the widening
-            # itself -- cursors stay valid because candidate order is a pure
-            # function of the grid, so index i still means action i. This is
-            # strictly better than the RESET below, which throws away a map
-            # that took thousands of billed actions to build.
-            if self._breadth < BREADTH_MAX:
-                self._breadth = min(self._breadth * 2, BREADTH_MAX)
-                self._stuck_steps = 0
-                # Give written-off actions another chance: an action that
-                # did nothing everywhere we had been may simply have needed
-                # a precondition we had not reached yet.
-                self._act_tried.clear()
-                self._act_changed.clear()
-                logger.info(
-                    "%s: map exhausted after %d actions; widening breadth to %d",
-                    self.game_id, self._steps, self._breadth,
-                )
-                return self._select(node, grid, latest_frame)
 
             logger.info(
                 "%s: reachable map exhausted after %d actions; re-exploring",
