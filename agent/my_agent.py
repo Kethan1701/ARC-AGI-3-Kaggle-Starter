@@ -510,6 +510,38 @@ MASK_LADDER = tuple(
     if x.strip()
 )
 
+# Which rung to take when several find a HUD. "First" stops at the tightest
+# threshold that sees anything; the alternative keeps descending and takes
+# the loosest rung that still clears MASK_CAP_FRACTION -- a bigger mask, but
+# only ever one the cap already approved.
+#
+# It matters more than it sounds. cd82 finds a 64-cell mask at 0.5 and a
+# 1016-cell one at 0.3, worth 274 actions and 191 respectively -- 0.19
+# against 0.40 -- so stopping at the first hit leaves half the gain behind.
+#
+# MEASURED across all 25 dev games, against the same baseline:
+#
+#   first hit (0.7/0.5/0.3)   aggregate 0.1206   cd82 274 actions, 0.19
+#   loosest   (0.7/0.5/0.3)   aggregate 0.1287   cd82 191 actions, 0.40
+#   single rung at 0.3        aggregate 0.1289   cd82 191 actions, 0.40
+#
+# So descending is worth +0.008 over stopping early, and 24 of 25 games are
+# byte-identical to baseline either way -- cd82 is the only one that moves.
+#
+# The last two are the same score, and the ladder is preferred over the bare
+# 0.3 because it degrades where a single rung cannot: re86's mask is over
+# cap at 0.3 and it falls back to 0.50 (496 cells), which `0.3` alone would
+# have missed entirely. Equal locally, more likely to find a usable mask on
+# a game neither of us has seen.
+#
+# One prediction died here and is worth recording: tr87 was expected to keep
+# the level-1 clear its 0.5 rung buys, on the theory that its 0.3 mask would
+# be over cap. It is 1180 cells, 28.8%, comfortably inside the 35% cap -- so
+# tr87 takes 0.3 and goes back to never finishing level 1. That costs no
+# score (it is 0.00 either way) but it is a real regression against the
+# first-hit rule, and the reason to keep MASK_CAP_FRACTION under review.
+MASK_PICK_FIRST = _env_int("ARC_MASK_PICK_FIRST", 0)
+
 # Refuse to mask more than this fraction of the frame. If that much of
 # the board qualifies, the reading is not a HUD and dropping it would
 # collapse unrelated states together.
@@ -1978,20 +2010,27 @@ class MyAgent(Agent):
         # ones this can reach are precisely those whose maps are exploding
         # today for want of one.
         if not volatile and MASK_FALLBACK:
+            chosen: frozenset[int] = frozenset()
+            chosen_at = 0.0
             for threshold in MASK_LADDER:
                 candidate = hud_mask(
                     counts, self._row_changes, self._col_changes,
                     self._samples, width, height, threshold=threshold,
                 )
-                if candidate:
-                    logger.info(
-                        "%s: no HUD at threshold %.2f; falling back to %.2f "
-                        "(%d cells)",
-                        self.game_id, VOLATILE_THRESHOLD, threshold,
-                        len(candidate),
-                    )
-                    volatile = candidate
+                # An over-cap mask comes back empty, so a non-empty
+                # candidate has already cleared MASK_CAP_FRACTION.
+                if not candidate:
+                    continue
+                chosen, chosen_at = candidate, threshold
+                if MASK_PICK_FIRST:
                     break
+            if chosen:
+                logger.info(
+                    "%s: no HUD at threshold %.2f; falling back to %.2f "
+                    "(%d cells)",
+                    self.game_id, VOLATILE_THRESHOLD, chosen_at, len(chosen),
+                )
+                volatile = chosen
 
         # Free the counters; they are dead weight for the rest of the run.
         self._cell_changes = []
