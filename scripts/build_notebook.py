@@ -81,12 +81,17 @@ POLICY_MODEL_DIR = f"/kaggle/input/models/{POLICY_MODEL}"
 # and was swallowed. "NvidiaRtxPro6000" is verified: it returned "NVIDIA RTX
 # PRO 6000 Blackwell Server Edition", 95GB VRAM, sm_120.
 #
-# The shape is necessary but NOT sufficient. The card is entitlement-gated on
-# competition membership: a probe with the correct shape and an empty
-# `competition_sources` was handed a P100, and pulling the kernel back still
-# showed `machine_shape: NvidiaRtxPro6000` -- Kaggle records what you asked
-# for and gives you what you are entitled to. See
-# tests/test_the_competition_stays_attached.
+# The shape in the metadata is necessary but NOT sufficient, and the comment
+# above overstates it. Measured on CLI 2.2.4 with three pushes of one probe:
+#
+#   metadata shape only, no flag  -> Tesla P100        (sm_60)
+#   metadata shape + --accelerator -> RTX PRO 6000     (sm_120)
+#
+# Both kernels reported `machine_shape: NvidiaRtxPro6000` when pulled back,
+# so the metadata field is stored and then not acted on. `make submit` now
+# reads the shape out of kernel-metadata.json and passes it as
+# `--accelerator`; do not remove that, or a GPU submission silently runs on
+# a P100 where the preinstalled torch cannot execute at all.
 _ACCELERATORS = {
     "cpu":     {"name": "none",            "gpu": False, "shape": None},
     "t4":      {"name": "nvidiaTeslaT4",   "gpu": True,  "shape": "NvidiaTeslaT4"},
