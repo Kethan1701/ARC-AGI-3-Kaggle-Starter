@@ -307,10 +307,17 @@ def _half_rate(width, height, n, digits=4, period=2):
 
 
 def test_the_mask_fallback_ships_on():
-    """Measured across all 25 dev games: cd82 0.00 -> 0.19 (2461 -> 274
-    actions), tr87 reaching level 1 for the first time, 23 games
-    byte-identical, aggregate 0.1129 -> 0.1206."""
+    """Measured across all 25 dev games: cd82 0.00 -> 0.40, 2461 -> 191
+    actions and two levels cleared instead of one, 24 games byte-identical,
+    aggregate 0.1129 -> 0.1287."""
     assert agent.MASK_FALLBACK == 1
+
+
+def test_the_ladder_ships_taking_the_loosest_rung():
+    """Stopping at the first hit leaves half the gain behind: cd82 lands on
+    a 64-cell mask at 0.5 (274 actions, 0.19) instead of the 1016-cell one
+    at 0.3 (191 actions, 0.40). Measured 0.1206 vs 0.1287 aggregate."""
+    assert agent.MASK_PICK_FIRST == 0
 
 
 def test_the_ladder_only_ever_relaxes():
@@ -346,6 +353,60 @@ def test_the_fallback_catches_a_half_rate_hud(monkeypatch):
     fired = _feed(a, frames, width, height)
     assert fired is not None, "the fallback did not adopt any mask"
     assert a._volatile, "fired but masked nothing"
+
+
+def _two_rate(width, height, n, fast=4, slow=8):
+    """A fast HUD block and a slower one, so the rungs disagree.
+
+    The fast cells change every step and qualify at any threshold; the slow
+    ones change every third step and only qualify low down the ladder. So
+    "first hit" and "loosest that fits" pick measurably different masks --
+    which is the whole distinction cd82 turns on.
+    """
+    out = []
+    for step in range(n):
+        flat = [0] * (width * height)
+        for x in range(fast):
+            flat[x] = (step + x) % 7 + 1
+        for x in range(slow):
+            flat[10 * width + x] = (step // 3 + x) % 7 + 1
+        out.append(flat)
+    return out
+
+
+def test_taking_the_loosest_rung_masks_at_least_as_much(monkeypatch):
+    """Option 3. Descending past the first hit can only widen the mask, and
+    only ever to one MASK_CAP_FRACTION has already approved."""
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
+    monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3))
+    width = height = 32
+    frames = _two_rate(width, height, agent.VOLATILE_WARMUP + 2)
+
+    monkeypatch.setattr(agent, "MASK_PICK_FIRST", 1)
+    first = _blank_agent()
+    _feed(first, frames, width, height)
+
+    monkeypatch.setattr(agent, "MASK_PICK_FIRST", 0)
+    loosest = _blank_agent()
+    _feed(loosest, frames, width, height)
+
+    assert first._volatile, "the fixture must trip the fallback at all"
+    assert loosest._volatile >= first._volatile
+    assert len(loosest._volatile) <= agent.MASK_CAP_FRACTION * width * height
+
+
+def test_the_loosest_rung_still_respects_the_cap(monkeypatch):
+    """The cap is the only thing standing between a looser threshold and a
+    mask that swallows the board, so descending must not bypass it."""
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
+    monkeypatch.setattr(agent, "MASK_PICK_FIRST", 0)
+    monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3, 0.05))
+    width = height = 32
+    frames = [[(step + i) % 5 for i in range(width * height)]
+              for step in range(agent.VOLATILE_WARMUP + 2)]
+    a = _blank_agent()
+    _feed(a, frames, width, height)
+    assert not a._volatile
 
 
 def test_the_fallback_cannot_touch_a_game_that_already_masks(monkeypatch):
