@@ -442,6 +442,44 @@ ADAPTIVE_MOMENTUM = _env_int("ARC_ADAPTIVE_MOMENTUM", 0)
 VOLATILE_WARMUP = _env_int("ARC_VOLATILE_WARMUP", 25)
 VOLATILE_THRESHOLD = _env_float("ARC_VOLATILE_THRESHOLD", 0.9)
 
+# Everything sampled before the mask is adopted is charged to level 1 and
+# then thrown away: adopting it re-keys every node, so the map built so far
+# is discarded. Traced on r11l, whose level 1 costs 112 actions against a
+# baseline of 22 -- 26 of them are spent before the mask fires, and the
+# route that actually clears the level is 4 actions long.
+#
+# Lowering VOLATILE_WARMUP globally is not the answer; that sweep is known
+# to be non-monotone (sp80: 79 actions at 25, 390 at 50, 78 at 100 and 400)
+# and cn04 stopped clearing level 1 entirely when it was reduced. Fewer
+# samples means a worse mask, and a wrong mask fuses distinct states.
+#
+# So fire early only where the evidence is not in doubt: cells that changed
+# on EVERY transition so far, agreeing for several consecutive samples. A
+# ticking timer qualifies immediately; a cell that merely changes often does
+# not, and waits for the full statistical rule at VOLATILE_WARMUP. This can
+# only ever move the decision earlier, never later, and never changes which
+# mask the 25-sample rule would pick when the early rule declines to fire.
+#
+# MEASURED AND REJECTED. It does what it says -- r11l and vc33 adopt their
+# masks at action 10 instead of 26 -- and the saved actions buy nothing:
+#
+#     game    off     on
+#     vc33     99     66     better
+#     ls20    526    842     worse
+#     r11l    112    112     identical (nodes 42 -> 52)
+#     cd82/m0r0/lp85         identical (no mask adopted either way)
+#
+# Both arms adopt the IDENTICAL mask; only the timing differs. So the ±60%
+# swings are trajectory luck of the kind this file already documents, not
+# merit, and r11l is the tell: 16 actions saved before the mask, 16 more
+# spent exploring after it, same 112 total. What sets a level's cost is the
+# number of probes needed to stumble on the exit, not when the map starts.
+# Kept as a flag because the mechanism is correct and costs one comparison
+# per sample; it just is not where the money is.
+EARLY_MASK = _env_int("ARC_EARLY_MASK", 0)
+EARLY_MASK_MIN = _env_int("ARC_EARLY_MASK_MIN", 6)
+EARLY_MASK_STABLE = _env_int("ARC_EARLY_MASK_STABLE", 3)
+
 # Refuse to mask more than this fraction of the frame. If that much of
 # the board qualifies, the reading is not a HUD and dropping it would
 # collapse unrelated states together.
@@ -1341,6 +1379,10 @@ class MyAgent(Agent):
         self._mask_frozen = False
         self._kept: Optional[tuple[int, ...]] = None   # flat indices in the key
         self._volatile: frozenset[int] = frozenset()   # flat indices excluded
+        # Early-fire bookkeeping (see EARLY_MASK): the last unanimous-change
+        # mask proposed, and how many consecutive samples have agreed on it.
+        self._early_candidate: frozenset[int] = frozenset()
+        self._early_stable = 0
 
         # --- execution bookkeeping ----------------------------------
         # (node, code) awaiting its outcome, folded in on the next call
@@ -1852,7 +1894,35 @@ class MyAgent(Agent):
         self._samples += 1
 
         if self._samples < VOLATILE_WARMUP:
-            return False
+            if not EARLY_MASK or self._samples < EARLY_MASK_MIN:
+                return False
+            # Unanimous change only: threshold 1.0 means "this cell (or its
+            # row/column) moved on every single transition we have seen".
+            # A timer or a frame counter clears that bar at once; a cell
+            # that is merely busy does not, and falls through to the
+            # statistical rule below at VOLATILE_WARMUP.
+            candidate = hud_mask(
+                counts, self._row_changes, self._col_changes,
+                self._samples, width, height, threshold=1.0,
+            )
+            if not candidate or candidate != self._early_candidate:
+                self._early_candidate = candidate
+                self._early_stable = 0
+                return False
+            self._early_stable += 1
+            if self._early_stable < EARLY_MASK_STABLE:
+                return False
+            # Converged. Adopt it and stop sampling.
+            self._mask_frozen = True
+            self._cell_changes = []
+            self._row_changes = []
+            self._col_changes = []
+            self._prev_flat = None
+            self._volatile = candidate
+            self._kept = tuple(
+                i for i in range(len(flat)) if i not in candidate
+            )
+            return True
 
         self._mask_frozen = True
         volatile = hud_mask(

@@ -215,3 +215,97 @@ def test_volatile_single_cell_counter_is_masked():
     cells[5 * width + 5] = 200
     mask = agent.hud_mask(cells, [0] * height, [0] * width, 200, width, height)
     assert mask == frozenset({5 * width + 5})
+
+
+# ------------------------------------------------------------------
+# Firing the mask early (see EARLY_MASK)
+# ------------------------------------------------------------------
+def _feed(agent_obj, frames, width, height):
+    """Push frames through `_learn_mask`, returning the sample it fired on."""
+    for i, flat in enumerate(frames):
+        if agent_obj._learn_mask(tuple(flat), width, height):
+            return i
+    return None
+
+
+def _blank_agent():
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a._mask_frozen = False
+    a._prev_flat = None
+    a._cell_changes = []
+    a._row_changes = []
+    a._col_changes = []
+    a._samples = 0
+    a._volatile = frozenset()
+    a._kept = None
+    a._early_candidate = frozenset()
+    a._early_stable = 0
+    return a
+
+
+def _ticking(width, height, n, digits=4):
+    """`n` frames whose only change is a small counter in the top-left.
+
+    Deliberately narrow. A HUD spanning the full width makes every column
+    volatile as well as the row, the union covers the whole frame, and
+    MASK_CAP_FRACTION then -- correctly -- refuses to mask anything. A real
+    counter occupies a few columns, which is what leaves a mask to adopt.
+    """
+    out = []
+    for step in range(n):
+        flat = [0] * (width * height)
+        for x in range(digits):
+            flat[x] = (step + x) % 7 + 1
+        out.append(flat)
+    return out
+
+
+def test_the_early_mask_is_off_by_default():
+    """It measured as a wash -- vc33 99 -> 66 actions but ls20 526 -> 842,
+    with both arms adopting the identical mask and only the timing
+    differing. That is trajectory luck, not merit, so it does not ship on."""
+    assert agent.EARLY_MASK == 0
+
+
+def test_a_ticking_row_is_masked_early_when_enabled(monkeypatch):
+    monkeypatch.setattr(agent, "EARLY_MASK", 1)
+    width = height = 32
+    fired = _feed(_blank_agent(), _ticking(width, height, 30), width, height)
+    assert fired is not None
+    assert fired < agent.VOLATILE_WARMUP, (
+        f"fired at sample {fired}; the whole point is to beat "
+        f"VOLATILE_WARMUP={agent.VOLATILE_WARMUP}"
+    )
+
+
+def test_the_early_mask_never_fires_later_than_the_baseline_rule(monkeypatch):
+    """It may only move the decision earlier. If the unanimous rule never
+    converges, the statistical rule at VOLATILE_WARMUP must still fire on
+    exactly the sample it always would."""
+    width = height = 32
+    frames = _ticking(width, height, 40)
+
+    monkeypatch.setattr(agent, "EARLY_MASK", 0)
+    late = _feed(_blank_agent(), frames, width, height)
+    monkeypatch.setattr(agent, "EARLY_MASK", 1)
+    early = _feed(_blank_agent(), frames, width, height)
+
+    assert late is not None and early is not None
+    assert early <= late
+
+
+def test_an_erratic_cell_does_not_trigger_the_early_mask(monkeypatch):
+    """The early rule demands change on EVERY transition. A cell that is
+    merely busy must wait for the statistical rule, or a moving player
+    piece gets masked and distinct states collapse into one node."""
+    monkeypatch.setattr(agent, "EARLY_MASK", 1)
+    width = height = 32
+    frames = []
+    for step in range(agent.VOLATILE_WARMUP - 2):
+        flat = [0] * (width * height)
+        # Hold each value for three frames, so two transitions out of every
+        # three see no change at all. Alternating 0,5,0,5 would not do:
+        # every transition is a change, which is genuinely unanimous.
+        flat[3 * width + 3] = (step // 3) % 6
+        frames.append(flat)
+    assert _feed(_blank_agent(), frames, width, height) is None
