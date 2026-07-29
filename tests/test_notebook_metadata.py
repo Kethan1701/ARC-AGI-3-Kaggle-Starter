@@ -1,20 +1,19 @@
 """The accelerator you ask for is not necessarily the one you get.
 
-`make submit` runs `kaggle kernels push` with no `--accelerator`, and the API
-push path reads exactly one field:
+Three different ways to end up on a P100, none of which report anything:
 
-    request.machine_shape = acc if acc else meta_data.get("machine_shape")
-        -- kaggle/api/kaggle_api_extended.py
+1. No `machine_shape` in kernel-metadata.json. The `accelerator` key that
+   `build_notebook.py` writes into *notebook* metadata is read by the web
+   editor and ignored by the API, so the run takes the server default.
+2. A `machine_shape` that is not the exact enum spelling. "NvidiaRtx6000"
+   was accepted and silently downgraded; only "NvidiaRtxPro6000" works.
+3. The right shape with the competition detached. The card is gated on
+   competition membership, and passing `--accelerator` does not buy your
+   way past it -- measured, see `test_the_competition_stays_attached`.
 
-The `accelerator` key that `build_notebook.py` writes into *notebook* metadata
-is read by the web editor and ignored by the API. So a GPU submission with no
-`machine_shape` silently lands on the server default -- a P100 -- with no
-error and no warning. Verified by probing a pushed kernel: it reported
-"Tesla P100-PCIE-16GB", on which the preinstalled torch 2.10.0+cu128 cannot
-run at all (it supports sm_70-sm_120; P100 is sm_60).
-
-An unrecognised shape string fails the same silent way: "NvidiaRtx6000" was
-accepted and yielded a P100. Only "NvidiaRtxPro6000" returned the real card.
+In every case the kernel still reports the shape you asked for when pulled
+back, and in every case the preinstalled torch 2.10.0+cu128 cannot execute
+on what you actually got (it supports sm_70-sm_120; the P100 is sm_60).
 """
 from __future__ import annotations
 
@@ -80,35 +79,39 @@ def test_competition_requires_internet_disabled():
 
 
 def test_the_competition_stays_attached():
-    """`environment_files` is mounted from the competition, so detaching it
-    leaves the agent with no game to play.
+    """Detaching it breaks the run twice over, both times silently.
 
-    (An earlier version of this test also blamed a P100 downgrade on a
-    missing attachment. That was wrong -- a later probe got the RTX PRO
-    6000 with `competition_sources` empty. The downgrade is about the
-    push flag, and is pinned by `test_submit_passes_the_shape_on_the_
-    command_line` instead.)
+    `environment_files` is mounted from the competition, so without it
+    there is no game to play. Less obviously, the RTX PRO 6000 is gated on
+    competition membership. Measured with a one-cell kernel that prints
+    its own device, varying one field at a time:
+
+        competition_sources           --accelerator   device
+        ["arc-prize-2026-arc-agi-3"]  absent          RTX PRO 6000 sm_120
+        []                            absent          Tesla P100   sm_60
+        []                            passed          Tesla P100   sm_60
+
+    The push flag changes nothing; the attachment decides it. A detached
+    kernel still reports `machine_shape: NvidiaRtxPro6000` when pulled
+    back, so nothing anywhere says you were downgraded -- and on a P100
+    the preinstalled torch cannot execute at all (sm_70-sm_120 vs sm_60).
     """
     meta = json.loads((ROOT / "notebooks" / "kernel-metadata.json").read_text())
     assert meta["competition_sources"] == ["arc-prize-2026-arc-agi-3"]
 
 
-def test_submit_passes_the_shape_on_the_command_line():
-    """Putting `machine_shape` in kernel-metadata.json is not enough.
+def test_submit_still_passes_the_shape_on_the_command_line():
+    """Belt and braces, and labelled as such.
 
-    Measured on Kaggle CLI 2.2.4 by pushing one probe three times: with the
-    shape in the metadata and no `--accelerator`, the run landed on a Tesla
-    P100; adding the flag returned the RTX PRO 6000 (sm_120). Both kernels
-    reported `machine_shape: NvidiaRtxPro6000` when pulled back, so the
-    field is recorded and then ignored. On the P100 the preinstalled torch
-    cannot run at all, and nothing in the push output hints at any of it.
+    The ablation above shows `--accelerator` is not what wins the card, so
+    this pins insurance rather than the fix -- it keeps the request visible
+    on the wire if Kaggle ever starts honouring it. Reading the value back
+    out of kernel-metadata.json keeps one source of truth, so the flag
+    cannot drift away from ACCELERATOR.
     """
     makefile = (ROOT / "Makefile").read_text()
     submit = makefile.split("submit:", 1)[1].split("\nstatus:", 1)[0]
-    assert "--accelerator" in submit, (
-        "`make submit` must pass the requested shape as --accelerator; "
-        "the metadata field alone silently yields a P100"
-    )
+    assert "--accelerator" in submit
     assert "machine_shape" in submit, (
         "the flag must come from kernel-metadata.json, not be hardcoded, "
         "or it will disagree with ACCELERATOR the first time it changes"
