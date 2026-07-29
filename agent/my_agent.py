@@ -423,6 +423,59 @@ AGENT_SEED = _env_int("ARC_SEED", 0)
 EAGER_WIDEN = _env_int("ARC_EAGER_WIDEN", 0)
 WIDEN_CLEARS_DEAD = _env_int("ARC_WIDEN_CLEARS_DEAD", 1)
 
+# EAGER_WIDEN above was rejected for widening everywhere, including on games
+# where the first 12 candidates are the right ones. But there are games where
+# the window is demonstrably wrong, and they can be told apart from the
+# others while the run is happening.
+#
+# Measured by recording the candidate rank of every action taken:
+#
+#   game  clicks  that moved   median rank of those   breadth
+#   ft09     677     3 (0.4%)          83  (max 91)      12
+#   lp85     364        (2%)   cleared by stuck-random,
+#                              i.e. a coordinate not in the list at all
+#   sb26    1366       (65%)          10                 12
+#   s5i5     204        (7%)           0                 12
+#
+# ft09's productive clicks sit at ranks 83-91 and the window is 12, so the
+# search cannot reach them at all; it does eventually widen to 96 and find
+# them, thousands of actions later, via STUCK_REEXPLORE_AFTER. tn36, the
+# game eager widening broke, moves the board on 43% of its clicks -- so
+# gating on click liveness leaves it alone by construction.
+#
+# Note this does NOT contradict the finding that the click prior ranks
+# level-clearing actions at 0-6: that held on r11l, sp80, vc33 and tn36,
+# every one of which clears level 1. On the games that never clear, the
+# picture inverts. Both are true of the games they were measured on.
+#
+# Measured over all 25 dev games (aggregate 0.1288 -> 0.1299). What the
+# reasoning above got right and wrong, recorded so the next change is not
+# argued from the same priors:
+#
+#   ft09  FALSIFIED. It is the game this was designed for, and the gate
+#         fired exactly as intended -- widened 24 -> 48 -> 96, reaching
+#         the rank-83-91 clicks. Still 5001 actions, 0 levels. Reaching a
+#         productive click is evidently not sufficient to use one, so
+#         "the window cannot see it" was not ft09's binding constraint.
+#   su15  unpredicted, and the largest win: 5001 -> 248 actions, clears
+#         level 0 for the first time.
+#   s5i5  unpredicted: 5001 -> 2386, now reaches level 1.
+#   lp85  501 -> 234, as hoped, though for unclear reasons.
+#   tn36  untouched, byte-identical, as the 43% hit rate requires.
+#   sp80  untouched, byte-identical.
+#
+# The aggregate moves little because the newly-clearing games clear slowly
+# and the score is quadratic in overrun. It ships for the structural
+# change: two games moved from "never leaves level 0" to "clears it", and
+# no level can be made fast before it can be finished at all.
+LIVENESS_WIDEN = _env_int("ARC_LIVENESS_WIDEN", 1)
+# Don't judge liveness on a handful of samples; 12 clicks is one full
+# window's worth.
+LIVENESS_MIN_CLICKS = _env_int("ARC_LIVENESS_MIN_CLICKS", 40)
+# At or below this hit rate the window is not paying for itself. sb26 (65%)
+# and tn36 (43%) are far above it; ft09 (0.4%) and lp85 (2%) far below.
+LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
+
 # 15 of the 25 dev games never clear level 1 at all, and the diagnostic
 # splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
 # action, so the reachable map never closes and the search degenerates into
@@ -1462,6 +1515,10 @@ class MyAgent(Agent):
         self._total: dict[int, int] = {}          # node -> candidate count
         self._cursor: dict[int, int] = {}         # node -> next index to try
         self._breadth = BREADTH_INITIAL           # candidates per node, deepens
+        # Click hit rate for the current level (see LIVENESS_WIDEN). Reset at
+        # each level boundary, alongside the breadth it governs.
+        self._click_tried = 0
+        self._click_live = 0
         self._why_counts: Counter[str] = Counter()  # billed actions by reason
         self._class_counts: Counter[str] = Counter()  # click/press hit rate
         self._last_code: Optional[int] = None     # code of the previous action
@@ -1884,6 +1941,14 @@ class MyAgent(Agent):
         if node != prev_node:
             self._class_counts[kind + "-live"] += 1
 
+        # Separate counters for LIVENESS_WIDEN. `_class_counts` cannot serve:
+        # `_report_budget` clears it, so switching diagnostics on would
+        # silently change what the search does.
+        if kind == "click":
+            self._click_tried += 1
+            if node != prev_node:
+                self._click_live += 1
+
     def _begin_level(self, node: int) -> None:
         """Root a fresh solution graph at the state the level starts in."""
         self._sol_edges = {}
@@ -1895,6 +1960,8 @@ class MyAgent(Agent):
         # boundary would spend the new level's budget at the old level's
         # difficulty.
         self._breadth = BREADTH_INITIAL
+        self._click_tried = 0
+        self._click_live = 0
         # The dead-action record deliberately survives the level boundary.
         # Which actions a game wires up is a property of the *game*, not of
         # the level, so clearing it made every level re-pay the cost of
@@ -2363,6 +2430,32 @@ class MyAgent(Agent):
         #     its 502 level-1 actions were stuck-random. Under a quadratic
         #     score those actions are not merely wasted, they are the
         #     difference between ~30x and ~3x baseline.
+        #     Widening unconditionally was measured and rejected. Widening
+        #     where the window has demonstrably failed is a different claim:
+        #     on ft09 the clicks that move the board sit at ranks 83-91, so
+        #     at breadth 12 the search cannot reach them however long it
+        #     runs. Fire only once enough clicks have been tried to judge,
+        #     and only when almost none of them did anything.
+        if (
+            LIVENESS_WIDEN
+            and self._breadth < BREADTH_MAX
+            and self._click_tried >= LIVENESS_MIN_CLICKS
+            and self._click_live <= LIVENESS_DEAD_RATE * self._click_tried
+        ):
+            self._breadth = min(self._breadth * 2, BREADTH_MAX)
+            self._stuck_steps = 0
+            # Deliberately NOT clearing the dead-action record. That wipe is
+            # the suspected cause of eager widening costing tn36 52 -> 86
+            # actions, and on a game whose clicks are already inert the
+            # record is the most valuable thing the run has learned.
+            logger.info(
+                "%s: clicks are dead (%d/%d live) after %d actions; "
+                "widening breadth to %d",
+                self.game_id, self._click_live, self._click_tried,
+                self._steps, self._breadth,
+            )
+            return self._select(node, grid, latest_frame)
+
         if EAGER_WIDEN and self._breadth < BREADTH_MAX:
             self._breadth = min(self._breadth * 2, BREADTH_MAX)
             self._stuck_steps = 0

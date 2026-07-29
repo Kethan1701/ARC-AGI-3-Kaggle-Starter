@@ -421,6 +421,85 @@ def test_the_loosest_rung_still_respects_the_cap(monkeypatch):
     assert not a._volatile
 
 
+def _widen_agent(module_agent, tried, live, breadth=None):
+    """An agent posed at branch (d): map exhausted, nothing left to route to."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._click_tried = tried
+    a._click_live = live
+    a._breadth = agent.BREADTH_INITIAL if breadth is None else breadth
+    a._stuck_steps = 99
+    return a
+
+
+def _would_widen(a):
+    """The LIVENESS_WIDEN gate, evaluated exactly as `_select` evaluates it."""
+    return (
+        bool(agent.LIVENESS_WIDEN)
+        and a._breadth < agent.BREADTH_MAX
+        and a._click_tried >= agent.LIVENESS_MIN_CLICKS
+        and a._click_live <= agent.LIVENESS_DEAD_RATE * a._click_tried
+    )
+
+
+def test_the_liveness_widen_is_on_by_default():
+    """Shipped on after a full 25-game A/B: su15 and s5i5 go from never
+    leaving level 0 to clearing it, and the two games that carry the
+    aggregate (tn36, sp80) come out byte-identical."""
+    assert agent.LIVENESS_WIDEN == 1
+
+
+def test_dead_clicks_widen_the_window(monkeypatch):
+    """ft09: 3 of 677 clicks move anything, and the ones that do sit at
+    ranks 83-91 -- unreachable at breadth 12 however long the run lasts."""
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert _would_widen(_widen_agent(agent, tried=677, live=3))
+
+
+def test_live_clicks_never_widen(monkeypatch):
+    """tn36 moves the board on 43% of clicks and is the game unconditional
+    widening broke, 52 -> 86 actions. The gate must never reach it."""
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert not _would_widen(_widen_agent(agent, tried=1000, live=430))
+    # sb26 at 65%, s5i5 at 7% -- the latter is genuinely lowish but still
+    # well clear of the 10% floor.
+    assert not _would_widen(_widen_agent(agent, tried=1366, live=886))
+
+
+def test_liveness_needs_a_fair_sample_first(monkeypatch):
+    """Two dead clicks in a row is not evidence the window is wrong."""
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert not _would_widen(_widen_agent(agent, tried=2, live=0))
+    assert not _would_widen(
+        _widen_agent(agent, tried=agent.LIVENESS_MIN_CLICKS - 1, live=0))
+
+
+def test_liveness_widen_stops_at_the_ceiling(monkeypatch):
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert not _would_widen(
+        _widen_agent(agent, tried=677, live=3, breadth=agent.BREADTH_MAX))
+
+
+def test_the_liveness_counters_reset_with_the_breadth_they_govern():
+    """Breadth resets per level because each level is scored on its own
+    actions; the hit rate that decides whether to widen must reset with it,
+    or a dead level-1 keeps widening a level 2 that clicks fine."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._click_tried = 500
+    a._click_live = 2
+    a._sol_edges = {}
+    a._sol_start = 0
+    a._sol_full = False
+    a._sol_count = 0
+    a._breadth = 96
+    a._act_tried = agent.Counter()
+    a._act_changed = agent.Counter()
+    agent.MyAgent._begin_level(a, 0)
+    assert a._breadth == agent.BREADTH_INITIAL
+    assert a._click_tried == 0 and a._click_live == 0
+
+
 def test_the_collapse_guard_ships_on():
     """Measured across all 25 dev games: five masks vetoed, all for fusing
     every sampled frame into one state, tr87 back to clearing level 1
