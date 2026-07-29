@@ -241,6 +241,9 @@ def _blank_agent():
     a._kept = None
     a._early_candidate = frozenset()
     a._early_stable = 0
+    # Warmup frames the collapse guard judges candidate masks against. Empty
+    # means "no evidence", and the guard abstains rather than vetoing.
+    a._mask_frames = []
     return a
 
 
@@ -296,12 +299,21 @@ def test_the_early_mask_never_fires_later_than_the_baseline_rule(monkeypatch):
 
 
 def _half_rate(width, height, n, digits=4, period=2):
-    """A HUD that updates every `period`-th step: real, but under 0.9."""
+    """A HUD updating every `period`-th step -- real, but under 0.9.
+
+    The board also moves, slowly: without that, masking the HUD fuses every
+    frame into one state and the collapse guard rightly refuses the mask.
+    cd82, which this models, keeps 12 distinct keys once its HUD is gone.
+    The board block changes every fifth step, well under the loosest rung,
+    so it never qualifies as volatile itself.
+    """
     out = []
     for step in range(n):
         flat = [0] * (width * height)
         for x in range(digits):
             flat[x] = (step // period + x) % 7 + 1
+        for x in range(10, 18):
+            flat[20 * width + x] = (step // 5) % 3 + 9
         out.append(flat)
     return out
 
@@ -407,6 +419,68 @@ def test_the_loosest_rung_still_respects_the_cap(monkeypatch):
     a = _blank_agent()
     _feed(a, frames, width, height)
     assert not a._volatile
+
+
+def test_the_collapse_guard_ships_on():
+    """Measured across all 25 dev games: five masks vetoed, all for fusing
+    every sampled frame into one state, tr87 back to clearing level 1
+    (5001 -> 2538 actions), no game regressed. Aggregate is unmoved at
+    0.1288 -- this ships as a correctness fix, not a scoring one."""
+    assert agent.MASK_COLLAPSE_GUARD == 1
+
+
+def test_a_small_mask_may_fuse_every_frame(monkeypatch):
+    """tn36's case, and the reason collapse alone cannot be the rule: it
+    masks 64 cells, fuses all 26 warmup frames into one key, and is the
+    highest-scoring game on the dev set. The board really was static."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    total = 32 * 32
+    a = _blank_agent()
+    # Frames identical apart from a tiny corner that ticks every step.
+    a._mask_frames = [
+        bytes([step % 5 if i < 8 else 3 for i in range(total)])
+        for step in range(20)
+    ]
+    small = frozenset(range(8))          # 8 cells, 0.8% of the frame
+    assert a._mask_is_credible(small, total)
+
+
+def test_a_large_mask_that_fuses_every_frame_is_rejected(monkeypatch):
+    """tr87's case: a 28.8% mask collapsing everything is not a HUD, it is
+    the mask deleting the board, and taking it loses a level-1 clear."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    total = 32 * 32
+    a = _blank_agent()
+    a._mask_frames = [
+        bytes([step % 5 if i < 400 else 3 for i in range(total)])
+        for step in range(20)
+    ]
+    big = frozenset(range(400))          # 39% of the frame
+    assert not a._mask_is_credible(big, total)
+
+
+def test_a_large_mask_that_preserves_distinct_states_is_kept(monkeypatch):
+    """cd82's case: 16.5% of the frame, still 12 distinct keys left. That
+    is a real HUD on a game that genuinely moves, and rejecting it would
+    throw away the largest single gain measured so far."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    total = 32 * 32
+    a = _blank_agent()
+    a._mask_frames = [
+        bytes([step % 5 if i < 400 else (step % 7) + 8 for i in range(total)])
+        for step in range(20)
+    ]
+    big = frozenset(range(400))
+    assert a._mask_is_credible(big, total)
+
+
+def test_the_guard_never_rescues_a_mask_the_cap_refused(monkeypatch):
+    """It is a veto and nothing else. Without frames to judge against it
+    must abstain rather than invent an opinion."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    a = _blank_agent()
+    a._mask_frames = []
+    assert a._mask_is_credible(frozenset(range(900)), 32 * 32)
 
 
 def test_the_fallback_cannot_touch_a_game_that_already_masks(monkeypatch):

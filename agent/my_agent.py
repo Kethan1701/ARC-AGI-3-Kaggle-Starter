@@ -542,6 +542,50 @@ MASK_LADDER = tuple(
 # first-hit rule, and the reason to keep MASK_CAP_FRACTION under review.
 MASK_PICK_FIRST = _env_int("ARC_MASK_PICK_FIRST", 0)
 
+# MASK_CAP_FRACTION gates on how much of the frame a mask covers, and that
+# is the wrong axis: it is simultaneously too loose and too tight. tr87
+# masks 28.8% at rung 0.3, passes, and loses the level-1 clear its 0.5 rung
+# was buying; m0r0 qualifies 44%, is refused, and goes on exploding at 1294
+# nodes in 1975 actions. No single fraction separates those.
+#
+# What does separate them is what the mask DOES to the frames already in
+# hand. Measured at the decision point, over the warmup frames:
+#
+#   game  rung  mask          distinct keys   outcome
+#   tn36  0.9     64 (1.6%)         1         1.35, the best game we have
+#   tr87  0.3   1180 (28.8%)        1         loses its level-1 clear
+#   tr87  0.5    496 (12.1%)       22         gives the clear
+#   cd82  0.3    674 (16.5%)       12         0.40
+#   sc25  0.5    616 (15.0%)        1         explodes, 0.00
+#   sc25  0.7    256 (6.2%)        15         --
+#
+# Fusing every observed frame into a single state is the failure mode, and
+# tn36 shows it is not fatal on its own: a 64-cell mask that collapses
+# everything means the board genuinely did not move except in the HUD. A
+# 1180-cell mask that collapses everything is deleting real content. So
+# reject only the conjunction -- total collapse AND a mask too big to be
+# plausibly just a HUD -- and fall back to the next tighter rung.
+#
+# MEASURED across all 25 dev games. It vetoes five masks, every one of them
+# for fusing all 25 sampled frames into a single state: tr87 (1180 cells,
+# 29%), sc25 (1096 then 616), ka59 (802), dc22 (438). cd82's 1016-cell mask
+# is left alone because 12 distinct keys survive it, and tn36, sp80 and r11l
+# never reach this path at all.
+#
+# The score effect is nil -- 0.1287 -> 0.1288 -- because the one game it
+# rescues, tr87, scores 0.00 either way. What it buys is tr87 going back to
+# clearing level 1 (5001 -> 2538 actions) and, more to the point, the
+# removal of a class of mask that is provably destroying information.
+# Shipped as a correctness fix rather than a scoring one, and it makes
+# MASK_CAP_FRACTION less load-bearing than it was.
+MASK_COLLAPSE_GUARD = _env_int("ARC_MASK_COLLAPSE_GUARD", 1)
+# Below this share of the frame, a mask is small enough that collapsing
+# everything is credible rather than suspicious (tn36 and sb26 sit at 1.6%).
+MASK_SMALL_FRACTION = _env_float("ARC_MASK_SMALL", 0.05)
+# A candidate must leave at least this many distinct warmup keys to be
+# trusted, once it is past MASK_SMALL_FRACTION.
+MASK_MIN_DISTINCT = _env_int("ARC_MASK_MIN_DISTINCT", 2)
+
 # Refuse to mask more than this fraction of the frame. If that much of
 # the board qualifies, the reading is not a HUD and dropping it would
 # collapse unrelated states together.
@@ -1445,6 +1489,9 @@ class MyAgent(Agent):
         # mask proposed, and how many consecutive samples have agreed on it.
         self._early_candidate: frozenset[int] = frozenset()
         self._early_stable = 0
+        # Warmup frames kept only until the mask is decided (see
+        # MASK_COLLAPSE_GUARD), then dropped.
+        self._mask_frames: list[bytes] = []
 
         # --- execution bookkeeping ----------------------------------
         # (node, code) awaiting its outcome, folded in on the next call
@@ -1923,6 +1970,37 @@ class MyAgent(Agent):
                 queue.append(nxt)
         return None
 
+    def _mask_is_credible(self, mask: frozenset[int], total: int) -> bool:
+        """Would this mask fuse every frame we have seen into one state?
+
+        Only asked of masks that already cleared MASK_CAP_FRACTION, and only
+        a veto -- never a reason to adopt something the size rule rejected.
+
+        Collapsing everything is not damning by itself. tn36 masks 64 cells
+        and collapses all 26 warmup frames to a single key, and it is the
+        highest-scoring game on the dev set: the board really did not move
+        except in its HUD. The same collapse from a 1180-cell mask, as tr87
+        gets at rung 0.3, is that mask deleting the board. Size alone cannot
+        tell those apart and neither can collapse alone, so require both.
+        """
+        if not MASK_COLLAPSE_GUARD or not self._mask_frames or total <= 0:
+            return True
+        if len(mask) <= MASK_SMALL_FRACTION * total:
+            return True
+        kept = [i for i in range(total) if i not in mask]
+        distinct = {
+            bytes(map(frame.__getitem__, kept)) for frame in self._mask_frames
+        }
+        if len(distinct) >= MASK_MIN_DISTINCT:
+            return True
+        logger.info(
+            "%s: rejecting a %d-cell mask (%.0f%% of frame): it fuses all "
+            "%d sampled frames into %d state(s)",
+            self.game_id, len(mask), 100.0 * len(mask) / total,
+            len(self._mask_frames), len(distinct),
+        )
+        return False
+
     def _learn_mask(self, flat: tuple[int, ...], width: int, height: int) -> bool:
         """Accumulate change rates; freeze the HUD mask when ready.
 
@@ -1931,6 +2009,19 @@ class MyAgent(Agent):
         """
         if self._mask_frozen:
             return False
+
+        # Retain the warmup frames so a candidate mask can be judged by what
+        # it does to them, not only by its size. Stored as bytes -- colours
+        # are small integers -- which is ~4KB a frame instead of ~115KB as a
+        # tuple of Python ints, and this list is dropped the moment the mask
+        # is decided.
+        if MASK_COLLAPSE_GUARD and len(self._mask_frames) < VOLATILE_WARMUP:
+            try:
+                self._mask_frames.append(bytes(flat))
+            except (ValueError, TypeError):
+                # A colour outside 0-255 would be a different game than the
+                # one this was written for; drop the guard rather than guess.
+                self._mask_frames = []
 
         previous, self._prev_flat = self._prev_flat, flat
         if previous is None or len(previous) != len(flat) or width <= 0:
@@ -1979,6 +2070,7 @@ class MyAgent(Agent):
             self._cell_changes = []
             self._row_changes = []
             self._col_changes = []
+            self._mask_frames = []
             self._prev_flat = None
             self._volatile = candidate
             self._kept = tuple(
@@ -2021,6 +2113,8 @@ class MyAgent(Agent):
                 # candidate has already cleared MASK_CAP_FRACTION.
                 if not candidate:
                     continue
+                if not self._mask_is_credible(candidate, width * height):
+                    continue
                 chosen, chosen_at = candidate, threshold
                 if MASK_PICK_FIRST:
                     break
@@ -2032,10 +2126,12 @@ class MyAgent(Agent):
                 )
                 volatile = chosen
 
-        # Free the counters; they are dead weight for the rest of the run.
+        # Free the counters and the retained frames; both are dead weight for
+        # the rest of the run, and the frames are the larger of the two.
         self._cell_changes = []
         self._row_changes = []
         self._col_changes = []
+        self._mask_frames = []
         self._prev_flat = None
 
         if not volatile:
