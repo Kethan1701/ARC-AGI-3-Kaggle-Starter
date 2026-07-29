@@ -139,6 +139,13 @@ def _bare_agent(module):
     # than a stub standing in for one.
     agent._policy = None
     agent._act_history = []
+    # `__new__` bypasses `__init__`, so anything `_select` reads has to be
+    # set here too. Both of these are zeroed in `__init__` and again in
+    # `_begin_level`, so a real agent always has them; zero also keeps the
+    # liveness gate below its minimum sample, which is what these tests
+    # want -- they are about the widening *order*, not about liveness.
+    agent._click_tried = 0
+    agent._click_live = 0
     return agent
 
 

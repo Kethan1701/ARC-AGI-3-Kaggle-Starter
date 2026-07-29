@@ -423,6 +423,59 @@ AGENT_SEED = _env_int("ARC_SEED", 0)
 EAGER_WIDEN = _env_int("ARC_EAGER_WIDEN", 0)
 WIDEN_CLEARS_DEAD = _env_int("ARC_WIDEN_CLEARS_DEAD", 1)
 
+# EAGER_WIDEN above was rejected for widening everywhere, including on games
+# where the first 12 candidates are the right ones. But there are games where
+# the window is demonstrably wrong, and they can be told apart from the
+# others while the run is happening.
+#
+# Measured by recording the candidate rank of every action taken:
+#
+#   game  clicks  that moved   median rank of those   breadth
+#   ft09     677     3 (0.4%)          83  (max 91)      12
+#   lp85     364        (2%)   cleared by stuck-random,
+#                              i.e. a coordinate not in the list at all
+#   sb26    1366       (65%)          10                 12
+#   s5i5     204        (7%)           0                 12
+#
+# ft09's productive clicks sit at ranks 83-91 and the window is 12, so the
+# search cannot reach them at all; it does eventually widen to 96 and find
+# them, thousands of actions later, via STUCK_REEXPLORE_AFTER. tn36, the
+# game eager widening broke, moves the board on 43% of its clicks -- so
+# gating on click liveness leaves it alone by construction.
+#
+# Note this does NOT contradict the finding that the click prior ranks
+# level-clearing actions at 0-6: that held on r11l, sp80, vc33 and tn36,
+# every one of which clears level 1. On the games that never clear, the
+# picture inverts. Both are true of the games they were measured on.
+#
+# Measured over all 25 dev games (aggregate 0.1288 -> 0.1299). What the
+# reasoning above got right and wrong, recorded so the next change is not
+# argued from the same priors:
+#
+#   ft09  FALSIFIED. It is the game this was designed for, and the gate
+#         fired exactly as intended -- widened 24 -> 48 -> 96, reaching
+#         the rank-83-91 clicks. Still 5001 actions, 0 levels. Reaching a
+#         productive click is evidently not sufficient to use one, so
+#         "the window cannot see it" was not ft09's binding constraint.
+#   su15  unpredicted, and the largest win: 5001 -> 248 actions, clears
+#         level 0 for the first time.
+#   s5i5  unpredicted: 5001 -> 2386, now reaches level 1.
+#   lp85  501 -> 234, as hoped, though for unclear reasons.
+#   tn36  untouched, byte-identical, as the 43% hit rate requires.
+#   sp80  untouched, byte-identical.
+#
+# The aggregate moves little because the newly-clearing games clear slowly
+# and the score is quadratic in overrun. It ships for the structural
+# change: two games moved from "never leaves level 0" to "clears it", and
+# no level can be made fast before it can be finished at all.
+LIVENESS_WIDEN = _env_int("ARC_LIVENESS_WIDEN", 1)
+# Don't judge liveness on a handful of samples; 12 clicks is one full
+# window's worth.
+LIVENESS_MIN_CLICKS = _env_int("ARC_LIVENESS_MIN_CLICKS", 40)
+# At or below this hit rate the window is not paying for itself. sb26 (65%)
+# and tn36 (43%) are far above it; ft09 (0.4%) and lp85 (2%) far below.
+LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
+
 # 15 of the 25 dev games never clear level 1 at all, and the diagnostic
 # splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
 # action, so the reachable map never closes and the search degenerates into
@@ -541,6 +594,50 @@ MASK_LADDER = tuple(
 # score (it is 0.00 either way) but it is a real regression against the
 # first-hit rule, and the reason to keep MASK_CAP_FRACTION under review.
 MASK_PICK_FIRST = _env_int("ARC_MASK_PICK_FIRST", 0)
+
+# MASK_CAP_FRACTION gates on how much of the frame a mask covers, and that
+# is the wrong axis: it is simultaneously too loose and too tight. tr87
+# masks 28.8% at rung 0.3, passes, and loses the level-1 clear its 0.5 rung
+# was buying; m0r0 qualifies 44%, is refused, and goes on exploding at 1294
+# nodes in 1975 actions. No single fraction separates those.
+#
+# What does separate them is what the mask DOES to the frames already in
+# hand. Measured at the decision point, over the warmup frames:
+#
+#   game  rung  mask          distinct keys   outcome
+#   tn36  0.9     64 (1.6%)         1         1.35, the best game we have
+#   tr87  0.3   1180 (28.8%)        1         loses its level-1 clear
+#   tr87  0.5    496 (12.1%)       22         gives the clear
+#   cd82  0.3    674 (16.5%)       12         0.40
+#   sc25  0.5    616 (15.0%)        1         explodes, 0.00
+#   sc25  0.7    256 (6.2%)        15         --
+#
+# Fusing every observed frame into a single state is the failure mode, and
+# tn36 shows it is not fatal on its own: a 64-cell mask that collapses
+# everything means the board genuinely did not move except in the HUD. A
+# 1180-cell mask that collapses everything is deleting real content. So
+# reject only the conjunction -- total collapse AND a mask too big to be
+# plausibly just a HUD -- and fall back to the next tighter rung.
+#
+# MEASURED across all 25 dev games. It vetoes five masks, every one of them
+# for fusing all 25 sampled frames into a single state: tr87 (1180 cells,
+# 29%), sc25 (1096 then 616), ka59 (802), dc22 (438). cd82's 1016-cell mask
+# is left alone because 12 distinct keys survive it, and tn36, sp80 and r11l
+# never reach this path at all.
+#
+# The score effect is nil -- 0.1287 -> 0.1288 -- because the one game it
+# rescues, tr87, scores 0.00 either way. What it buys is tr87 going back to
+# clearing level 1 (5001 -> 2538 actions) and, more to the point, the
+# removal of a class of mask that is provably destroying information.
+# Shipped as a correctness fix rather than a scoring one, and it makes
+# MASK_CAP_FRACTION less load-bearing than it was.
+MASK_COLLAPSE_GUARD = _env_int("ARC_MASK_COLLAPSE_GUARD", 1)
+# Below this share of the frame, a mask is small enough that collapsing
+# everything is credible rather than suspicious (tn36 and sb26 sit at 1.6%).
+MASK_SMALL_FRACTION = _env_float("ARC_MASK_SMALL", 0.05)
+# A candidate must leave at least this many distinct warmup keys to be
+# trusted, once it is past MASK_SMALL_FRACTION.
+MASK_MIN_DISTINCT = _env_int("ARC_MASK_MIN_DISTINCT", 2)
 
 # Refuse to mask more than this fraction of the frame. If that much of
 # the board qualifies, the reading is not a HUD and dropping it would
@@ -1418,6 +1515,10 @@ class MyAgent(Agent):
         self._total: dict[int, int] = {}          # node -> candidate count
         self._cursor: dict[int, int] = {}         # node -> next index to try
         self._breadth = BREADTH_INITIAL           # candidates per node, deepens
+        # Click hit rate for the current level (see LIVENESS_WIDEN). Reset at
+        # each level boundary, alongside the breadth it governs.
+        self._click_tried = 0
+        self._click_live = 0
         self._why_counts: Counter[str] = Counter()  # billed actions by reason
         self._class_counts: Counter[str] = Counter()  # click/press hit rate
         self._last_code: Optional[int] = None     # code of the previous action
@@ -1445,6 +1546,9 @@ class MyAgent(Agent):
         # mask proposed, and how many consecutive samples have agreed on it.
         self._early_candidate: frozenset[int] = frozenset()
         self._early_stable = 0
+        # Warmup frames kept only until the mask is decided (see
+        # MASK_COLLAPSE_GUARD), then dropped.
+        self._mask_frames: list[bytes] = []
 
         # --- execution bookkeeping ----------------------------------
         # (node, code) awaiting its outcome, folded in on the next call
@@ -1837,6 +1941,14 @@ class MyAgent(Agent):
         if node != prev_node:
             self._class_counts[kind + "-live"] += 1
 
+        # Separate counters for LIVENESS_WIDEN. `_class_counts` cannot serve:
+        # `_report_budget` clears it, so switching diagnostics on would
+        # silently change what the search does.
+        if kind == "click":
+            self._click_tried += 1
+            if node != prev_node:
+                self._click_live += 1
+
     def _begin_level(self, node: int) -> None:
         """Root a fresh solution graph at the state the level starts in."""
         self._sol_edges = {}
@@ -1848,6 +1960,8 @@ class MyAgent(Agent):
         # boundary would spend the new level's budget at the old level's
         # difficulty.
         self._breadth = BREADTH_INITIAL
+        self._click_tried = 0
+        self._click_live = 0
         # The dead-action record deliberately survives the level boundary.
         # Which actions a game wires up is a property of the *game*, not of
         # the level, so clearing it made every level re-pay the cost of
@@ -1923,6 +2037,37 @@ class MyAgent(Agent):
                 queue.append(nxt)
         return None
 
+    def _mask_is_credible(self, mask: frozenset[int], total: int) -> bool:
+        """Would this mask fuse every frame we have seen into one state?
+
+        Only asked of masks that already cleared MASK_CAP_FRACTION, and only
+        a veto -- never a reason to adopt something the size rule rejected.
+
+        Collapsing everything is not damning by itself. tn36 masks 64 cells
+        and collapses all 26 warmup frames to a single key, and it is the
+        highest-scoring game on the dev set: the board really did not move
+        except in its HUD. The same collapse from a 1180-cell mask, as tr87
+        gets at rung 0.3, is that mask deleting the board. Size alone cannot
+        tell those apart and neither can collapse alone, so require both.
+        """
+        if not MASK_COLLAPSE_GUARD or not self._mask_frames or total <= 0:
+            return True
+        if len(mask) <= MASK_SMALL_FRACTION * total:
+            return True
+        kept = [i for i in range(total) if i not in mask]
+        distinct = {
+            bytes(map(frame.__getitem__, kept)) for frame in self._mask_frames
+        }
+        if len(distinct) >= MASK_MIN_DISTINCT:
+            return True
+        logger.info(
+            "%s: rejecting a %d-cell mask (%.0f%% of frame): it fuses all "
+            "%d sampled frames into %d state(s)",
+            self.game_id, len(mask), 100.0 * len(mask) / total,
+            len(self._mask_frames), len(distinct),
+        )
+        return False
+
     def _learn_mask(self, flat: tuple[int, ...], width: int, height: int) -> bool:
         """Accumulate change rates; freeze the HUD mask when ready.
 
@@ -1931,6 +2076,19 @@ class MyAgent(Agent):
         """
         if self._mask_frozen:
             return False
+
+        # Retain the warmup frames so a candidate mask can be judged by what
+        # it does to them, not only by its size. Stored as bytes -- colours
+        # are small integers -- which is ~4KB a frame instead of ~115KB as a
+        # tuple of Python ints, and this list is dropped the moment the mask
+        # is decided.
+        if MASK_COLLAPSE_GUARD and len(self._mask_frames) < VOLATILE_WARMUP:
+            try:
+                self._mask_frames.append(bytes(flat))
+            except (ValueError, TypeError):
+                # A colour outside 0-255 would be a different game than the
+                # one this was written for; drop the guard rather than guess.
+                self._mask_frames = []
 
         previous, self._prev_flat = self._prev_flat, flat
         if previous is None or len(previous) != len(flat) or width <= 0:
@@ -1979,6 +2137,7 @@ class MyAgent(Agent):
             self._cell_changes = []
             self._row_changes = []
             self._col_changes = []
+            self._mask_frames = []
             self._prev_flat = None
             self._volatile = candidate
             self._kept = tuple(
@@ -2021,6 +2180,8 @@ class MyAgent(Agent):
                 # candidate has already cleared MASK_CAP_FRACTION.
                 if not candidate:
                     continue
+                if not self._mask_is_credible(candidate, width * height):
+                    continue
                 chosen, chosen_at = candidate, threshold
                 if MASK_PICK_FIRST:
                     break
@@ -2032,10 +2193,12 @@ class MyAgent(Agent):
                 )
                 volatile = chosen
 
-        # Free the counters; they are dead weight for the rest of the run.
+        # Free the counters and the retained frames; both are dead weight for
+        # the rest of the run, and the frames are the larger of the two.
         self._cell_changes = []
         self._row_changes = []
         self._col_changes = []
+        self._mask_frames = []
         self._prev_flat = None
 
         if not volatile:
@@ -2267,6 +2430,32 @@ class MyAgent(Agent):
         #     its 502 level-1 actions were stuck-random. Under a quadratic
         #     score those actions are not merely wasted, they are the
         #     difference between ~30x and ~3x baseline.
+        #     Widening unconditionally was measured and rejected. Widening
+        #     where the window has demonstrably failed is a different claim:
+        #     on ft09 the clicks that move the board sit at ranks 83-91, so
+        #     at breadth 12 the search cannot reach them however long it
+        #     runs. Fire only once enough clicks have been tried to judge,
+        #     and only when almost none of them did anything.
+        if (
+            LIVENESS_WIDEN
+            and self._breadth < BREADTH_MAX
+            and self._click_tried >= LIVENESS_MIN_CLICKS
+            and self._click_live <= LIVENESS_DEAD_RATE * self._click_tried
+        ):
+            self._breadth = min(self._breadth * 2, BREADTH_MAX)
+            self._stuck_steps = 0
+            # Deliberately NOT clearing the dead-action record. That wipe is
+            # the suspected cause of eager widening costing tn36 52 -> 86
+            # actions, and on a game whose clicks are already inert the
+            # record is the most valuable thing the run has learned.
+            logger.info(
+                "%s: clicks are dead (%d/%d live) after %d actions; "
+                "widening breadth to %d",
+                self.game_id, self._click_live, self._click_tried,
+                self._steps, self._breadth,
+            )
+            return self._select(node, grid, latest_frame)
+
         if EAGER_WIDEN and self._breadth < BREADTH_MAX:
             self._breadth = min(self._breadth * 2, BREADTH_MAX)
             self._stuck_steps = 0

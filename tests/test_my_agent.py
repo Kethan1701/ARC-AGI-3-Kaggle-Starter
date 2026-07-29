@@ -241,6 +241,9 @@ def _blank_agent():
     a._kept = None
     a._early_candidate = frozenset()
     a._early_stable = 0
+    # Warmup frames the collapse guard judges candidate masks against. Empty
+    # means "no evidence", and the guard abstains rather than vetoing.
+    a._mask_frames = []
     return a
 
 
@@ -296,12 +299,21 @@ def test_the_early_mask_never_fires_later_than_the_baseline_rule(monkeypatch):
 
 
 def _half_rate(width, height, n, digits=4, period=2):
-    """A HUD that updates every `period`-th step: real, but under 0.9."""
+    """A HUD updating every `period`-th step -- real, but under 0.9.
+
+    The board also moves, slowly: without that, masking the HUD fuses every
+    frame into one state and the collapse guard rightly refuses the mask.
+    cd82, which this models, keeps 12 distinct keys once its HUD is gone.
+    The board block changes every fifth step, well under the loosest rung,
+    so it never qualifies as volatile itself.
+    """
     out = []
     for step in range(n):
         flat = [0] * (width * height)
         for x in range(digits):
             flat[x] = (step // period + x) % 7 + 1
+        for x in range(10, 18):
+            flat[20 * width + x] = (step // 5) % 3 + 9
         out.append(flat)
     return out
 
@@ -407,6 +419,147 @@ def test_the_loosest_rung_still_respects_the_cap(monkeypatch):
     a = _blank_agent()
     _feed(a, frames, width, height)
     assert not a._volatile
+
+
+def _widen_agent(module_agent, tried, live, breadth=None):
+    """An agent posed at branch (d): map exhausted, nothing left to route to."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._click_tried = tried
+    a._click_live = live
+    a._breadth = agent.BREADTH_INITIAL if breadth is None else breadth
+    a._stuck_steps = 99
+    return a
+
+
+def _would_widen(a):
+    """The LIVENESS_WIDEN gate, evaluated exactly as `_select` evaluates it."""
+    return (
+        bool(agent.LIVENESS_WIDEN)
+        and a._breadth < agent.BREADTH_MAX
+        and a._click_tried >= agent.LIVENESS_MIN_CLICKS
+        and a._click_live <= agent.LIVENESS_DEAD_RATE * a._click_tried
+    )
+
+
+def test_the_liveness_widen_is_on_by_default():
+    """Shipped on after a full 25-game A/B: su15 and s5i5 go from never
+    leaving level 0 to clearing it, and the two games that carry the
+    aggregate (tn36, sp80) come out byte-identical."""
+    assert agent.LIVENESS_WIDEN == 1
+
+
+def test_dead_clicks_widen_the_window(monkeypatch):
+    """ft09: 3 of 677 clicks move anything, and the ones that do sit at
+    ranks 83-91 -- unreachable at breadth 12 however long the run lasts."""
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert _would_widen(_widen_agent(agent, tried=677, live=3))
+
+
+def test_live_clicks_never_widen(monkeypatch):
+    """tn36 moves the board on 43% of clicks and is the game unconditional
+    widening broke, 52 -> 86 actions. The gate must never reach it."""
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert not _would_widen(_widen_agent(agent, tried=1000, live=430))
+    # sb26 at 65%, s5i5 at 7% -- the latter is genuinely lowish but still
+    # well clear of the 10% floor.
+    assert not _would_widen(_widen_agent(agent, tried=1366, live=886))
+
+
+def test_liveness_needs_a_fair_sample_first(monkeypatch):
+    """Two dead clicks in a row is not evidence the window is wrong."""
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert not _would_widen(_widen_agent(agent, tried=2, live=0))
+    assert not _would_widen(
+        _widen_agent(agent, tried=agent.LIVENESS_MIN_CLICKS - 1, live=0))
+
+
+def test_liveness_widen_stops_at_the_ceiling(monkeypatch):
+    monkeypatch.setattr(agent, "LIVENESS_WIDEN", 1)
+    assert not _would_widen(
+        _widen_agent(agent, tried=677, live=3, breadth=agent.BREADTH_MAX))
+
+
+def test_the_liveness_counters_reset_with_the_breadth_they_govern():
+    """Breadth resets per level because each level is scored on its own
+    actions; the hit rate that decides whether to widen must reset with it,
+    or a dead level-1 keeps widening a level 2 that clicks fine."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._click_tried = 500
+    a._click_live = 2
+    a._sol_edges = {}
+    a._sol_start = 0
+    a._sol_full = False
+    a._sol_count = 0
+    a._breadth = 96
+    a._act_tried = agent.Counter()
+    a._act_changed = agent.Counter()
+    agent.MyAgent._begin_level(a, 0)
+    assert a._breadth == agent.BREADTH_INITIAL
+    assert a._click_tried == 0 and a._click_live == 0
+
+
+def test_the_collapse_guard_ships_on():
+    """Measured across all 25 dev games: five masks vetoed, all for fusing
+    every sampled frame into one state, tr87 back to clearing level 1
+    (5001 -> 2538 actions), no game regressed. Aggregate is unmoved at
+    0.1288 -- this ships as a correctness fix, not a scoring one."""
+    assert agent.MASK_COLLAPSE_GUARD == 1
+
+
+def test_a_small_mask_may_fuse_every_frame(monkeypatch):
+    """tn36's case, and the reason collapse alone cannot be the rule: it
+    masks 64 cells, fuses all 26 warmup frames into one key, and is the
+    highest-scoring game on the dev set. The board really was static."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    total = 32 * 32
+    a = _blank_agent()
+    # Frames identical apart from a tiny corner that ticks every step.
+    a._mask_frames = [
+        bytes([step % 5 if i < 8 else 3 for i in range(total)])
+        for step in range(20)
+    ]
+    small = frozenset(range(8))          # 8 cells, 0.8% of the frame
+    assert a._mask_is_credible(small, total)
+
+
+def test_a_large_mask_that_fuses_every_frame_is_rejected(monkeypatch):
+    """tr87's case: a 28.8% mask collapsing everything is not a HUD, it is
+    the mask deleting the board, and taking it loses a level-1 clear."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    total = 32 * 32
+    a = _blank_agent()
+    a._mask_frames = [
+        bytes([step % 5 if i < 400 else 3 for i in range(total)])
+        for step in range(20)
+    ]
+    big = frozenset(range(400))          # 39% of the frame
+    assert not a._mask_is_credible(big, total)
+
+
+def test_a_large_mask_that_preserves_distinct_states_is_kept(monkeypatch):
+    """cd82's case: 16.5% of the frame, still 12 distinct keys left. That
+    is a real HUD on a game that genuinely moves, and rejecting it would
+    throw away the largest single gain measured so far."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    total = 32 * 32
+    a = _blank_agent()
+    a._mask_frames = [
+        bytes([step % 5 if i < 400 else (step % 7) + 8 for i in range(total)])
+        for step in range(20)
+    ]
+    big = frozenset(range(400))
+    assert a._mask_is_credible(big, total)
+
+
+def test_the_guard_never_rescues_a_mask_the_cap_refused(monkeypatch):
+    """It is a veto and nothing else. Without frames to judge against it
+    must abstain rather than invent an opinion."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    a = _blank_agent()
+    a._mask_frames = []
+    assert a._mask_is_credible(frozenset(range(900)), 32 * 32)
 
 
 def test_the_fallback_cannot_touch_a_game_that_already_masks(monkeypatch):
