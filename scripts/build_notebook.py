@@ -80,6 +80,13 @@ POLICY_MODEL_DIR = f"/kaggle/input/models/{POLICY_MODEL}"
 # these strings must match Kaggle's enum exactly -- "NvidiaRtx6000" is wrong
 # and was swallowed. "NvidiaRtxPro6000" is verified: it returned "NVIDIA RTX
 # PRO 6000 Blackwell Server Edition", 95GB VRAM, sm_120.
+#
+# The shape is necessary but NOT sufficient. The card is entitlement-gated on
+# competition membership: a probe with the correct shape and an empty
+# `competition_sources` was handed a P100, and pulling the kernel back still
+# showed `machine_shape: NvidiaRtxPro6000` -- Kaggle records what you asked
+# for and gives you what you are entitled to. See
+# tests/test_the_competition_stays_attached.
 _ACCELERATORS = {
     "cpu":     {"name": "none",            "gpu": False, "shape": None},
     "t4":      {"name": "nvidiaTeslaT4",   "gpu": True,  "shape": "NvidiaTeslaT4"},

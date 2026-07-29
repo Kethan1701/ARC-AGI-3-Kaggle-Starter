@@ -79,6 +79,21 @@ def test_competition_requires_internet_disabled():
     assert meta["enable_internet"] is False
 
 
+def test_the_competition_stays_attached():
+    """Detaching it breaks the run twice over, both times quietly.
+
+    `environment_files` is mounted from the competition, so without this
+    there is no game to play. Less obviously, the RTX PRO 6000 is
+    entitlement-gated on competition membership: a probe kernel asking for
+    `machine_shape: NvidiaRtxPro6000` with an empty `competition_sources`
+    was handed a Tesla P100, and Kaggle still reported the requested shape
+    back when the kernel was pulled. The shape is necessary, not
+    sufficient, and neither failure announces itself.
+    """
+    meta = json.loads((ROOT / "notebooks" / "kernel-metadata.json").read_text())
+    assert meta["competition_sources"] == ["arc-prize-2026-arc-agi-3"]
+
+
 # ---------------------------------------------------------------------
 # The model policy's submission wiring
 # ---------------------------------------------------------------------
