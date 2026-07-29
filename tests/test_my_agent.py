@@ -230,6 +230,7 @@ def _feed(agent_obj, frames, width, height):
 
 def _blank_agent():
     a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"          # the fallback logs which game it fired on
     a._mask_frozen = False
     a._prev_flat = None
     a._cell_changes = []
@@ -292,6 +293,96 @@ def test_the_early_mask_never_fires_later_than_the_baseline_rule(monkeypatch):
 
     assert late is not None and early is not None
     assert early <= late
+
+
+def _half_rate(width, height, n, digits=4, period=2):
+    """A HUD that updates every `period`-th step: real, but under 0.9."""
+    out = []
+    for step in range(n):
+        flat = [0] * (width * height)
+        for x in range(digits):
+            flat[x] = (step // period + x) % 7 + 1
+        out.append(flat)
+    return out
+
+
+def test_the_mask_fallback_ships_on():
+    """Measured across all 25 dev games: cd82 0.00 -> 0.19 (2461 -> 274
+    actions), tr87 reaching level 1 for the first time, 23 games
+    byte-identical, aggregate 0.1129 -> 0.1206."""
+    assert agent.MASK_FALLBACK == 1
+
+
+def test_the_ladder_only_ever_relaxes():
+    """A rung at or above VOLATILE_THRESHOLD could adopt a mask the strict
+    rule had already rejected as too weak, and the rungs must descend or
+    'stop at the first hit' silently means 'stop at the loosest'."""
+    assert agent.MASK_LADDER
+    assert all(t < agent.VOLATILE_THRESHOLD for t in agent.MASK_LADDER)
+    assert list(agent.MASK_LADDER) == sorted(agent.MASK_LADDER, reverse=True)
+
+
+def test_a_half_rate_hud_is_missed_by_the_strict_rule(monkeypatch):
+    """The premise of the fallback, so it is pinned separately from it.
+
+    If VOLATILE_THRESHOLD ever starts catching this on its own, the ladder
+    is dead code and should be removed rather than left running.
+    """
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 0)
+    width = height = 32
+    frames = _half_rate(width, height, agent.VOLATILE_WARMUP + 2)
+    a = _blank_agent()
+    assert _feed(a, frames, width, height) is None or not a._volatile
+
+
+def test_the_fallback_catches_a_half_rate_hud(monkeypatch):
+    """cd82's failure in miniature: a HUD ticking every other step, missed
+    entirely at 0.9, leaving every frame a distinct node."""
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
+    monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3))
+    width = height = 32
+    frames = _half_rate(width, height, agent.VOLATILE_WARMUP + 2)
+    a = _blank_agent()
+    fired = _feed(a, frames, width, height)
+    assert fired is not None, "the fallback did not adopt any mask"
+    assert a._volatile, "fired but masked nothing"
+
+
+def test_the_fallback_cannot_touch_a_game_that_already_masks(monkeypatch):
+    """The safety argument for shipping this at all: a game whose HUD
+    already clears VOLATILE_THRESHOLD must get bit-for-bit the same mask,
+    because relaxing the threshold for those games was measured and broke
+    them (sp80 78 -> 211 actions)."""
+    width = height = 32
+    frames = _ticking(width, height, agent.VOLATILE_WARMUP + 2)
+
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 0)
+    plain = _blank_agent()
+    _feed(plain, frames, width, height)
+
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
+    monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3))
+    relaxed = _blank_agent()
+    _feed(relaxed, frames, width, height)
+
+    assert plain._volatile
+    assert plain._volatile == relaxed._volatile
+
+
+def test_the_fallback_still_refuses_to_swallow_the_board(monkeypatch):
+    """Relaxing the threshold must not relax the cap. m0r0 qualifies 44% of
+    its frame at 0.3; masking that would fuse unrelated states into one
+    node, which is worse than the exploding map it would be curing."""
+    monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
+    monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3, 0.1))
+    width = height = 32
+    frames = []
+    for step in range(agent.VOLATILE_WARMUP + 2):
+        # Everything moves, all the time: not a HUD, just a busy board.
+        frames.append([(step + i) % 5 for i in range(width * height)])
+    a = _blank_agent()
+    _feed(a, frames, width, height)
+    assert not a._volatile
 
 
 def test_an_erratic_cell_does_not_trigger_the_early_mask(monkeypatch):
