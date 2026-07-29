@@ -79,6 +79,42 @@ def test_competition_requires_internet_disabled():
     assert meta["enable_internet"] is False
 
 
+def test_the_competition_stays_attached():
+    """`environment_files` is mounted from the competition, so detaching it
+    leaves the agent with no game to play.
+
+    (An earlier version of this test also blamed a P100 downgrade on a
+    missing attachment. That was wrong -- a later probe got the RTX PRO
+    6000 with `competition_sources` empty. The downgrade is about the
+    push flag, and is pinned by `test_submit_passes_the_shape_on_the_
+    command_line` instead.)
+    """
+    meta = json.loads((ROOT / "notebooks" / "kernel-metadata.json").read_text())
+    assert meta["competition_sources"] == ["arc-prize-2026-arc-agi-3"]
+
+
+def test_submit_passes_the_shape_on_the_command_line():
+    """Putting `machine_shape` in kernel-metadata.json is not enough.
+
+    Measured on Kaggle CLI 2.2.4 by pushing one probe three times: with the
+    shape in the metadata and no `--accelerator`, the run landed on a Tesla
+    P100; adding the flag returned the RTX PRO 6000 (sm_120). Both kernels
+    reported `machine_shape: NvidiaRtxPro6000` when pulled back, so the
+    field is recorded and then ignored. On the P100 the preinstalled torch
+    cannot run at all, and nothing in the push output hints at any of it.
+    """
+    makefile = (ROOT / "Makefile").read_text()
+    submit = makefile.split("submit:", 1)[1].split("\nstatus:", 1)[0]
+    assert "--accelerator" in submit, (
+        "`make submit` must pass the requested shape as --accelerator; "
+        "the metadata field alone silently yields a P100"
+    )
+    assert "machine_shape" in submit, (
+        "the flag must come from kernel-metadata.json, not be hardcoded, "
+        "or it will disagree with ACCELERATOR the first time it changes"
+    )
+
+
 # ---------------------------------------------------------------------
 # The model policy's submission wiring
 # ---------------------------------------------------------------------

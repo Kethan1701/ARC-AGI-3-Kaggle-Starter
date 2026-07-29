@@ -78,7 +78,13 @@ submit: notebook _check-kaggle ## Build notebook and push to Kaggle (one-line su
 	@grep -q REPLACE_WITH_YOUR_USERNAME notebooks/kernel-metadata.json && { \
 	    echo "ERROR: edit notebooks/kernel-metadata.json and replace REPLACE_WITH_YOUR_USERNAME"; \
 	    exit 1; } || true
-	$(KAGGLE) kernels push -p notebooks/
+	@SHAPE=$$($(VENV_PY) -c "import json;print(json.load(open('notebooks/kernel-metadata.json')).get('machine_shape') or '')"); \
+	if [ -n "$$SHAPE" ]; then \
+	    echo "pushing with --accelerator $$SHAPE"; \
+	    $(KAGGLE) kernels push -p notebooks/ --accelerator "$$SHAPE"; \
+	else \
+	    $(KAGGLE) kernels push -p notebooks/; \
+	fi
 	@echo ""
 	@echo "Pushed. Track it with:  make status"
 
