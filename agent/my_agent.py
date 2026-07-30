@@ -132,6 +132,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import zlib
 from collections import Counter, deque
 from itertools import chain
@@ -1121,6 +1123,230 @@ def run_python_tool(
         "error": error,
         "truncated": truncated,
     }
+
+
+# --- the model loop ------------------------------------------------------
+#
+# Names are ARC_LLM_* rather than ARC_POLICY_*. The ARC_POLICY_* space
+# already belongs to the abandoned option-picking policy, and reusing it
+# would make it impossible to tell from a Kaggle log which of the two was
+# configured. That policy is the thing this replaces: it was measured
+# answering by option position (code agreement 0.125 against chance 0.088),
+# which is what happens when a model is handed a menu instead of a problem.
+LLM_ENABLED = _env_int("ARC_LLM", 0)
+LLM_BASE_URL = os.getenv("ARC_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+LLM_MODEL = os.getenv("ARC_LLM_MODEL", "vrfai/Qwen3.6-27B-FP8")
+# TAAF's analyzer settings, which are Qwen3's own recommended sampling.
+LLM_TEMPERATURE = _env_float("ARC_LLM_TEMPERATURE", 0.6)
+LLM_TOP_P = _env_float("ARC_LLM_TOP_P", 0.95)
+LLM_TOP_K = _env_int("ARC_LLM_TOP_K", 20)
+LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 120.0)
+# How many python calls the model may make per observe-plan-act turn. TAAF
+# tells the model not to ration tool calls, so the cap is a backstop against
+# a loop that never decides, not a budget the model should feel.
+LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
+
+PYTHON_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "python",
+        "description": (
+            "Run Python to inspect the board and act. The runtime provides "
+            "current_frame, previous_frame, history, transitions, "
+            "valid_actions, last_action_result, and action(actions) which "
+            "executes real environment actions. Print compact summaries "
+            "only; never print a whole board."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source to execute in the sandbox.",
+                }
+            },
+            "required": ["code"],
+        },
+    },
+}
+
+
+def chat_completion(
+    payload: dict[str, Any],
+    *,
+    base_url: str = LLM_BASE_URL,
+    timeout: float = LLM_REQUEST_TIMEOUT,
+) -> dict[str, Any]:
+    """POST to an OpenAI-compatible `/chat/completions`, stdlib only.
+
+    No `openai` package: this file is spliced verbatim into the notebook and
+    may import nothing that the first cell does not install. vLLM's server
+    accepts `top_k` as a top-level field even though OpenAI's schema has no
+    such parameter, which is why it is passed that way.
+    """
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def render_tool_result(outcome: dict[str, Any], *, limit: int = TOOL_OUTPUT_CHARS) -> str:
+    """Turn a `run_python_tool` outcome into the text the model reads back.
+
+    Errors are never swallowed: the model can only fix its own code if it
+    sees what broke. An empty run reports itself as empty rather than as a
+    blank message, because a model given "" tends to assume success.
+    """
+    parts: list[str] = []
+    if outcome.get("stdout"):
+        parts.append(outcome["stdout"].rstrip("\n"))
+    if outcome.get("result") is not None:
+        parts.append(f"result = {outcome['result']!r}")
+    if outcome.get("error"):
+        parts.append(f"ERROR:\n{outcome['error']}")
+    if not parts:
+        parts.append("(no output; nothing was printed and `result` was not set)")
+    text = "\n".join(parts)
+    if len(text) > limit:
+        text = text[:limit] + "\n...[truncated]"
+    return text
+
+
+def evict_turns(
+    messages: list[dict[str, Any]], keep_turns: int
+) -> list[dict[str, Any]]:
+    """Drop middle history, keeping the system prompt and the last turns.
+
+    Context is 32768 tokens and a single segmentation dump can be thousands
+    of them, so old turns have to go. The system prompt and the FIRST user
+    turn are always kept -- the first turn carries the game framing, and a
+    model that loses it starts reasoning about a board with no idea what the
+    game is. `keep_turns <= 0` means keep everything.
+    """
+    if keep_turns <= 0 or len(messages) <= 2:
+        return messages
+    head = [m for m in messages[:2]]
+    tail_start = max(2, len(messages) - keep_turns * 2)
+    tail = messages[tail_start:]
+    # A tool message whose matching assistant tool_call has been evicted is
+    # a protocol error for the server, so walk forward to the first message
+    # that is not an orphaned tool result.
+    while tail and tail[0].get("role") == "tool":
+        tail = tail[1:]
+    return head + tail
+
+
+def run_tool_conversation(
+    messages: list[dict[str, Any]],
+    namespace: dict[str, Any],
+    *,
+    post: Any = None,
+    model: str = LLM_MODEL,
+    max_tool_calls: int = LLM_MAX_TOOL_CALLS,
+    tool_timeout: float = TOOL_TIMEOUT,
+    output_limit: int = TOOL_OUTPUT_CHARS,
+    temperature: float = LLM_TEMPERATURE,
+    top_p: float = LLM_TOP_P,
+    top_k: int = LLM_TOP_K,
+    stop_check: Any = None,
+) -> dict[str, Any]:
+    """Drive one observe-plan-act turn: ask, run the code, feed back, repeat.
+
+    `messages` is appended to in place so the caller keeps the transcript.
+    `post` is injected so this is testable without a model -- the real one is
+    `chat_completion`, and the whole loop is exercised in tests by a scripted
+    stand-in. Returns ``{"stop": reason, "tool_calls": n, "content": str}``.
+
+    `stop_check` is called after every tool call and ends the turn when it
+    returns true. That is how a level completion or a game over stops the
+    model mid-search instead of letting it keep acting into a board that has
+    already moved on.
+
+    Network and protocol failures are allowed to propagate. The caller is
+    expected to fall back to the search agent, and a policy that silently
+    swallowed a dead server would score exactly what the search scores while
+    looking like a model run that merely did not help -- which has already
+    happened once on this project.
+    """
+    send = post or chat_completion
+    calls_made = 0
+
+    while True:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "tools": [PYTHON_TOOL_SCHEMA],
+            "tool_choice": "auto",
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+        }
+        reply = send(payload)
+        choices = reply.get("choices") or []
+        if not choices:
+            return {"stop": "empty-response", "tool_calls": calls_made, "content": ""}
+        message = choices[0].get("message") or {}
+        messages.append(message)
+
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return {
+                "stop": "content",
+                "tool_calls": calls_made,
+                "content": message.get("content") or "",
+            }
+
+        for call in tool_calls:
+            calls_made += 1
+            function = call.get("function") or {}
+            raw = function.get("arguments") or "{}"
+            try:
+                arguments = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except (TypeError, ValueError) as exc:
+                # Malformed tool arguments are the model's mistake to fix, so
+                # they go back as a tool result rather than killing the turn.
+                rendered = f"ERROR: could not parse tool arguments as JSON: {exc}"
+            else:
+                code = arguments.get("code")
+                if not isinstance(code, str) or not code.strip():
+                    rendered = (
+                        "ERROR: the `python` tool needs a non-empty `code` "
+                        "string argument."
+                    )
+                else:
+                    outcome = run_python_tool(
+                        code,
+                        namespace,
+                        timeout=tool_timeout,
+                        output_limit=output_limit,
+                    )
+                    rendered = render_tool_result(outcome, limit=output_limit)
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "name": "python",
+                    "content": rendered,
+                }
+            )
+
+            if stop_check is not None and stop_check():
+                return {
+                    "stop": "halted",
+                    "tool_calls": calls_made,
+                    "content": "",
+                }
+
+        if calls_made >= max_tool_calls:
+            return {
+                "stop": "max-tool-calls",
+                "tool_calls": calls_made,
+                "content": "",
+            }
 
 
 def click_targets(
