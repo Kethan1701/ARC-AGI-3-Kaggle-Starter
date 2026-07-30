@@ -2054,10 +2054,16 @@ class MyAgent(Agent):
             return True
         if len(mask) <= MASK_SMALL_FRACTION * total:
             return True
+        # A frame sampled before a resize cannot be indexed by a mask built
+        # for after it. `_learn_mask` drops those as it goes, so this is the
+        # belt to that braces -- `total` is width*height from the caller and
+        # nothing here guarantees it matches what was sampled. Abstaining
+        # when nothing comparable is left keeps this a veto.
+        frames = [frame for frame in self._mask_frames if len(frame) == total]
+        if not frames:
+            return True
         kept = [i for i in range(total) if i not in mask]
-        distinct = {
-            bytes(map(frame.__getitem__, kept)) for frame in self._mask_frames
-        }
+        distinct = {bytes(map(frame.__getitem__, kept)) for frame in frames}
         if len(distinct) >= MASK_MIN_DISTINCT:
             return True
         logger.info(
@@ -2093,6 +2099,13 @@ class MyAgent(Agent):
         previous, self._prev_flat = self._prev_flat, flat
         if previous is None or len(previous) != len(flat) or width <= 0:
             # First frame, or the grid was resized: start counting fresh.
+            # The sampled frames restart too. Keeping ones from before a
+            # resize is not merely useless -- a mask indexed for the new
+            # size walks off the end of an older, smaller frame, and that
+            # IndexError lands on the action path.
+            self._mask_frames = [
+                frame for frame in self._mask_frames if len(frame) == len(flat)
+            ]
             self._cell_changes = [0] * len(flat)
             self._row_changes = [0] * height
             self._col_changes = [0] * width
