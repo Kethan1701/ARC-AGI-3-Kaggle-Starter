@@ -828,6 +828,152 @@ def grid_of(frame: FrameData) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(row) for row in grids[-1])
 
 
+def segment_frame(
+    grid: tuple[tuple[int, ...], ...],
+    ignore: frozenset[int] = frozenset(),
+) -> dict[str, Any]:
+    """Parse a frame into 4-connected same-color objects.
+
+    This is the view the model reasons over instead of the raw grid, which
+    is deliberately never handed to it: a 64x64 field of integers invites
+    coordinate arithmetic, and asking a model to pick from a rendered board
+    is measurably answered by position rather than by content.
+
+    Returns ``{"nodes": [...], "adjacency_list": [[i, j], ...]}``, one node
+    per 4-connected run of a single color:
+
+        id        index, ordered top-most then left-most (scan order)
+        color     cell value, 0..15
+        pixels    cell count
+        bbox      (top, left, bottom, right), inclusive
+        hash      crc32 over the color plus the cell offsets normalised to
+                  the bounding box, so the same shape in the same color
+                  hashes equal wherever it sits. Equal hashes mean the same
+                  object, which is what lets one be followed across frames
+                  or duplicates spotted within one frame.
+        children  ids of every node this one encloses
+
+    `adjacency_list` holds ``[i, j]`` id pairs whose objects share an edge.
+
+    Background is NOT dropped, unlike `click_targets`. Which component is
+    background is a judgement, and "the large region everything sits on" is
+    a fact worth being able to see rather than one to bake into the parse.
+
+    `ignore` holds flat indices (y * width + x) to treat as absent -- the
+    volatile HUD cells -- so a step counter's digits do not arrive as a row
+    of tiny objects. Ignored cells are traversable for containment.
+
+    Deliberately omitted: a clockwise `boundary` corner list. Corner
+    tracing is fiddly to get right, `bbox` and `pixels` carry most of the
+    same information, and a wrong boundary is worse than no boundary.
+    """
+    height = len(grid)
+    if height == 0:
+        return {"nodes": [], "adjacency_list": []}
+    width = len(grid[0])
+    if width == 0:
+        return {"nodes": [], "adjacency_list": []}
+
+    label = [[-1] * width for _ in range(height)]
+    nodes: list[dict[str, Any]] = []
+    members: list[list[tuple[int, int]]] = []
+
+    for y0 in range(height):
+        for x0 in range(width):
+            if label[y0][x0] != -1 or (y0 * width + x0) in ignore:
+                continue
+            color = grid[y0][x0]
+            nid = len(nodes)
+            label[y0][x0] = nid
+            stack = [(y0, x0)]
+            cells: list[tuple[int, int]] = []
+            while stack:
+                cy, cx = stack.pop()
+                cells.append((cy, cx))
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and label[ny][nx] == -1
+                        and grid[ny][nx] == color
+                        and (ny * width + nx) not in ignore
+                    ):
+                        label[ny][nx] = nid
+                        stack.append((ny, nx))
+
+            top = min(c[0] for c in cells)
+            left = min(c[1] for c in cells)
+            bottom = max(c[0] for c in cells)
+            right = max(c[1] for c in cells)
+            offsets = sorted((cy - top, cx - left) for cy, cx in cells)
+            signature = f"{color}|" + ";".join(f"{a},{b}" for a, b in offsets)
+            nodes.append(
+                {
+                    "id": nid,
+                    "color": color,
+                    "pixels": len(cells),
+                    "bbox": (top, left, bottom, right),
+                    "hash": zlib.crc32(signature.encode()),
+                    "children": [],
+                }
+            )
+            members.append(cells)
+
+    pairs: set[tuple[int, int]] = set()
+    for y in range(height):
+        for x in range(width):
+            a = label[y][x]
+            if a == -1:
+                continue
+            for ny, nx in ((y + 1, x), (y, x + 1)):
+                if ny < height and nx < width:
+                    b = label[ny][nx]
+                    if b != -1 and b != a:
+                        pairs.add((a, b) if a < b else (b, a))
+
+    # Containment: B is inside A when no 4-connected path from B reaches the
+    # grid border without crossing A. Flood from the border across everything
+    # that is not A; whatever is never reached is enclosed by A. Only nodes
+    # of 8+ cells can ring anything (a 3x3 ring around one cell is the
+    # smallest possible), which prunes most of the work away.
+    if len(nodes) > 1:
+        for parent, cells in enumerate(members):
+            if len(cells) < 8:
+                continue
+            reached = [[False] * width for _ in range(height)]
+            frontier: deque[tuple[int, int]] = deque()
+            for y in range(height):
+                for x in (0, width - 1):
+                    if label[y][x] != parent and not reached[y][x]:
+                        reached[y][x] = True
+                        frontier.append((y, x))
+            for x in range(width):
+                for y in (0, height - 1):
+                    if label[y][x] != parent and not reached[y][x]:
+                        reached[y][x] = True
+                        frontier.append((y, x))
+            while frontier:
+                cy, cx = frontier.popleft()
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and not reached[ny][nx]
+                        and label[ny][nx] != parent
+                    ):
+                        reached[ny][nx] = True
+                        frontier.append((ny, nx))
+            enclosed = [
+                other
+                for other, other_cells in enumerate(members)
+                if other != parent
+                and not any(reached[cy][cx] for cy, cx in other_cells)
+            ]
+            nodes[parent]["children"] = enclosed
+
+    return {"nodes": nodes, "adjacency_list": [list(p) for p in sorted(pairs)]}
+
+
 def click_targets(
     grid: tuple[tuple[int, ...], ...],
     limit: int = MAX_CLICK_CANDIDATES,
