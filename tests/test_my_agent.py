@@ -562,6 +562,34 @@ def test_the_guard_never_rescues_a_mask_the_cap_refused(monkeypatch):
     assert a._mask_is_credible(frozenset(range(900)), 32 * 32)
 
 
+def test_the_guard_survives_a_grid_that_grew_mid_warmup(monkeypatch):
+    """`_learn_mask` explicitly expects the grid to be resized, and restarts
+    its counters when it is -- but the sampled frames outlive that reset, so
+    the list can hold two different frame sizes at once. Indexing a 16x16
+    frame at an offset from a 32x32 one is an IndexError, uncaught, on the
+    action path. No dev game resizes inside its first VOLATILE_WARMUP
+    frames, which is why 25 local games never found this."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    a = _blank_agent()
+    a._mask_frames = [bytes([3] * (16 * 16)) for _ in range(5)]
+    a._mask_frames += [bytes([3] * (32 * 32)) for _ in range(5)]
+    # Must reach a verdict rather than raise.
+    assert a._mask_is_credible(frozenset(range(400)), 32 * 32) in (True, False)
+
+
+def test_a_resize_during_warmup_drops_the_stale_frames(monkeypatch):
+    """The counters restart on resize; the frames have to go with them. A
+    frame from before the resize cannot be compared against a mask indexed
+    for after it, so keeping it is meaningless as well as unsafe."""
+    monkeypatch.setattr(agent, "MASK_COLLAPSE_GUARD", 1)
+    a = _blank_agent()
+    for _ in range(4):
+        a._learn_mask(tuple([3] * (16 * 16)), 16, 16)
+    assert a._mask_frames, "frames should accumulate during warmup"
+    a._learn_mask(tuple([3] * (32 * 32)), 32, 32)
+    assert {len(f) for f in a._mask_frames} <= {32 * 32}
+
+
 def test_the_fallback_cannot_touch_a_game_that_already_masks(monkeypatch):
     """The safety argument for shipping this at all: a game whose HUD
     already clears VOLATILE_THRESHOLD must get bit-for-bit the same mask,
