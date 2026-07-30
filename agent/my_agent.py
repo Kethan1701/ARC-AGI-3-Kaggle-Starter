@@ -128,8 +128,10 @@ import os
 import queue
 import random
 import re
+import sys
 import threading
 import time
+import traceback
 import zlib
 from collections import Counter, deque
 from itertools import chain
@@ -972,6 +974,153 @@ def segment_frame(
             nodes[parent]["children"] = enclosed
 
     return {"nodes": nodes, "adjacency_list": [list(p) for p in sorted(pairs)]}
+
+
+# The model gets exactly these modules. Same list TAAF exposes: enough to
+# write BFS, flood fill or a beam search, and nothing that reaches the
+# filesystem, the network or the process.
+TOOL_MODULES = frozenset(
+    {
+        "bisect", "collections", "copy", "fractions", "functools", "heapq",
+        "itertools", "json", "math", "operator", "random", "re",
+        "statistics", "string",
+    }
+)
+# A runaway loop in model-written code would otherwise hang the game thread
+# until the whole run times out. 30s matches TAAF's tool_timeout.
+TOOL_TIMEOUT = _env_float("ARC_TOOL_TIMEOUT", 30.0)
+# TAAF caps tool output at 1024 tokens; ~4 chars a token. The cap is not
+# politeness -- `segment_frame` on a noisy board returns 2184 nodes, which
+# would bury the conversation and evict the model's own reasoning.
+TOOL_OUTPUT_CHARS = _env_int("ARC_TOOL_OUTPUT_CHARS", 4000)
+
+
+class ToolTimeout(Exception):
+    """Model-written code outran TOOL_TIMEOUT."""
+
+
+def _tool_builtins() -> dict[str, Any]:
+    """Builtins for sandboxed code, with the obvious foot-guns removed.
+
+    NOT a security boundary, and nothing here pretends otherwise: Python
+    cannot be sandboxed against hostile code from inside the interpreter,
+    and `__subclasses__` walking defeats any such attempt in a few lines.
+    The model is a cooperative author, not an attacker. What this actually
+    buys is that an *accident* fails loudly and locally -- an import of
+    `numpy` that would not exist on Kaggle, a stray `open()`, an `exec` of
+    generated text -- instead of half-working.
+    """
+    # `__builtins__` is a module inside the importing module and a dict
+    # inside an exec'd one; both shapes are reachable from here.
+    namespace = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
+    allowed = dict(namespace)
+    for name in ("exec", "eval", "compile", "open", "input", "breakpoint", "help"):
+        allowed.pop(name, None)
+
+    real_import = __import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = name.partition(".")[0]
+        if root not in TOOL_MODULES:
+            raise ImportError(
+                f"{root!r} is not available in the tool sandbox. "
+                f"Available: {', '.join(sorted(TOOL_MODULES))}."
+            )
+        return real_import(name, globals, locals, fromlist, level)
+
+    allowed["__import__"] = guarded_import
+    return allowed
+
+
+def run_python_tool(
+    code: str,
+    namespace: dict[str, Any],
+    *,
+    timeout: float = TOOL_TIMEOUT,
+    output_limit: int = TOOL_OUTPUT_CHARS,
+) -> dict[str, Any]:
+    """Run one ephemeral block of model-written code.
+
+    Returns ``{"stdout", "result", "error", "truncated"}``. `namespace`
+    supplies whatever the model is allowed to touch -- the frame views and
+    the `action(...)` callable -- and is mutated in place, so the caller can
+    read back anything the code assigned.
+
+    Two things here are shaped by the fact that the framework runs ONE AGENT
+    PER GAME AS A THREAD in a single process (see the CONTRACT at the top):
+
+    * `print` is rebound to a per-call buffer rather than redirecting
+      `sys.stdout`. Swapping `sys.stdout` is process-global, so with 25 games
+      running concurrently one game's tool output would land in another
+      game's transcript. That bug would be near-impossible to read back from
+      a Kaggle log, so the design avoids it rather than detecting it.
+    * The deadline is enforced by a per-thread trace function, because
+      `signal.alarm` only works on the main thread and there are 25 of these.
+
+    The deadline is checked on each Python line, so it cannot interrupt a
+    single long call inside C -- a catastrophic regex or one enormous
+    `sorted()` will overrun it. Tracing also slows the code measurably.
+    Both are accepted: the point is to stop `while True`, not to be exact.
+    """
+    buffer: list[str] = []
+    written = 0
+
+    def tool_print(*args: Any, sep: str = " ", end: str = "\n", **_: Any) -> None:
+        nonlocal written
+        if written >= output_limit:
+            return
+        text = sep.join(str(a) for a in args) + end
+        buffer.append(text)
+        written += len(text)
+
+    scope = dict(namespace)
+    scope["__builtins__"] = _tool_builtins()
+    scope["print"] = tool_print
+    scope.pop("result", None)
+
+    deadline = time.monotonic() + timeout
+
+    def local_trace(frame, event, arg):  # noqa: ANN001 - CPython trace protocol
+        if time.monotonic() > deadline:
+            raise ToolTimeout(f"tool code exceeded {timeout:g}s")
+        return local_trace
+
+    def global_trace(frame, event, arg):  # noqa: ANN001
+        return local_trace
+
+    error = ""
+    previous = sys.gettrace()
+    try:
+        sys.settrace(global_trace)
+        exec(compile(code, "<tool>", "exec"), scope)  # noqa: S102 - see docstring
+    except ToolTimeout as exc:
+        error = str(exc)
+    except SyntaxError as exc:
+        error = f"SyntaxError: {exc}"
+    except BaseException as exc:  # noqa: BLE001 - reported back to the model
+        # The model has to be able to fix its own code, so it gets the
+        # traceback rather than a bare class name. Frames below `<tool>` are
+        # dropped: agent internals are not its business and cost context.
+        lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+        error = "".join(lines[-3:]).strip()
+    finally:
+        sys.settrace(previous)
+
+    namespace.update(
+        {k: v for k, v in scope.items() if k not in ("__builtins__", "print")}
+    )
+
+    stdout = "".join(buffer)
+    truncated = len(stdout) > output_limit
+    if truncated:
+        stdout = stdout[:output_limit] + "\n...[output truncated]"
+
+    return {
+        "stdout": stdout,
+        "result": scope.get("result"),
+        "error": error,
+        "truncated": truncated,
+    }
 
 
 def click_targets(
