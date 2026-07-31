@@ -99,6 +99,7 @@ def _turn_agent(env):
     a.arc_env = env
     a._convert_raw_frame_data = lambda raw: raw
     a._llm_dead = False
+    a._llm_failures = 0
     a._llm_messages = []
     a._llm_history = []
     a._llm_turns = 0
@@ -257,7 +258,9 @@ def test_a_turn_that_acted_does_not_spend_one_more_action(monkeypatch):
     assert a._noop is False, "the suppression must not persist to the next action"
 
 
-def test_a_dead_server_retires_the_model_for_the_rest_of_the_game(monkeypatch):
+def test_a_dead_server_retires_the_model_after_a_bounded_number_of_tries(
+    monkeypatch,
+):
     env = _FakeEnv(_frame(_grid()))
     a = _turn_agent(env)
 
@@ -265,10 +268,74 @@ def test_a_dead_server_retires_the_model_for_the_rest_of_the_game(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr(agent_mod, "chat_completion", dead)
+    grid = agent_mod.grid_of(env.current)
 
-    assert a._llm_turn(agent_mod.grid_of(env.current), env.current) is False
+    for i in range(1, agent_mod.LLM_MAX_FAILURES):
+        assert a._llm_turn(grid, env.current) is False
+        assert a._llm_dead is False, f"retired after only {i} failure(s)"
+
+    assert a._llm_turn(grid, env.current) is False
     assert a._llm_dead is True
     assert env.sent == []
+
+
+def test_one_slow_generation_does_not_write_off_a_working_server(monkeypatch):
+    """Measured on Kaggle, not imagined: the model played 136 actions, one
+    generation ran past the deadline, and the old code retired a perfectly
+    healthy server for the rest of the game."""
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(1, 1, 5)))] * 4)
+    a = _turn_agent(env)
+    grid = agent_mod.grid_of(env.current)
+
+    calls = {"n": 0}
+
+    def flaky(_payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("timed out")
+        if calls["n"] == 2:
+            return _reply(code="action('ACTION1')")
+        return _reply(content="ok")
+
+    monkeypatch.setattr(agent_mod, "chat_completion", flaky)
+
+    assert a._llm_turn(grid, env.current) is False   # the slow one
+    assert a._llm_dead is False, "a timeout is not a dead server"
+    assert a._llm_turn(grid, env.current) is True    # and it recovers
+    assert env.sent == [(1, None, None)]
+
+
+def test_a_recovered_turn_clears_the_failure_count(monkeypatch):
+    """Otherwise three slow generations spread across a whole game would
+    retire a server that worked fine in between."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    a._llm_failures = agent_mod.LLM_MAX_FAILURES - 1
+    _script(monkeypatch, [_reply(content="thinking")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    assert a._llm_failures == 0
+
+
+def test_a_failed_turn_does_not_leave_a_broken_transcript(monkeypatch):
+    """A half-finished turn can end on an assistant tool_call whose result
+    never arrived, which the server rejects on the next request."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    grid = agent_mod.grid_of(env.current)
+
+    calls = {"n": 0}
+
+    def flaky(_payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _reply(code="action('ACTION1')")
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(agent_mod, "chat_completion", flaky)
+    a._llm_turn(grid, env.current)
+
+    assert [m["role"] for m in a._llm_messages] == ["system"]
 
 
 def test_a_turn_that_only_reasons_falls_back_rather_than_stalling(monkeypatch):

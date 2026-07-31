@@ -1140,7 +1140,18 @@ LLM_MODEL = os.getenv("ARC_LLM_MODEL", "vrfai/Qwen3.6-27B-FP8")
 LLM_TEMPERATURE = _env_float("ARC_LLM_TEMPERATURE", 0.6)
 LLM_TOP_P = _env_float("ARC_LLM_TOP_P", 0.95)
 LLM_TOP_K = _env_int("ARC_LLM_TOP_K", 20)
-LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 120.0)
+# Measured on the Blackwell card: a turn averaged 62.5s wall clock across
+# several generations, and one request still ran past a 120s deadline --
+# a thinking model with a grown transcript is simply slow sometimes. 300
+# is chosen to make the timeout mean "something is wrong" rather than
+# "this one was long", which is what it has to mean for the failure count
+# below to be worth anything.
+LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 300.0)
+
+# Consecutive failed model calls before the search takes over the game.
+# Not 1: see `_llm_turn`. A dead server trips this immediately and pays
+# the retries once; a single slow generation costs one search step.
+LLM_MAX_FAILURES = _env_int("ARC_LLM_MAX_FAILURES", 3)
 # How many python calls the model may make per observe-plan-act turn. TAAF
 # tells the model not to ration tool calls, so the cap is a backstop against
 # a loop that never decides, not a budget the model should feel.
@@ -2369,6 +2380,8 @@ class MyAgent(Agent):
         # unreachable. It will not come back, and re-attempting a 27B
         # request per action would spend the wall clock the search needs.
         self._llm_dead = not LLM_ENABLED
+        # Consecutive transport failures; reset by any successful turn.
+        self._llm_failures = 0
         self._llm_messages: list[dict[str, Any]] = []
         self._llm_history: list[str] = []
         self._llm_turns = 0
@@ -2715,6 +2728,7 @@ class MyAgent(Agent):
         """
         available = list(latest_frame.available_actions or [])
         view = segment_frame(grid, self._volatile)
+        started = time.monotonic()
 
         self._turn_actions = 0
         self._turn_frame = latest_frame
@@ -2754,31 +2768,54 @@ class MyAgent(Agent):
             outcome = run_tool_conversation(
                 self._llm_messages, namespace, stop_check=self._turn_over
             )
-        except Exception as exc:  # noqa: BLE001 - any transport failure retires it
-            # Deliberately broad and deliberately terminal. Whatever went
-            # wrong -- refused connection, a server that died, a protocol
-            # the parser did not expect -- it will still be wrong on the
-            # next action, and the search needs the remaining wall clock
-            # more than this needs a retry.
+        except Exception as exc:  # noqa: BLE001 - any transport failure counts
+            # This used to retire the model on the FIRST failure, reasoning
+            # that whatever broke would still be broken next time. That is
+            # true of a refused connection and false of a timeout, and the
+            # first Blackwell run hit exactly the false case: the model
+            # played 136 actions, one generation ran past the deadline, and
+            # a working server was written off for the rest of the game.
+            #
+            # So failures are counted instead. A genuinely dead server
+            # trips the limit immediately and costs a bounded number of
+            # retries once, not per action; a single slow generation costs
+            # one search step and is forgiven.
+            self._llm_failures += 1
+            retiring = self._llm_failures >= LLM_MAX_FAILURES
             logger.warning(
-                "%s: model unreachable at action %d (%s: %s); the search "
-                "plays the rest of this game",
+                "%s: model call failed at action %d (%s: %s) [%d/%d]%s",
                 self.game_id, self._steps, type(exc).__name__, exc,
+                self._llm_failures, LLM_MAX_FAILURES,
+                "; retiring it, the search plays the rest of this game"
+                if retiring else "; falling back for this step only",
             )
-            self._llm_dead = True
+            self._llm_dead = retiring
+            # The transcript is left mid-turn -- possibly with an assistant
+            # tool_call whose result never arrived, which the server
+            # rejects. Drop back to the framing and start the next turn
+            # clean rather than reasoning about how far it got.
+            self._llm_messages = self._llm_messages[:1]
             return False
 
+        self._llm_failures = 0
         self._llm_turns += 1
+
+        # One line per turn. The first Blackwell run reported "136 actions"
+        # and nothing else, which says the loop works but not whether the
+        # model is playing or thrashing -- and on a quadratic metric the
+        # actions-per-turn number is the one that decides the score.
+        logger.info(
+            "%s: model turn %d: %d actions in %.0fs (%s, %d tool calls, "
+            "level %d, %d total)",
+            self.game_id, self._llm_turns, self._turn_actions,
+            time.monotonic() - started, outcome["stop"],
+            outcome["tool_calls"], self._turn_level, self._steps,
+        )
+
         if self._turn_actions == 0:
-            # Worth logging every time: a model that reasons and never
-            # acts looks exactly like a working run from the outside,
-            # while the search quietly plays the whole game.
-            logger.info(
-                "%s: model turn %d took no action (%s, %d tool calls); "
-                "the search takes this step",
-                self.game_id, self._llm_turns, outcome["stop"],
-                outcome["tool_calls"],
-            )
+            # Called out separately: a model that reasons and never acts
+            # looks exactly like a working run from the outside, while the
+            # search quietly plays the whole game.
             self._llm_note = (
                 "Your last turn ended without calling action(). A move has "
                 "to be played, so one was chosen for you. Act this turn."
