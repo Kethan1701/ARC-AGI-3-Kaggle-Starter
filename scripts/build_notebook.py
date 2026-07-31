@@ -112,6 +112,19 @@ VLLM_TARGET = "/tmp/vllm-site-packages"
 # silently demotes the whole run to the search.
 SERVER_WAIT_SECONDS = 900
 
+# --- the Phase A rehearsal --------------------------------------------------
+# One game, played for real. ls20 is the pick because its per-level
+# baselines are known ([22, 123, 73, 84, 96, 192, 186]) and it is
+# movement-driven, so "did the model make progress" is legible in the
+# actions/baseline column rather than needing interpretation.
+SMOKE_GAME = "ls20"
+
+# Enough to cross level 1 at a sane action count and see level 2 begin;
+# small enough that Save & Run All stays a rehearsal rather than becoming
+# a run of its own. At the measured 62.5s/turn and ~27 actions/turn this
+# is roughly ten minutes on top of the ~6 minutes of server startup.
+SMOKE_STEPS = 300
+
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
 # "name" goes in the *notebook* metadata, which is what the web editor reads.
@@ -365,6 +378,15 @@ def build() -> dict:
         "%%writefile /tmp/my_agent.py\n" + agent_body
     )
 
+    # The repo's own scorer, shipped verbatim. Its three path assumptions
+    # are env-overridable precisely so this works, which keeps Phase A
+    # honest: it measures with the same harness the repo measures with,
+    # instead of a notebook-only imitation that could agree with nothing.
+    scorer_src = (ROOT / "scripts" / "score_competition.py").read_text()
+    write_scorer_cell = code_cell(
+        "%%writefile /tmp/score_competition.py\n" + scorer_src
+    )
+
     # Framework setup, UNCONDITIONALLY.
     #
     # This used to live inside the rerun branch, which meant `agents` did
@@ -457,76 +479,54 @@ def build() -> dict:
     # submission 55099108 shipped with an IndexError on the action path and
     # failed where it could not be seen.
     #
-    # This does not need the gateway. It imports the agent exactly as the
-    # framework will, drives one full turn against a synthetic frame, and
-    # checks that an action comes back. Cheap, offline, and it catches the
-    # entire class of failure that cost that submission.
+    # This does not need the gateway sidecar, because the competition
+    # dataset ships `environment_files/` -- all 25 real games, offline. So
+    # Phase A stands up the genuine arc_agi Flask app with
+    # competition_mode=True and plays a REAL game under the real rules,
+    # using the same `score_competition.py` the repo scores with rather
+    # than a second, less honest harness written for the notebook.
+    #
+    # The first version of this cell played a synthetic all-zero frame.
+    # That proved the loop round-trips and nothing about whether the model
+    # can play: it reported 136 actions with no way to tell exploration
+    # from thrashing, because a board that never changes cannot be solved.
     smoke_cell = code_cell(
         dedent(
-            """\
-            import os, sys, traceback
+            f"""\
+            import os, subprocess, sys
 
             if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
-                # Adopt whatever the server cell proved, BEFORE importing the
-                # agent -- it reads ARC_LLM at import time. Without this the
-                # smoke test would exercise the search and quietly tell us
-                # nothing about the path we are actually shipping.
+                COMP = '/kaggle/input/competitions/arc-prize-2026-arc-agi-3'
+                env = dict(os.environ)
+                env['ARC_FRAMEWORK_DIR'] = '/kaggle/working/ARC-AGI-3-Agents'
+                env['ARC_ENVIRONMENTS_DIR'] = COMP + '/environment_files'
+                env['ARC_AGENT_PATH'] = '/tmp/my_agent.py'
+                env['RECORDINGS_DIR'] = '/tmp/recordings'
+                env['MPLBACKEND'] = 'agg'
+
+                # Whatever the server cell proved. The agent reads ARC_LLM at
+                # import time, and the subprocess inherits this env, so
+                # without it Phase A would exercise the search and tell us
+                # nothing about the path being shipped.
                 if os.path.exists('/tmp/llm.env'):
                     for line in open('/tmp/llm.env'):
                         line = line.strip().replace('export ', '', 1)
                         if '=' in line:
                             k, _, v = line.partition('=')
-                            os.environ[k] = v
+                            env[k] = v
+                print('ARC_LLM =', env.get('ARC_LLM', '0'))
 
-                # Both are needed: /tmp holds my_agent.py, and the framework
-                # directory holds the `agents` package its base class comes
-                # from. Missing the second is what failed this cell the
-                # first time it ever ran.
-                sys.path.insert(0, '/tmp')
-                sys.path.insert(0, '/kaggle/working/ARC-AGI-3-Agents')
-                ok = False
-                try:
-                    from arcengine import FrameData, GameState
-                    from my_agent import MyAgent
+                rc = subprocess.call(
+                    [sys.executable, '/tmp/score_competition.py',
+                     '--game', {SMOKE_GAME!r}, '--max-steps', str({SMOKE_STEPS})],
+                    env=env)
 
-                    class _Env:
-                        def __init__(self):
-                            self.sent = []
-                            self.current = FrameData(
-                                game_id='smoke',
-                                frame=[[[0] * 64 for _ in range(64)]],
-                                state=GameState.NOT_FINISHED,
-                                levels_completed=0, win_levels=3, guid='g',
-                                full_reset=False, available_actions=[1, 2, 6])
-                        def step(self, action, data=None, reasoning=None):
-                            self.sent.append(action.value)
-                            return self.current
-                        @property
-                        def observation_space(self):
-                            return self.current
-
-                    env = _Env()
-                    agent = MyAgent(card_id='c', game_id='smoke',
-                                    agent_name='smoke', ROOT_URL='',
-                                    record=False, arc_env=env)
-                    agent._convert_raw_frame_data = lambda raw: raw
-                    # Few, because with ARC_LLM=1 each of these is a real
-                    # turn against the real 27B model. Enough to prove the
-                    # loop round-trips; not so many that Save & Run All
-                    # turns into a run of its own.
-                    for _ in range(6):
-                        act = agent.choose_action(agent.frames, env.current)
-                        agent.take_action(act)
-                    print(f'SMOKE OK: {len(env.sent)} actions, '
-                          f'ARC_LLM={os.getenv("ARC_LLM", "0")}')
-                    ok = True
-                except Exception:
-                    traceback.print_exc()
-                    print('SMOKE FAILED -- this agent would error on the '
-                          'leaderboard. Fix before submitting.')
-                finally:
-                    sys.path.remove('/tmp')
-                    sys.path.remove('/kaggle/working/ARC-AGI-3-Agents')
+                # A non-zero exit is reported, not raised. This cell must not
+                # be able to fail the commit -- the run still has to produce
+                # a submission.parquet below.
+                print('SMOKE OK' if rc == 0 else
+                      f'SMOKE FAILED (rc={{rc}}) -- this agent would error on '
+                      f'the leaderboard. Fix before submitting.')
             """
         )
     )
@@ -609,6 +609,7 @@ def build() -> dict:
             install_cell,
             *([vllm_cell] if MODE == "policy" else []),
             write_agent_cell,
+            write_scorer_cell,
             # Unconditional: the smoke test imports the agent, and the
             # agent's base class lives in this package.
             framework_cell,

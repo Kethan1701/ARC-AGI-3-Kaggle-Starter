@@ -260,11 +260,34 @@ def test_the_framework_is_set_up_outside_the_rerun_branch():
     ), "framework setup is gated on the rerun again"
 
 
-def test_the_smoke_test_can_actually_import_the_agent():
-    """/tmp alone is not enough, and that was exactly the bug."""
+def test_the_smoke_test_points_the_scorer_at_kaggles_paths():
+    """Nothing sits where it does in the repo: the framework is copied to
+    /kaggle/working, the agent is spliced into /tmp, and the games ship
+    inside the competition dataset."""
     module = _load_build_notebook()
     plumbing = _plumbing(module)
-    assert "sys.path.insert(0, '/kaggle/working/ARC-AGI-3-Agents')" in plumbing
+    assert "ARC_FRAMEWORK_DIR" in plumbing
+    assert "ARC_ENVIRONMENTS_DIR" in plumbing
+    assert "ARC_AGENT_PATH" in plumbing
+
+
+def test_the_scorer_honours_those_overrides():
+    """If it ever goes back to hardcoded repo paths, Phase A silently
+    stops testing anything on Kaggle."""
+    src = (ROOT / "scripts" / "score_competition.py").read_text()
+    for var in ("ARC_FRAMEWORK_DIR", "ARC_ENVIRONMENTS_DIR", "ARC_AGENT_PATH"):
+        assert var in src, f"{var} override missing from the scorer"
+
+
+def test_phase_a_plays_a_real_game_not_a_synthetic_one():
+    """The first version played an all-zero frame that could never be
+    solved, so it reported an action count with no way to tell exploration
+    from thrashing."""
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert "environment_files" in plumbing, "no real games wired in"
+    assert "score_competition.py" in plumbing
+    assert module.SMOKE_GAME in plumbing
 
 
 def test_the_vllm_install_stays_out_of_the_notebook_outputs():
@@ -281,9 +304,22 @@ def test_save_and_run_all_actually_exercises_the_agent():
     IndexError on the action path and failed where nobody could see it."""
     module = _load_build_notebook()
     plumbing = _plumbing(module)
-    assert "from my_agent import MyAgent" in plumbing
-    assert "choose_action" in plumbing
+    assert "score_competition.py" in plumbing
     assert "SMOKE FAILED" in plumbing
+
+    # And it must not be able to fail the commit: the run still has to
+    # write a submission.parquet after it. Checked as statements, not as a
+    # substring -- the prose in this cell says "raised" and matching that
+    # would be a test of the comments.
+    smoke = [
+        c["source"] for c in module.build()["cells"]
+        if "SMOKE FAILED" in str(c["source"])
+    ][0]
+    bad = [
+        line for line in smoke.splitlines()
+        if line.strip().startswith(("raise ", "raise\t", "sys.exit", "assert "))
+    ]
+    assert not bad, f"this cell can fail the commit: {bad}"
 
 
 def test_the_shipped_notebook_matches_the_mode_it_declares():
