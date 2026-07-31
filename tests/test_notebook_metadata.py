@@ -238,6 +238,43 @@ def test_a_failed_server_never_raises_and_kills_the_submission():
     assert "SystemExit" not in server
 
 
+def test_the_framework_is_set_up_outside_the_rerun_branch():
+    """Verified against a real Kaggle run, not reasoned about.
+
+    The framework copy used to live inside `if KAGGLE_IS_COMPETITION_RERUN`,
+    so during Save & Run All the `agents` package did not exist and the
+    smoke test died on `ModuleNotFoundError: No module named 'agents'`
+    before it could test anything at all. `my_agent.py` derives its base
+    class from that package, so everything that imports the agent needs
+    it -- not just the run.
+    """
+    module = _load_build_notebook()
+    cells = [
+        "".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+        for c in module.build()["cells"]
+    ]
+    setup = [c for c in cells if "ARC-AGI-3-Agents/agents/__init__.py" in c]
+    assert setup, "no framework setup cell"
+    assert not any(
+        "KAGGLE_IS_COMPETITION_RERUN" in c for c in setup
+    ), "framework setup is gated on the rerun again"
+
+
+def test_the_smoke_test_can_actually_import_the_agent():
+    """/tmp alone is not enough, and that was exactly the bug."""
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert "sys.path.insert(0, '/kaggle/working/ARC-AGI-3-Agents')" in plumbing
+
+
+def test_the_vllm_install_stays_out_of_the_notebook_outputs():
+    """Anything under /kaggle/working is a notebook OUTPUT. The first GPU
+    run put several GB of wheels there, where the Submit-to-Competition
+    picker offers them alongside submission.parquet."""
+    module = _load_build_notebook()
+    assert not module.VLLM_TARGET.startswith("/kaggle/working")
+
+
 def test_save_and_run_all_actually_exercises_the_agent():
     """Phase A never plays a game, so for a long time it proved only that
     the cells parsed -- which is how a submission shipped with an
@@ -249,16 +286,39 @@ def test_save_and_run_all_actually_exercises_the_agent():
     assert "SMOKE FAILED" in plumbing
 
 
-def test_the_default_notebook_never_switches_a_model_on():
-    """What ships today is the search that scored 0.26: no GPU, no
-    weights, nothing to provision and nothing to fail."""
+def test_the_shipped_notebook_matches_the_mode_it_declares():
+    """The guard that matters is agreement, not a fixed value.
+
+    A notebook that says MODE='llm' and carries no server would score what
+    the search scores while looking like a model run -- and one that says
+    'search' but drags in a model would spend GPU quota to no purpose.
+    Both are silent, so both are checked.
+    """
     module = _load_build_notebook()
-    assert module.MODE == "search"
     plumbing = _plumbing(module)
-    assert "ARC_POLICY" not in plumbing
-    assert "api_server" not in plumbing
-    assert "requirements.lock" not in plumbing
     assert "__POLICY_ENV__" not in plumbing, "placeholder left unsubstituted"
+
+    if module.MODE == "search":
+        assert "ARC_POLICY" not in plumbing
+        assert "api_server" not in plumbing
+        assert "requirements.lock" not in plumbing
+    elif module.MODE == "llm":
+        assert "api_server" in plumbing, "llm mode with no server"
+        assert "export ARC_LLM=1" in plumbing
+        assert "ARC_POLICY" not in plumbing, "both policies at once"
+    else:
+        assert "ARC_POLICY=1" in plumbing
+        assert "api_server" not in plumbing
+
+
+def test_a_gpu_mode_ships_with_a_gpu_selected():
+    """The build refuses this combination, but the refusal only fires when
+    someone runs the build -- this fires on every test run."""
+    module = _load_build_notebook()
+    if module.MODE in ("policy", "llm"):
+        assert module._ACCELERATORS[module.ACCELERATOR]["gpu"] is True
+    if module.MODE == "llm":
+        assert module.ACCELERATOR == "rtx6000"
 
 
 def test_the_shipped_metadata_mounts_match_the_selected_mode():

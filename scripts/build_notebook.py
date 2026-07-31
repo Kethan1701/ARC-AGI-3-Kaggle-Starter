@@ -41,7 +41,7 @@ from textwrap import dedent
 # and adding a provisioning failure mode to every run. Switch this only if
 # you actually wire in local model weights.
 # ─────────────────────────────────────────────────────────────────────────────
-ACCELERATOR = "cpu"
+ACCELERATOR = "rtx6000"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT PLAYS THE GAMES
@@ -66,7 +66,7 @@ ACCELERATOR = "cpu"
 # `build()` refuses a GPU mode on a CPU accelerator: the agent would
 # otherwise spend minutes failing to load 28GB of weights before falling
 # back, having spent a submission slot to score what the search scores.
-MODE = "search"
+MODE = "llm"
 
 _MODES = ("search", "policy", "llm")
 
@@ -99,7 +99,13 @@ SERVER_PORT = 1234
 # fail at install time; it fails at the last cell, after nine hours, with
 # nothing to submit. An isolated --target cannot do that: the server
 # subprocess gets it on PYTHONPATH and the notebook kernel never sees it.
-VLLM_TARGET = "/kaggle/working/vllm-site-packages"
+#
+# /tmp, NOT /kaggle/working. Anything under /kaggle/working is a notebook
+# OUTPUT: the first run put several GB of wheels there, which the "Submit
+# to Competition" file picker then offers alongside submission.parquet --
+# the same trap that keeps my_agent.py in /tmp -- and which counts against
+# the output size limit for nothing.
+VLLM_TARGET = "/tmp/vllm-site-packages"
 
 # Long because it is honest. Loading 28GB of FP8 weights and compiling
 # CUDA graphs is minutes, not seconds, and a wait that expires early
@@ -359,15 +365,17 @@ def build() -> dict:
         "%%writefile /tmp/my_agent.py\n" + agent_body
     )
 
-    run_cell_source = dedent(
-        """\
-        import os
-
-        if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
-            # Wait for the gateway sidecar to be ready.
-            !curl --fail --retry 999 --retry-all-errors --retry-delay 5 \\
-                  --retry-max-time 600 http://gateway:8001/api/games
-
+    # Framework setup, UNCONDITIONALLY.
+    #
+    # This used to live inside the rerun branch, which meant `agents` did
+    # not exist during Save & Run All -- so the Phase A smoke test could
+    # not import the agent at all and died on `ModuleNotFoundError: No
+    # module named 'agents'`. The framework is what `my_agent.py` derives
+    # its base class from, so anything that imports the agent needs it,
+    # not just the run.
+    framework_cell = code_cell(
+        dedent(
+            """\
             # Copy the framework into a writable location.
             !cp -r /kaggle/input/competitions/arc-prize-2026-arc-agi-3/ARC-AGI-3-Agents \\
                    /kaggle/working/ARC-AGI-3-Agents
@@ -381,31 +389,44 @@ def build() -> dict:
             # templates with deps we don't ship (langgraph, smolagents, etc.).
             with open('/kaggle/working/ARC-AGI-3-Agents/agents/__init__.py', 'w') as f:
                 f.write(\"\"\"from typing import Type
-        from dotenv import load_dotenv
-        from .agent import Agent, Playback
-        from .swarm import Swarm
-        from .templates.random_agent import Random
-        from .templates.my_agent import MyAgent
+            from dotenv import load_dotenv
+            from .agent import Agent, Playback
+            from .swarm import Swarm
+            from .templates.random_agent import Random
+            from .templates.my_agent import MyAgent
 
-        load_dotenv()
+            load_dotenv()
 
-        AVAILABLE_AGENTS: dict[str, Type[Agent]] = {
-            'random': Random,
-            'myagent': MyAgent,
-        }
-        \"\"\")
+            AVAILABLE_AGENTS: dict[str, Type[Agent]] = {
+                'random': Random,
+                'myagent': MyAgent,
+            }
+            \"\"\")
 
             # Point the framework at the gateway sidecar.
             with open('/kaggle/working/ARC-AGI-3-Agents/.env', 'w') as f:
                 f.write(\"\"\"SCHEME=http
-        HOST=gateway
-        PORT=8001
-        ARC_API_KEY=test-key-123
-        ARC_BASE_URL=http://gateway:8001/
-        OPERATION_MODE=online
-        ENVIRONMENTS_DIR=
-        RECORDINGS_DIR=/kaggle/working/server_recording
-        \"\"\")
+            HOST=gateway
+            PORT=8001
+            ARC_API_KEY=test-key-123
+            ARC_BASE_URL=http://gateway:8001/
+            OPERATION_MODE=online
+            ENVIRONMENTS_DIR=
+            RECORDINGS_DIR=/kaggle/working/server_recording
+            \"\"\")
+            print('framework ready')
+            """
+        )
+    )
+
+    run_cell_source = dedent(
+        """\
+        import os
+
+        if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+            # Wait for the gateway sidecar to be ready.
+            !curl --fail --retry 999 --retry-all-errors --retry-delay 5 \\
+                  --retry-max-time 600 http://gateway:8001/api/games
 
             # Run it. The gateway records every action and emits submission.parquet.
             #
@@ -457,10 +478,14 @@ def build() -> dict:
                             k, _, v = line.partition('=')
                             os.environ[k] = v
 
+                # Both are needed: /tmp holds my_agent.py, and the framework
+                # directory holds the `agents` package its base class comes
+                # from. Missing the second is what failed this cell the
+                # first time it ever ran.
                 sys.path.insert(0, '/tmp')
+                sys.path.insert(0, '/kaggle/working/ARC-AGI-3-Agents')
                 ok = False
                 try:
-                    import numpy as np
                     from arcengine import FrameData, GameState
                     from my_agent import MyAgent
 
@@ -501,6 +526,7 @@ def build() -> dict:
                           'leaderboard. Fix before submitting.')
                 finally:
                     sys.path.remove('/tmp')
+                    sys.path.remove('/kaggle/working/ARC-AGI-3-Agents')
             """
         )
     )
@@ -583,6 +609,9 @@ def build() -> dict:
             install_cell,
             *([vllm_cell] if MODE == "policy" else []),
             write_agent_cell,
+            # Unconditional: the smoke test imports the agent, and the
+            # agent's base class lives in this package.
+            framework_cell,
             # The server cell comes AFTER the agent is written, so the
             # smoke test below can exercise the agent against a live
             # server during Save & Run All rather than only in the rerun.
