@@ -500,6 +500,51 @@ def test_choose_action_still_plays_the_search_when_the_model_is_off():
     assert a._noop is False
 
 
+def test_the_turn_sends_the_board_as_an_image(monkeypatch):
+    """The served model has a vision encoder. The first real run fed it
+    prose about a visual puzzle and it never converged."""
+    env = _FakeEnv(_frame(_grid(mark=(3, 3, 9))))
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    user = [m for m in a._llm_messages if m.get("role") == "user"][-1]
+    assert isinstance(user["content"], list)
+    kinds = [p["type"] for p in user["content"]]
+    assert kinds == ["text", "image_url"]
+    assert user["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+
+
+def test_only_the_current_board_is_ever_in_flight(monkeypatch):
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(content="a"), _reply(content="b")])
+    grid = agent_mod.grid_of(env.current)
+
+    a._llm_turn(grid, env.current)
+    a._llm_turn(grid, env.current)
+
+    images = sum(
+        1
+        for m in a._llm_messages
+        if isinstance(m.get("content"), list)
+        for p in m["content"]
+        if p.get("type") == "image_url"
+    )
+    assert images == 1
+
+
+def test_the_system_prompt_tells_the_model_it_can_see(monkeypatch):
+    """It used to say the opposite -- 'you are not shown the raw numbers as
+    a picture' -- which was true then and is a lie now."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6]).lower()
+    assert "image" in prompt
+    assert "not shown" not in prompt
+
+
 def test_the_namespace_offers_both_views(monkeypatch):
     """TAAF withholds the raw grid and substitutes an image. We have no
     image to substitute, so withholding it would leave the model blind."""

@@ -122,12 +122,14 @@ alone is enough to know what has and hasn't been tried.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import queue
 import random
 import re
+import struct
 import sys
 import threading
 import time
@@ -1152,10 +1154,19 @@ LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 300.0)
 # Not 1: see `_llm_turn`. A dead server trips this immediately and pays
 # the retries once; a single slow generation costs one search step.
 LLM_MAX_FAILURES = _env_int("ARC_LLM_MAX_FAILURES", 3)
-# How many python calls the model may make per observe-plan-act turn. TAAF
-# tells the model not to ration tool calls, so the cap is a backstop against
-# a loop that never decides, not a budget the model should feel.
-LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
+# How many python calls the model may make per observe-plan-act turn.
+#
+# Was 12, on TAAF's principle that the model should not ration tool calls.
+# Measured on ls20, that backstop was not a backstop: ELEVEN of twelve turns
+# ran to the cap, averaging 370s each at ~31s a call, and the model still had
+# not cleared a 22-action level after 304 actions. A cap that is hit every
+# single time is not bounding a pathological case, it is the schedule.
+#
+# 6 halves the turn while the model is being given the board as an image --
+# most of what those calls were doing was reconstructing by arithmetic what
+# it can now simply look at. If turns still end at the cap with the image in
+# place, the problem is the loop, not the budget.
+LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 6)
 
 PYTHON_TOOL_SCHEMA = {
     "type": "function",
@@ -1395,6 +1406,147 @@ LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
 LLM_MAX_NODES = _env_int("ARC_LLM_MAX_NODES", 120)
 
 
+# The board, drawn. `Qwen3_5ForConditionalGeneration` initialises a ViT and
+# an MM encoder -- confirmed in the vLLM startup log -- so the served model
+# can see. The first real run fed that vision model a prose description of a
+# visual puzzle and it never converged on a hypothesis: twelve turns, every
+# one of them burning the tool-call cap, and level 1 of ls20 (baseline 22)
+# still unsolved after 304 actions. TAAF sends `{context: current_grid,
+# upscale: 4}`. This is that.
+#
+# 8, not TAAF's 4, and the reason is patch geometry rather than taste. A
+# ViT sees the image in patches; Qwen-family encoders merge 2x2 of them, so
+# one visual token covers roughly 28-32 pixels square. At upscale 4 the
+# board is 256px and a single token blurs about EIGHT board cells together
+# -- which loses exactly the cell-level detail the image was added to
+# provide. 8 doubles the linear resolution to 512px, about four cells per
+# token, for 256 visual tokens and a 6KB PNG. Measured across the games:
+#
+#   upscale   px    PNG     encode   ~tokens   cells/token
+#         4   256   1.9KB     3ms         64           8
+#         8   512   6.2KB     9ms        256           4
+#        16  1024  19.9KB    45ms       1024           2
+#
+# All are affordable against a 32768 context whose text half peaks at ~2.3k,
+# so this is not a budget decision. 16 was tempting, but the image's job is
+# the gestalt -- what kind of puzzle this is, how it is laid out -- and the
+# prompt already tells the model to take exact coordinates from the
+# segmentation and the raw grid, which are pixel-perfect. The exact patch
+# size is not something this file can verify, hence the override.
+RENDER_UPSCALE = _env_int("ARC_LLM_UPSCALE", 8)
+
+# 16 colours, because all 16 values occur: measured over the opening frame of
+# all 25 games, every value 0-15 is present and 5 alone accounts for 38,816
+# cells (it is the background on most boards).
+#
+# NOT the framework's COLOR_PALETTE from `langgraph_thinking/vision.py`. That
+# one defines 10 of the 16 and maps both 5 and 11 to the same grey, so two
+# distinct values would render identically -- on a puzzle whose entire content
+# is which cells differ from which. 0-9 follow the familiar ARC palette; 10-15
+# are chosen to sit away from those hues.
+PALETTE: tuple[tuple[int, int, int], ...] = (
+    (0, 0, 0),        # 0  black
+    (0, 116, 217),    # 1  blue
+    (255, 65, 54),    # 2  red
+    (46, 204, 64),    # 3  green
+    (255, 220, 0),    # 4  yellow
+    (170, 170, 170),  # 5  grey
+    (240, 18, 190),   # 6  fuchsia
+    (255, 133, 27),   # 7  orange
+    (127, 219, 255),  # 8  azure
+    (135, 12, 37),    # 9  maroon
+    (255, 255, 255),  # 10 white
+    (75, 0, 130),     # 11 indigo
+    (0, 128, 128),    # 12 teal
+    (139, 69, 19),    # 13 brown
+    (255, 182, 193),  # 14 pink
+    (128, 128, 0),    # 15 olive
+)
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + tag
+        + data
+        + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    )
+
+
+def render_png(
+    grid: tuple[tuple[int, ...], ...], upscale: int = RENDER_UPSCALE
+) -> bytes:
+    """The frame as a PNG, written by hand.
+
+    Hand-rolled because this file is spliced into the notebook and may import
+    only the standard library -- Pillow exists on the Kaggle image but not by
+    any guarantee this file is allowed to rely on. A truecolour PNG is a
+    signature, three chunks and one zlib stream, which is a smaller thing to
+    own than a dependency that would break the contract at the top of this
+    module.
+
+    `upscale` repeats each cell into an NxN block. A 64x64 image is smaller
+    than the model's patch grid, so without it whole objects vanish into a
+    single patch.
+    """
+    height = len(grid)
+    width = len(grid[0]) if height else 0
+    if not height or not width:
+        # A 1x1 black pixel. Callers get a valid image rather than an
+        # exception on the action path.
+        return render_png(((0,),), 1)
+
+    raw = bytearray()
+    for row in grid:
+        line = bytearray()
+        for value in row:
+            line += bytes(PALETTE[value % len(PALETTE)]) * upscale
+        for _ in range(upscale):
+            raw += b"\x00"  # filter type 0 (None) for this scanline
+            raw += line
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(
+            b"IHDR",
+            struct.pack(
+                ">IIBBBBB", width * upscale, height * upscale, 8, 2, 0, 0, 0
+            ),
+        )
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def render_data_uri(
+    grid: tuple[tuple[int, ...], ...], upscale: int = RENDER_UPSCALE
+) -> str:
+    """The frame as a data: URI, ready for an image_url content block."""
+    return "data:image/png;base64," + base64.b64encode(
+        render_png(grid, upscale)
+    ).decode("ascii")
+
+
+def strip_images(messages: list[dict[str, Any]]) -> None:
+    """Drop image blocks from every message, in place, keeping the text.
+
+    Called before appending the current turn, so exactly one image is ever in
+    flight. Without this every turn's board accumulates: the transcript keeps
+    four turns, and four 256x256 images is thousands of tokens spent showing
+    the model three boards that no longer exist and which it cannot act on.
+    """
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        text = " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+        message["content"] = text
+
+
 def describe_frame(view: dict[str, Any], limit: int = LLM_MAX_NODES) -> str:
     """Render a segmentation as prose, largest objects first.
 
@@ -1448,10 +1600,14 @@ def build_system_prompt(available: list[int]) -> str:
         "code that explores, reads what came back, and decides -- a search, "
         "a flood fill, a hypothesis test. That is the whole job.\n\n"
         "THE BOARD\n"
-        "A 64x64 grid of colours numbered 0-15. You are not shown the raw "
-        "numbers as a picture; you are shown the board parsed into objects "
-        "-- 4-connected runs of one colour -- and you can inspect the grid "
-        "yourself in code.\n\n"
+        "A 64x64 grid of colours numbered 0-15. You get three views of it, "
+        "and they are the same board:\n"
+        "  * an image of it, upscaled so one cell is a block of pixels;\n"
+        "  * the same board parsed into objects, listed below;\n"
+        "  * the raw grid, in code, as `grid[y][x]`.\n"
+        "Look at the image first to see the shape of the problem, then use "
+        "the objects and the grid to pin down exact coordinates. Trust the "
+        "numbers over your reading of the picture when they disagree.\n\n"
         "ACTIONS\n"
         f"This game accepts: {names}. ACTION6 is a click and needs "
         "coordinates; the rest take none. RESET (ACTION0) restarts and is "
@@ -2740,16 +2896,26 @@ class MyAgent(Agent):
             ]
         else:
             self._llm_messages = evict_turns(self._llm_messages, LLM_EVICT_TURNS)
+
+        # Exactly one image in flight: the board as it is now.
+        strip_images(self._llm_messages)
+        turn_text = build_turn_prompt(
+            view,
+            self._llm_history,
+            latest_frame.levels_completed,
+            self._steps,
+            self._llm_note,
+        )
         self._llm_messages.append(
             {
                 "role": "user",
-                "content": build_turn_prompt(
-                    view,
-                    self._llm_history,
-                    latest_frame.levels_completed,
-                    self._steps,
-                    self._llm_note,
-                ),
+                "content": [
+                    {"type": "text", "text": turn_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": render_data_uri(grid)},
+                    },
+                ],
             }
         )
         self._llm_note = ""
