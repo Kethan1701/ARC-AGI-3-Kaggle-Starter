@@ -4,12 +4,20 @@ The notebook follows the exact pattern used by Kaggle's official sample
 ("ARC3 Sample Submission - Stochastic Goose"):
 
   Cell 1: install the `arc-agi` wheel from the offline competition dataset.
-  Cell 2: write `my_agent.py` to /kaggle/working/ — its body is THIS file.
-  Cell 3: if running inside the Kaggle competition rerun, wait for the
+  Cell 2: write `my_agent.py` to /tmp/ — its body is THIS file.
+  Cell 3: (MODE="llm" only) stand up a vLLM OpenAI server on the mounted
+          weights and, only once it answers a real chat completion, write
+          /tmp/llm.env so the agent is told to use it.
+  Cell 4: if running inside the Kaggle competition rerun, wait for the
           gateway sidecar, copy the framework into /kaggle/working/, register
           MyAgent, and run `python main.py --agent myagent`.
-  Cell 4: otherwise (during commit / save-and-run-all), write a dummy
-          submission.parquet so Kaggle accepts the commit.
+  Cell 5: otherwise (during commit / save-and-run-all), drive the agent
+          through a handful of turns against a synthetic frame. The rerun
+          is the only place a game is actually played, so without this
+          Phase A proves nothing but that the cells parsed — which is how a
+          submission once shipped with an IndexError on the action path.
+  Cell 6: and write a dummy submission.parquet so the commit succeeds. The
+          real one is produced by the gateway during the rerun.
 
 You don't normally need to call this directly — `make submit` runs it for you.
 """
@@ -36,17 +44,31 @@ from textwrap import dedent
 ACCELERATOR = "cpu"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL POLICY (ARC_POLICY)
+# WHAT PLAYS THE GAMES
 # ─────────────────────────────────────────────────────────────────────────────
-# False ships the pure-Python search that scored 0.26 -- no GPU, no weights,
-# no extra mounts, nothing to provision and nothing to fail.
+#   "search"  the pure-Python state-graph search that scored 0.26. No GPU, no
+#             weights, no extra mounts: nothing to provision and nothing to
+#             fail. This is the fallback in every other mode too.
 #
-# True additionally mounts a 27B model and an offline vLLM wheelhouse and
-# sets ARC_POLICY=1, which lets the model choose *which* candidate the
-# search probes next. It requires a GPU accelerator, and `build()` refuses
-# the combination if you forget -- the agent would otherwise spend five
-# minutes failing to load 28GB of weights on a CPU box before falling back.
-POLICY = False
+#   "policy"  search, but a model ranks which candidate to probe next
+#             (ARC_POLICY). Loads weights in-process via the vLLM Python API.
+#             Superseded by "llm" and kept only so the comparison is still
+#             runnable -- it never beat the search by enough to matter.
+#
+#   "llm"     the model plays. It is given a Python sandbox and an object
+#             view of the board and writes its own search, executing action
+#             sequences from inside its own code (ARC_LLM). This is the
+#             architecture the 1.0+ leaderboard cluster runs, and the reason
+#             the split is 0.26-0.54 for search-only against 1.21-1.47 for
+#             a model with tools. Needs the GPU, the weights and the
+#             wheelhouse, and stands up a vLLM OpenAI server as a subprocess.
+#
+# `build()` refuses a GPU mode on a CPU accelerator: the agent would
+# otherwise spend minutes failing to load 28GB of weights before falling
+# back, having spent a submission slot to score what the search scores.
+MODE = "search"
+
+_MODES = ("search", "policy", "llm")
 
 # vLLM is not on the competition image and the run has no internet, so it
 # comes from a mounted wheelhouse. Despite the "h100" in the name, this
@@ -59,6 +81,30 @@ WHEELHOUSE = "driessmit1/arc3-vllm-h100-wheelhouse-v3"
 # used elsewhere on Kaggle; assuming the flat layout cost a probe cycle.
 POLICY_MODEL = "michaelpoluektov/qwen3-6-27b-fp8/transformers/default/1"
 POLICY_MODEL_DIR = f"/kaggle/input/models/{POLICY_MODEL}"
+
+# --- vLLM server, for MODE="llm" -------------------------------------------
+# The name the served model answers to. It is an alias, not a lookup: the
+# weights come from the mounted directory above and this only has to match
+# what the agent puts in `"model"`, which is ARC_LLM_MODEL's default.
+SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
+SERVER_PORT = 1234
+
+# vLLM is installed into its OWN directory rather than over the image.
+#
+# This is the fix for a failure mode already seen on this project: a GPU
+# run that produced no submission.parquet at all. Installing vLLM on top
+# of the competition image drags in its own torch/numpy pins, and the
+# thing that writes submission.parquet is pandas -> pyarrow -> numpy. A
+# resolver that upgrades numpy under a pyarrow already imported does not
+# fail at install time; it fails at the last cell, after nine hours, with
+# nothing to submit. An isolated --target cannot do that: the server
+# subprocess gets it on PYTHONPATH and the notebook kernel never sees it.
+VLLM_TARGET = "/kaggle/working/vllm-site-packages"
+
+# Long because it is honest. Loading 28GB of FP8 weights and compiling
+# CUDA graphs is minutes, not seconds, and a wait that expires early
+# silently demotes the whole run to the search.
+SERVER_WAIT_SECONDS = 900
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
@@ -175,6 +221,136 @@ def build() -> dict:
         )
     )
 
+    # Stand up a vLLM OpenAI server for the agent to talk to.
+    #
+    # Nothing here raises. Every failure prints loudly and leaves
+    # /tmp/llm.env unwritten, which means ARC_LLM is never set and the
+    # agent plays the search -- a worse score, but a score. Raising would
+    # fail the cell and produce no submission at all, and time left on the
+    # clock is worth less than a submission that lands.
+    server_cell = code_cell(
+        dedent(
+            f"""\
+            import json, os, pathlib, subprocess, sys, time, urllib.request
+
+            MODEL_DIR = {POLICY_MODEL_DIR!r}
+            SERVED    = {SERVED_MODEL_NAME!r}
+            TARGET    = {VLLM_TARGET!r}
+            PORT      = {SERVER_PORT}
+            BASE      = f'http://127.0.0.1:{{PORT}}/v1'
+
+            def bail(msg):
+                print('LLM DISABLED:', msg)
+                print('The search will play every game. Expect ~0.26.')
+                return False
+
+            def setup():
+                gpu = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                    capture_output=True, text=True).stdout.strip()
+                print('GPU:', gpu or '(nvidia-smi said nothing)')
+                # Checked, not assumed. The RTX PRO 6000 is granted on
+                # competition entitlement, not on what the metadata asked
+                # for, and a silent P100 substitution has happened here
+                # before. The wheelhouse carries sm_120 kernels only.
+                if 'RTX PRO 6000' not in gpu:
+                    return bail(f'expected an RTX PRO 6000, got {{gpu!r}}')
+
+                if not pathlib.Path(MODEL_DIR).is_dir():
+                    return bail(f'weights not mounted at {{MODEL_DIR}}')
+
+                lock = next(
+                    pathlib.Path('/kaggle/input').rglob('requirements.lock'), None)
+                if lock is None:
+                    for p in sorted(pathlib.Path('/kaggle/input').glob('*/*')):
+                        print('  mounted:', p)
+                    return bail('vLLM wheelhouse not attached')
+
+                print('wheelhouse:', lock.parent)
+                rc = subprocess.call([
+                    sys.executable, '-m', 'pip', 'install', '--no-index',
+                    '--find-links', str(lock.parent), '--requirement', str(lock),
+                    '--target', TARGET,
+                    # Isolated and self-contained: --ignore-installed so it
+                    # does not decide the image's copy will do, --only-binary
+                    # so nothing tries to compile without internet, and
+                    # --no-compile because .pyc for 28GB of deps is minutes
+                    # of wall clock for nothing.
+                    '--ignore-installed', '--only-binary', ':all:', '--no-compile',
+                ])
+                if rc != 0:
+                    return bail(f'pip install failed (rc={{rc}})')
+
+                env = dict(os.environ)
+                env['PYTHONPATH'] = TARGET + ':' + env.get('PYTHONPATH', '')
+                env['VLLM_NO_USAGE_STATS'] = '1'
+                env['HF_HUB_OFFLINE'] = '1'
+                env['TRANSFORMERS_OFFLINE'] = '1'
+
+                log = open('/kaggle/working/vllm-server.log', 'wb')
+                proc = subprocess.Popen([
+                    sys.executable, '-m', 'vllm.entrypoints.openai.api_server',
+                    '--model', MODEL_DIR,
+                    '--served-model-name', SERVED,
+                    '--host', '127.0.0.1', '--port', str(PORT),
+                    '--tensor-parallel-size', '1',
+                    # The three flags the whole design rests on: tool calls
+                    # have to be parsed out of Qwen's format, or the model
+                    # can talk but never act.
+                    '--enable-auto-tool-choice',
+                    '--tool-call-parser', 'qwen3_coder',
+                    '--reasoning-parser', 'qwen3',
+                    '--generation-config', 'vllm',
+                    '--enable-prefix-caching',
+                    '--default-chat-template-kwargs',
+                    json.dumps({{'preserve_thinking': True}}),
+                    '--max-model-len', '65536',
+                    '--gpu-memory-utilization', '0.92',
+                ], env=env, stdout=log, stderr=subprocess.STDOUT)
+
+                deadline = time.time() + {SERVER_WAIT_SECONDS}
+                while time.time() < deadline:
+                    if proc.poll() is not None:
+                        print(open('/kaggle/working/vllm-server.log').read()[-4000:])
+                        return bail(f'server exited with {{proc.returncode}}')
+                    try:
+                        urllib.request.urlopen(BASE + '/models', timeout=5).read()
+                        break
+                    except Exception:
+                        time.sleep(5)
+                else:
+                    return bail('server never came up')
+                print(f'server up after {{int(time.time() - deadline + {SERVER_WAIT_SECONDS})}}s')
+
+                # Prove it answers a real chat completion with a tool
+                # declared. /v1/models responds well before the model can
+                # generate, and "up" is not the property we need.
+                body = json.dumps({{
+                    'model': SERVED,
+                    'messages': [{{'role': 'user', 'content': 'Reply with OK.'}}],
+                    'max_tokens': 8, 'temperature': 0.0,
+                }}).encode()
+                try:
+                    req = urllib.request.Request(
+                        BASE + '/chat/completions', data=body,
+                        headers={{'Content-Type': 'application/json'}})
+                    reply = json.loads(urllib.request.urlopen(req, timeout=180).read())
+                    print('smoke test:', reply['choices'][0]['message'])
+                except Exception as exc:
+                    return bail(f'smoke test failed: {{type(exc).__name__}}: {{exc}}')
+                return True
+
+            if setup():
+                # Only now is the agent told to depend on it.
+                with open('/tmp/llm.env', 'w') as f:
+                    f.write(f'export ARC_LLM=1\\n')
+                    f.write(f'export ARC_LLM_BASE_URL={{BASE}}\\n')
+                    f.write(f'export ARC_LLM_MODEL={{SERVED}}\\n')
+                print('LLM ENABLED at', BASE)
+            """
+        )
+    )
+
     # We write the agent to /tmp/ (not /kaggle/working/) so it does NOT appear
     # as a notebook output. Otherwise the "Submit to Competition" UI would
     # offer it as a candidate submission file alongside submission.parquet,
@@ -232,9 +408,15 @@ def build() -> dict:
         \"\"\")
 
             # Run it. The gateway records every action and emits submission.parquet.
-            !cd /kaggle/working/ARC-AGI-3-Agents && \\
-                MPLBACKEND=agg \\
-                __POLICY_ENV__python main.py --agent myagent
+            #
+            # /tmp/llm.env exists only if the vLLM server actually came up AND
+            # answered a chat completion. When it does not, ARC_LLM stays unset
+            # and the agent plays the search. That is the entire fallback, and
+            # it is one line of shell on purpose: there is no state to get
+            # wrong and nothing to misreport.
+            !cd /kaggle/working/ARC-AGI-3-Agents && MPLBACKEND=agg \\
+                __POLICY_ENV__bash -c '[ -f /tmp/llm.env ] && . /tmp/llm.env; \\
+                exec python main.py --agent myagent'
         """
     )
     # Substituted rather than interpolated so the CPU notebook carries no
@@ -243,10 +425,85 @@ def build() -> dict:
     run_cell_source = run_cell_source.replace(
         "__POLICY_ENV__",
         f"ARC_POLICY=1 \\\n        ARC_POLICY_MODEL={POLICY_MODEL_DIR} \\\n        "
-        if POLICY
+        if MODE == "policy"
         else "",
     )
     run_cell = code_cell(run_cell_source)
+
+    # Phase A ("Save & Run All") never plays a game -- the gateway sidecar
+    # only exists during the competition rerun -- so for a long time it
+    # proved nothing except that the notebook's cells parsed. That is how
+    # submission 55099108 shipped with an IndexError on the action path and
+    # failed where it could not be seen.
+    #
+    # This does not need the gateway. It imports the agent exactly as the
+    # framework will, drives one full turn against a synthetic frame, and
+    # checks that an action comes back. Cheap, offline, and it catches the
+    # entire class of failure that cost that submission.
+    smoke_cell = code_cell(
+        dedent(
+            """\
+            import os, sys, traceback
+
+            if not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+                # Adopt whatever the server cell proved, BEFORE importing the
+                # agent -- it reads ARC_LLM at import time. Without this the
+                # smoke test would exercise the search and quietly tell us
+                # nothing about the path we are actually shipping.
+                if os.path.exists('/tmp/llm.env'):
+                    for line in open('/tmp/llm.env'):
+                        line = line.strip().replace('export ', '', 1)
+                        if '=' in line:
+                            k, _, v = line.partition('=')
+                            os.environ[k] = v
+
+                sys.path.insert(0, '/tmp')
+                ok = False
+                try:
+                    import numpy as np
+                    from arcengine import FrameData, GameState
+                    from my_agent import MyAgent
+
+                    class _Env:
+                        def __init__(self):
+                            self.sent = []
+                            self.current = FrameData(
+                                game_id='smoke',
+                                frame=[[[0] * 64 for _ in range(64)]],
+                                state=GameState.NOT_FINISHED,
+                                levels_completed=0, win_levels=3, guid='g',
+                                full_reset=False, available_actions=[1, 2, 6])
+                        def step(self, action, data=None, reasoning=None):
+                            self.sent.append(action.value)
+                            return self.current
+                        @property
+                        def observation_space(self):
+                            return self.current
+
+                    env = _Env()
+                    agent = MyAgent(card_id='c', game_id='smoke',
+                                    agent_name='smoke', ROOT_URL='',
+                                    record=False, arc_env=env)
+                    agent._convert_raw_frame_data = lambda raw: raw
+                    # Few, because with ARC_LLM=1 each of these is a real
+                    # turn against the real 27B model. Enough to prove the
+                    # loop round-trips; not so many that Save & Run All
+                    # turns into a run of its own.
+                    for _ in range(6):
+                        act = agent.choose_action(agent.frames, env.current)
+                        agent.take_action(act)
+                    print(f'SMOKE OK: {len(env.sent)} actions, '
+                          f'ARC_LLM={os.getenv("ARC_LLM", "0")}')
+                    ok = True
+                except Exception:
+                    traceback.print_exc()
+                    print('SMOKE FAILED -- this agent would error on the '
+                          'leaderboard. Fix before submitting.')
+                finally:
+                    sys.path.remove('/tmp')
+            """
+        )
+    )
 
     dummy_submission_cell = code_cell(
         dedent(
@@ -266,6 +523,8 @@ def build() -> dict:
         )
     )
 
+    if MODE not in _MODES:
+        raise SystemExit(f"Unknown MODE={MODE!r}. Pick one of: {list(_MODES)}")
     if ACCELERATOR not in _ACCELERATORS:
         raise SystemExit(
             f"Unknown ACCELERATOR={ACCELERATOR!r}. Pick one of: "
@@ -273,14 +532,22 @@ def build() -> dict:
         )
     accel = _ACCELERATORS[ACCELERATOR]
 
-    # Caught here rather than on Kaggle. A policy run without a GPU loads
+    # Caught here rather than on Kaggle. A model run without a GPU loads
     # nothing, falls back to search, and scores what the search scores --
-    # while having spent a GPU-quota-free submission slot looking like a
-    # model run that simply did not help.
-    if POLICY and not accel["gpu"]:
+    # while having spent a submission slot looking like a model run that
+    # simply did not help.
+    if MODE != "search" and not accel["gpu"]:
         raise SystemExit(
-            f"POLICY=True needs a GPU, but ACCELERATOR={ACCELERATOR!r}. "
+            f"MODE={MODE!r} needs a GPU, but ACCELERATOR={ACCELERATOR!r}. "
             f"Set ACCELERATOR='rtx6000'."
+        )
+    # The weights are FP8 and the wheelhouse ships sm_120 kernels only.
+    # A T4 (sm_75) or P100 (sm_60) cannot run either, and finding that out
+    # on Kaggle costs a run.
+    if MODE == "llm" and ACCELERATOR != "rtx6000":
+        raise SystemExit(
+            f"MODE='llm' needs the Blackwell card: FP8 weights and sm_120 "
+            f"kernels. Set ACCELERATOR='rtx6000', not {ACCELERATOR!r}."
         )
 
     notebook = {
@@ -314,9 +581,14 @@ def build() -> dict:
                 "`make submit`."
             ),
             install_cell,
-            *([vllm_cell] if POLICY else []),
+            *([vllm_cell] if MODE == "policy" else []),
             write_agent_cell,
+            # The server cell comes AFTER the agent is written, so the
+            # smoke test below can exercise the agent against a live
+            # server during Save & Run All rather than only in the rerun.
+            *([server_cell] if MODE == "llm" else []),
             run_cell,
+            smoke_cell,
             dummy_submission_cell,
         ],
     }
@@ -327,7 +599,7 @@ def main() -> None:
     NOTEBOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
     NOTEBOOK_PATH.write_text(json.dumps(build(), indent=1))
     print(f"[build_notebook] Wrote {NOTEBOOK_PATH.relative_to(ROOT)}  "
-          f"(accelerator: {ACCELERATOR})")
+          f"(mode: {MODE}, accelerator: {ACCELERATOR})")
 
     # Keep notebooks/kernel-metadata.json in sync so the user never has to
     # edit it just to flip CPU <-> GPU. `machine_shape` matters as much as
@@ -355,8 +627,9 @@ def main() -> None:
         # The weights and the vLLM wheelhouse have to be *attached*, not
         # merely referenced: with internet disabled an unmounted source is
         # not a download that fails, it is a path that does not exist.
-        wanted_datasets = [WHEELHOUSE] if POLICY else []
-        wanted_models = [POLICY_MODEL] if POLICY else []
+        needs_model = MODE in ("policy", "llm")
+        wanted_datasets = [WHEELHOUSE] if needs_model else []
+        wanted_models = [POLICY_MODEL] if needs_model else []
         if meta.get("dataset_sources") != wanted_datasets:
             meta["dataset_sources"] = wanted_datasets
             changed.append(f"dataset_sources={wanted_datasets}")
