@@ -1274,6 +1274,7 @@ def run_tool_conversation(
     top_p: float = LLM_TOP_P,
     top_k: int = LLM_TOP_K,
     stop_check: Any = None,
+    label: str = "llm",
 ) -> dict[str, Any]:
     """Drive one observe-plan-act turn: ask, run the code, feed back, repeat.
 
@@ -1346,6 +1347,18 @@ def run_tool_conversation(
                         output_limit=output_limit,
                     )
                     rendered = render_tool_result(outcome, limit=output_limit)
+                    # Three GPU runs told us the model was thrashing and
+                    # none of them told us what it believed. This is the
+                    # cheapest possible fix for that: the code itself,
+                    # capped, plus whether it raised.
+                    if LLM_LOG_CODE:
+                        logger.info(
+                            "%s tool call %d:\n%s%s",
+                            label, calls_made,
+                            code[:LLM_LOG_CODE_CHARS],
+                            "" if not outcome["error"]
+                            else f"\n  -> {outcome['error'].splitlines()[-1][:200]}",
+                        )
 
             messages.append(
                 {
@@ -1404,6 +1417,20 @@ LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
 # noisy mid-game board segments into thousands of nodes, and rendering
 # those would evict the model's own reasoning to describe static.
 LLM_MAX_NODES = _env_int("ARC_LLM_MAX_NODES", 120)
+
+# How much of the model's own `notes` is read back each turn. Generous,
+# because this is the only memory that outlives eviction: at ~170s a turn a
+# game runs to dozens of turns, and without this the rule worked out on turn
+# 3 is gone by turn 8 and gets re-derived at full price.
+LLM_NOTES_CHARS = _env_int("ARC_LLM_NOTES_CHARS", 3000)
+
+# Log the code the model runs. Three GPU runs established that it was
+# thrashing and not one of them showed what it believed, which made every
+# diagnosis a guess. At a handful of calls per turn this is a modest number
+# of log lines, and it is the difference between "it used 60 actions" and
+# knowing why. Set ARC_LLM_LOG_CODE=0 to silence it.
+LLM_LOG_CODE = _env_int("ARC_LLM_LOG_CODE", 1)
+LLM_LOG_CODE_CHARS = _env_int("ARC_LLM_LOG_CODE_CHARS", 700)
 
 
 # The board, drawn. `Qwen3_5ForConditionalGeneration` initialises a ViT and
@@ -1614,6 +1641,29 @@ def build_system_prompt(available: list[int]) -> str:
         "always accepted.\n"
         "Nothing tells you what any action does. Two games number them "
         "differently. Find out by trying.\n\n"
+        "HOW TO WIN THIS\n"
+        "Every action you play is billed and the penalty is quadratic, so "
+        "the winning strategy is not to search the board -- it is to learn "
+        "the rule, then spend actions only on a plan you have already "
+        "checked.\n"
+        "Concretely, and this is the whole method:\n"
+        "  1. Spend a few actions finding out what each action does.\n"
+        "  2. Write a forward model: a function predict(grid, act) that "
+        "returns the grid you expect. Test it against what really "
+        "happened. Fix it until it agrees.\n"
+        "  3. Search THAT with BFS for a winning sequence. Simulating "
+        "costs nothing. Only then call action(...) with the sequence you "
+        "found.\n"
+        "Your variables persist between turns, so the model you build and "
+        "the notes you keep survive. Build them once and improve them; do "
+        "not start over each turn.\n"
+        "Put durable findings in `notes` (a list) -- what each action does, "
+        "the rule, what failed. `notes` is shown back to you every turn "
+        "even after the rest of this conversation has been trimmed away, so "
+        "anything not in `notes` you will forget.\n"
+        "A loop that just repeats one action 60 times is the single "
+        "worst thing you can do: it is 60 billed actions buying one bit of "
+        "information.\n\n"
         "HOW TO ACT\n"
         "  action('ACTION1')            one move\n"
         "  action(['ACTION1', 'ACTION1'])  a sequence\n"
@@ -1629,6 +1679,9 @@ def build_system_prompt(available: list[int]) -> str:
         "  grid            the raw 64x64 tuple of tuples, grid[y][x]\n"
         "  history         recent (action, changed) pairs\n"
         "  valid_actions   the list above\n"
+        "  notes           your own list, carried across turns\n"
+        "These five are refreshed each turn. Everything else you define "
+        "stays exactly as you left it.\n"
         "Each object has: id, color, pixels, bbox (top, left, bottom, "
         "right), hash (equal hashes mean the same shape in the same "
         "colour, so you can follow one across frames), children (ids it "
@@ -1655,12 +1708,41 @@ def build_system_prompt(available: list[int]) -> str:
     )
 
 
+def render_notes(notes: Any, limit: int = LLM_NOTES_CHARS) -> str:
+    """The model's own durable findings, read back to it.
+
+    Eviction trims the middle of the transcript, so by turn 15 the rule it
+    worked out on turn 3 is gone. This is the channel that survives that,
+    which is why the prompt tells it plainly that anything not in `notes`
+    it will forget.
+    """
+    if not notes:
+        return ""
+    if isinstance(notes, dict):
+        items = [f"{k}: {v}" for k, v in notes.items()]
+    elif isinstance(notes, (list, tuple)):
+        items = [str(n) for n in notes]
+    else:
+        items = [str(notes)]
+
+    lines, used = [], 0
+    for item in items:
+        item = item.replace("\n", " ")
+        if used + len(item) > limit:
+            lines.append(f"  ... {len(items) - len(lines)} more, trimmed")
+            break
+        lines.append(f"  - {item}")
+        used += len(item)
+    return "\nWhat you have worked out so far:\n" + "\n".join(lines) + "\n"
+
+
 def build_turn_prompt(
     view: dict[str, Any],
     history: list[str],
     level: int,
     steps: int,
     note: str = "",
+    notes: Any = None,
 ) -> str:
     """The state message for one turn."""
     seen = "\n".join(f"  {line}" for line in history[-LLM_HISTORY:])
@@ -1669,6 +1751,7 @@ def build_turn_prompt(
     return (
         f"{head}Level {level}. {steps} actions used so far.\n\n"
         f"Objects on the board now:\n{describe_frame(view)}\n"
+        f"{render_notes(notes)}"
         f"{recent}\n"
         "Work out what to do and do it."
     )
@@ -2538,6 +2621,10 @@ class MyAgent(Agent):
         self._llm_dead = not LLM_ENABLED
         # Consecutive transport failures; reset by any successful turn.
         self._llm_failures = 0
+        # The model's own workspace, persisted for the whole game. See
+        # `_llm_turn` -- rebuilding this per turn made a forward model
+        # impossible to keep, and keeping one is the entire strategy.
+        self._llm_ns: dict[str, Any] = {}
         self._llm_messages: list[dict[str, Any]] = []
         self._llm_history: list[str] = []
         self._llm_turns = 0
@@ -2905,6 +2992,7 @@ class MyAgent(Agent):
             latest_frame.levels_completed,
             self._steps,
             self._llm_note,
+            self._llm_ns.get("notes"),
         )
         self._llm_messages.append(
             {
@@ -2920,19 +3008,35 @@ class MyAgent(Agent):
         )
         self._llm_note = ""
 
-        namespace: dict[str, Any] = {
-            "current_frame": view,
-            "previous_frame": self._last_view,
-            "grid": grid,
-            "history": list(self._llm_history),
-            "valid_actions": available,
-            "action": self._llm_act,
-        }
+        # ONE namespace for the whole game, refreshed rather than rebuilt.
+        #
+        # It used to be constructed fresh every turn, which quietly made the
+        # intended strategy impossible: a forward model the model writes on
+        # turn 3 was deleted before turn 4 could search it. Told to "build a
+        # simulator and plan in it", it would have had to rebuild the
+        # simulator every turn out of a transcript that is itself evicted
+        # every four turns. Persisting this is what makes planning cheaper
+        # than acting, which is the only way a quadratic metric is won.
+        self._llm_ns.update(
+            {
+                "current_frame": view,
+                "previous_frame": self._last_view,
+                "grid": grid,
+                "history": list(self._llm_history),
+                "valid_actions": available,
+                "action": self._llm_act,
+            }
+        )
+        self._llm_ns.setdefault("notes", [])
+        namespace = self._llm_ns
         self._last_view = view
 
         try:
             outcome = run_tool_conversation(
-                self._llm_messages, namespace, stop_check=self._turn_over
+                self._llm_messages,
+                namespace,
+                stop_check=self._turn_over,
+                label=f"{self.game_id} t{self._llm_turns + 1}",
             )
         except Exception as exc:  # noqa: BLE001 - any transport failure counts
             # This used to retire the model on the FIRST failure, reasoning
