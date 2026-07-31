@@ -1349,6 +1349,266 @@ def run_tool_conversation(
             }
 
 
+# ---------------------------------------------------------------------
+# The turn: what the model is shown, and how it acts.
+# ---------------------------------------------------------------------
+# Actions the model may take inside ONE turn before `action()` refuses.
+# This is not a safety rail against the model misbehaving -- it is the
+# unit of re-planning. Past this many steps the transcript it planned
+# from describes a board that is several moves stale, so it is asked
+# again rather than allowed to keep executing against a memory.
+LLM_TURN_ACTIONS = _env_int("ARC_LLM_TURN_ACTIONS", 60)
+
+# Recent (action, did-the-board-change) pairs offered as `history`.
+LLM_HISTORY = _env_int("ARC_LLM_HISTORY", 16)
+
+# Turns kept in full before the middle of the transcript is dropped. A
+# game runs for thousands of actions and the context window does not,
+# so something has to go; what survives is the framing plus the recent
+# past. See `evict_turns`.
+LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
+
+# Objects rendered into the prompt text. The full segmentation is always
+# in the namespace for the model's own code to walk; this caps only what
+# is spelled out in prose, because a noisy board segments into thousands
+# of nodes and rendering them all would evict the model's reasoning.
+LLM_MAX_NODES = _env_int("ARC_LLM_MAX_NODES", 48)
+
+
+def describe_frame(view: dict[str, Any], limit: int = LLM_MAX_NODES) -> str:
+    """Render a segmentation as prose, largest objects first.
+
+    Ordered by size rather than by id because the cap bites on exactly the
+    boards where it matters, and on those the big structures are the board
+    while the tail is noise. The ids are still the segmentation's own, so
+    anything named here can be looked up in `current_frame` directly.
+    """
+    nodes = view.get("nodes") or []
+    if not nodes:
+        return "(no objects: the frame is empty)"
+
+    ranked = sorted(nodes, key=lambda n: (-n["pixels"], n["id"]))
+    lines = []
+    for node in ranked[:limit]:
+        top, left, bottom, right = node["bbox"]
+        line = (
+            f"  #{node['id']} colour={node['color']} cells={node['pixels']} "
+            f"rows {top}-{bottom}, cols {left}-{right}"
+        )
+        if node["children"]:
+            line += f", encloses {node['children']}"
+        lines.append(line)
+
+    if len(ranked) > limit:
+        lines.append(
+            f"  ... and {len(ranked) - limit} smaller objects, in "
+            f"`current_frame['nodes']`"
+        )
+    return "\n".join(lines)
+
+
+def build_system_prompt(available: list[int]) -> str:
+    """The framing the model keeps for the whole game.
+
+    Held apart from the per-turn state so the transcript can be evicted
+    down to this plus the newest turns without losing the rules of the
+    game -- see `evict_turns`.
+
+    What this deliberately does NOT say is what any action does. The
+    mapping from ACTION1..5 to an effect differs per game and nothing in
+    the frame data declares it, so naming one "up" would be a guess the
+    model then acts on. Discovering it is the job.
+    """
+    names = ", ".join(f"ACTION{i}" for i in available) or "(none reported)"
+    return (
+        "You are solving an unfamiliar puzzle video game by writing "
+        "Python.\n\n"
+        "You never name a move directly. You are given one tool, `python`, "
+        "and inside it a function `action(...)` that plays moves. So write "
+        "code that explores, reads what came back, and decides -- a search, "
+        "a flood fill, a hypothesis test. That is the whole job.\n\n"
+        "THE BOARD\n"
+        "A 64x64 grid of colours numbered 0-15. You are not shown the raw "
+        "numbers as a picture; you are shown the board parsed into objects "
+        "-- 4-connected runs of one colour -- and you can inspect the grid "
+        "yourself in code.\n\n"
+        "ACTIONS\n"
+        f"This game accepts: {names}. ACTION6 is a click and needs "
+        "coordinates; the rest take none. RESET (ACTION0) restarts and is "
+        "always accepted.\n"
+        "Nothing tells you what any action does. Two games number them "
+        "differently. Find out by trying.\n\n"
+        "HOW TO ACT\n"
+        "  action('ACTION1')            one move\n"
+        "  action(['ACTION1', 'ACTION1'])  a sequence\n"
+        "  action(('ACTION6', 12, 30))  a click at column 12, row 30\n"
+        "It returns a dict: `changed` (did the board differ), `state`, "
+        "`levels_completed`, `frame` (the new segmentation), and `steps` "
+        "(how many ran -- fewer than you asked means it stopped, and "
+        "`stopped` says why).\n"
+        "Coordinates are (x=column, y=row), both 0-63.\n\n"
+        "WHAT YOU START WITH\n"
+        "  current_frame   the segmentation now\n"
+        "  previous_frame  the one before it, or None\n"
+        "  grid            the raw 64x64 tuple of tuples, grid[y][x]\n"
+        "  history         recent (action, changed) pairs\n"
+        "  valid_actions   the list above\n"
+        "Each object has: id, color, pixels, bbox (top, left, bottom, "
+        "right), hash (equal hashes mean the same shape in the same "
+        "colour, so you can follow one across frames), children (ids it "
+        "encloses).\n\n"
+        "SCORING -- read this twice\n"
+        "You are scored on how FEW actions the level takes, and the "
+        "penalty is quadratic: taking twice the intended number scores a "
+        "quarter, ten times scores about one point in a hundred. Finishing "
+        "a level slowly is worth almost nothing. There is exactly one "
+        "attempt per game and every action is billed, including the ones "
+        "you spend exploring and including RESET. So think before you act, "
+        "and prefer one experiment that settles a question to ten that "
+        "each nudge something.\n\n"
+        "THE TOOL\n"
+        "Variables persist between your `python` calls within a turn. "
+        "Available modules: "
+        f"{', '.join(sorted(TOOL_MODULES))}. No file, network or process "
+        f"access. Each call is killed after {TOOL_TIMEOUT:.0f} seconds, so "
+        "bound your loops.\n"
+        "Print what you want to see; only stdout and the last expression "
+        "come back, truncated if long.\n\n"
+        "Stop calling the tool and answer in words when you have acted and "
+        "want to see the board fresh."
+    )
+
+
+def build_turn_prompt(
+    view: dict[str, Any],
+    history: list[str],
+    level: int,
+    steps: int,
+    note: str = "",
+) -> str:
+    """The state message for one turn."""
+    seen = "\n".join(f"  {line}" for line in history[-LLM_HISTORY:])
+    recent = f"\nRecently:\n{seen}\n" if seen else "\n"
+    head = f"{note}\n\n" if note else ""
+    return (
+        f"{head}Level {level}. {steps} actions used so far.\n\n"
+        f"Objects on the board now:\n{describe_frame(view)}\n"
+        f"{recent}\n"
+        "Work out what to do and do it."
+    )
+
+
+def split_action_specs(steps: Any) -> list[Any]:
+    """`action(...)`'s argument as a list of individual action specs.
+
+    The ambiguity is real and worth stating: ``('ACTION6', 12, 30)`` is
+    ONE click, while ``('ACTION1', 'ACTION2', 'ACTION3')`` is three moves.
+    They are told apart by the only thing that actually distinguishes
+    them -- a click carries two integers after the name.
+
+    ``[1, 2, 3]`` is therefore read as a click, not as three moves. That
+    is not silently wrong: `parse_action_spec` then rejects it, because
+    ACTION1 takes no coordinates, and the model is told to use names.
+    Guessing which reading was meant is the one thing not to do here.
+    """
+    if isinstance(steps, (str, bytes)) or not isinstance(steps, (list, tuple)):
+        return [steps]
+    if (
+        len(steps) == 3
+        and isinstance(steps[0], (str, int))
+        and not isinstance(steps[0], bool)
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in steps[1:])
+    ):
+        return [steps]
+    return list(steps)
+
+
+def name_action(action_id: int, x: Optional[int], y: Optional[int]) -> str:
+    """How an executed action is written back into `history`."""
+    if action_id == _RESET_ID:
+        return "RESET"
+    if x is None:
+        return f"ACTION{action_id}"
+    return f"ACTION{action_id}({x},{y})"
+
+
+def parse_action_spec(
+    item: Any, available: list[int]
+) -> tuple[int, Optional[int], Optional[int]]:
+    """One item the model passed to `action()`, as (action_id, x, y).
+
+    Accepts what a model plausibly writes: ``'ACTION1'``, ``1``,
+    ``('ACTION6', 12, 30)``, ``[6, 12, 30]``, ``'reset'``.
+
+    Every rejection raises `ValueError` with a message written to be read
+    by the model, because that is exactly where it goes -- back as the
+    tool result, for it to correct. A refused action costs nothing; a
+    silently reinterpreted one costs a billed step and teaches the model
+    something false about the game.
+    """
+    x: Any = None
+    y: Any = None
+    if isinstance(item, (list, tuple)):
+        if not item:
+            raise ValueError("an empty sequence is not an action")
+        head, rest = item[0], list(item[1:])
+        if len(rest) == 2:
+            x, y = rest
+        elif rest:
+            raise ValueError(
+                f"expected an action or (action, x, y), got {len(item)} "
+                f"items: {item!r}"
+            )
+    else:
+        head = item
+
+    if isinstance(head, bool):  # bool is an int; nobody means action True
+        raise ValueError(f"{head!r} is not an action")
+    if isinstance(head, int):
+        action_id = head
+    elif isinstance(head, str):
+        text = head.strip().upper().replace(" ", "")
+        if text in ("RESET", "ACTION0"):
+            action_id = _RESET_ID
+        else:
+            match = re.fullmatch(r"ACTION(\d+)", text)
+            if match is None:
+                raise ValueError(
+                    f"{head!r} is not an action name. Use 'ACTION1'.."
+                    f"'ACTION6' or 'RESET'."
+                )
+            action_id = int(match.group(1))
+    else:
+        raise ValueError(f"{head!r} is not an action name or id")
+
+    if action_id != _RESET_ID and action_id not in available:
+        allowed = ", ".join(f"ACTION{a}" for a in available) or "none"
+        raise ValueError(
+            f"ACTION{action_id} is not accepted by this game. "
+            f"Accepted: {allowed} (and RESET)."
+        )
+
+    if action_id == _ACTION6_ID:
+        if x is None:
+            raise ValueError(
+                "ACTION6 is a click and needs coordinates: "
+                "action(('ACTION6', x, y))"
+            )
+        if isinstance(x, bool) or isinstance(y, bool):
+            raise ValueError("click coordinates must be integers")
+        if not isinstance(x, int) or not isinstance(y, int):
+            raise ValueError(f"click coordinates must be integers, got ({x!r}, {y!r})")
+        if not (0 <= x <= 63 and 0 <= y <= 63):
+            raise ValueError(
+                f"click ({x}, {y}) is off the board; x and y are both 0-63"
+            )
+        return action_id, x, y
+
+    if x is not None:
+        raise ValueError(f"ACTION{action_id} takes no coordinates; only ACTION6 does")
+    return action_id, None, None
+
+
 def click_targets(
     grid: tuple[tuple[int, ...], ...],
     limit: int = MAX_CLICK_CANDIDATES,
@@ -2095,6 +2355,29 @@ class MyAgent(Agent):
         # all the history the model is given.
         self._act_history: list[tuple[int, bool]] = []
 
+        # --- the tool-calling model (see LLM_ENABLED) -----------------
+        # Retired for the rest of the game once the server proves
+        # unreachable. It will not come back, and re-attempting a 27B
+        # request per action would spend the wall clock the search needs.
+        self._llm_dead = not LLM_ENABLED
+        self._llm_messages: list[dict[str, Any]] = []
+        self._llm_history: list[str] = []
+        self._llm_turns = 0
+        self._llm_note = ""
+        # Actions the model took inside the current turn, and the frame it
+        # was last handed, which `action()` diffs against to report
+        # `changed`.
+        self._turn_actions = 0
+        self._turn_frame: Optional[FrameData] = None
+        self._turn_level = 0
+        # The segmentation as of the previous action, handed over as
+        # `previous_frame` so a diff is one subtraction away.
+        self._last_view: Optional[dict[str, Any]] = None
+        # Set when the turn already acted, so the single action the
+        # framework expects back from `choose_action` is not sent. See
+        # `do_action_request`.
+        self._noop = False
+
         self._best_levels = 0
         self._stuck_steps = 0
         self._steps = 0
@@ -2212,6 +2495,21 @@ class MyAgent(Agent):
                 self._sol_count = 0
             return self._emit(_RESET_ID, None, None, "full-reset")
 
+        # 3b. The model's turn, when there is a model. It acts through
+        #     `action()` from inside its own code, so by the time this
+        #     returns true everything it wanted is already sent and the
+        #     one action the framework expects back must be suppressed.
+        #
+        #     `_pending` is cleared first because the model's steps are
+        #     not recorded as graph edges. Leaving it set would attribute
+        #     the model's outcome to the search's last action and write a
+        #     transition that never happened.
+        if not self._llm_dead:
+            self._pending = None
+            if self._llm_turn(grid, latest_frame):
+                self._noop = True
+                return GameAction.from_id(_RESET_ID)
+
         # 4. Replay a banked route, validating each step against the level
         #    it was recorded on before trusting it.
         while self._replay:
@@ -2272,11 +2570,211 @@ class MyAgent(Agent):
         and takes the payload from `data`, so passing our own
         per-instance dict removes the race entirely. The dict is shaped
         exactly as `action_data.model_dump()` would be.
+
+        The no-op path exists because the framework's loop is one action
+        per `choose_action`, and the model's turn is not: it acts from
+        inside its own code, through `action()`, as many times as its
+        plan needs. Those steps have already been sent by the time
+        `choose_action` returns, so the action it hands back is a
+        formality the loop requires and must NOT reach the server -- it
+        would be an extra billed step, chosen by nobody, on a board the
+        model has already moved past.
         """
+        if self._noop:
+            self._noop = False
+            return self._latest_frame()
         raw = self.arc_env.step(
             action, data=dict(self._pending_data), reasoning=self._pending_reasoning
         )
         return self._convert_raw_frame_data(raw)
+
+    def _latest_frame(self) -> FrameData:
+        """The current frame without spending an action to ask for it."""
+        return self._convert_raw_frame_data(self.arc_env.observation_space)
+
+    # -- the tool-calling model ---------------------------------------
+    def _step_env(
+        self, action_id: int, x: Optional[int], y: Optional[int]
+    ) -> FrameData:
+        """Send one action. The single place a billed step actually happens."""
+        data: dict[str, Any] = {"game_id": ""}
+        if x is not None:
+            data["x"] = x
+            data["y"] = y
+        raw = self.arc_env.step(
+            GameAction.from_id(action_id), data=data, reasoning={"why": "llm"}
+        )
+        return self._convert_raw_frame_data(raw)
+
+    def _turn_over(self) -> bool:
+        """Should the model stop acting and be shown the board again?
+
+        Checked after every tool call. The level boundary is the one that
+        matters: past it the model is planning against a level that no
+        longer exists, and every action it takes there is billed against
+        the new one.
+        """
+        if time.monotonic() >= _DEADLINE:
+            return True
+        if self._turn_actions >= LLM_TURN_ACTIONS:
+            return True
+        frame = self._turn_frame
+        if frame is None:
+            return False
+        if frame.state in (GameState.GAME_OVER, GameState.WIN):
+            return True
+        return frame.levels_completed != self._turn_level
+
+    def _llm_act(self, steps: Any) -> dict[str, Any]:
+        """`action(...)` as the model sees it: play moves, report back.
+
+        A `ValueError` from `parse_action_spec` is left to propagate. It
+        surfaces inside the model's own code, where it can catch it, and
+        otherwise comes back as the tool result -- which is the point.
+        Nothing is sent until every step in the batch has parsed, so a
+        typo in the fourth move does not leave the first three played.
+        """
+        available = list(
+            (self._turn_frame.available_actions if self._turn_frame else None) or []
+        )
+        parsed = [
+            parse_action_spec(item, available) for item in split_action_specs(steps)
+        ]
+
+        frame = self._turn_frame
+        ran = 0
+        changed = False
+        stopped: Optional[str] = None
+
+        for action_id, x, y in parsed:
+            if self._turn_actions >= LLM_TURN_ACTIONS:
+                stopped = "turn action limit reached; you will be asked again"
+                break
+            if time.monotonic() >= _DEADLINE:
+                stopped = "the run is out of time"
+                break
+
+            before = grid_of(frame) if frame is not None else None
+            frame = self._step_env(action_id, x, y)
+            self.append_frame(frame)
+            self._turn_frame = frame
+            ran += 1
+            self._turn_actions += 1
+            self._steps += 1
+            # `Agent.main()` bills one per loop iteration and this turn
+            # takes many, so without this MAX_ACTIONS would stop meaning
+            # anything.
+            self.action_counter += 1
+
+            changed = grid_of(frame) != before
+            self._llm_history.append(
+                f"{name_action(action_id, x, y)} -> "
+                f"{'board changed' if changed else 'no change'}"
+            )
+
+            if frame.state in (GameState.GAME_OVER, GameState.WIN):
+                stopped = f"the game ended: {frame.state.name}"
+                break
+            if frame.levels_completed != self._turn_level:
+                stopped = (
+                    f"level completed -- now on level {frame.levels_completed}"
+                )
+                break
+
+        del self._llm_history[:-LLM_HISTORY]
+
+        view = segment_frame(grid_of(frame), self._volatile) if frame else {}
+        self._last_view = view
+        return {
+            "steps": ran,
+            "changed": changed,
+            "state": frame.state.name if frame else "UNKNOWN",
+            "levels_completed": frame.levels_completed if frame else 0,
+            "frame": view,
+            "stopped": stopped,
+        }
+
+    def _llm_turn(
+        self, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
+    ) -> bool:
+        """Give the model one observe-plan-act turn. True if it acted.
+
+        False means the caller must fall through to the search, and it is
+        an ordinary outcome, not an error: a turn that only reasoned, or
+        whose code raised, still has to yield an action or the game stalls
+        on a board nobody moved.
+        """
+        available = list(latest_frame.available_actions or [])
+        view = segment_frame(grid, self._volatile)
+
+        self._turn_actions = 0
+        self._turn_frame = latest_frame
+        self._turn_level = latest_frame.levels_completed
+
+        if not self._llm_messages:
+            self._llm_messages = [
+                {"role": "system", "content": build_system_prompt(available)}
+            ]
+        else:
+            self._llm_messages = evict_turns(self._llm_messages, LLM_EVICT_TURNS)
+        self._llm_messages.append(
+            {
+                "role": "user",
+                "content": build_turn_prompt(
+                    view,
+                    self._llm_history,
+                    latest_frame.levels_completed,
+                    self._steps,
+                    self._llm_note,
+                ),
+            }
+        )
+        self._llm_note = ""
+
+        namespace: dict[str, Any] = {
+            "current_frame": view,
+            "previous_frame": self._last_view,
+            "grid": grid,
+            "history": list(self._llm_history),
+            "valid_actions": available,
+            "action": self._llm_act,
+        }
+        self._last_view = view
+
+        try:
+            outcome = run_tool_conversation(
+                self._llm_messages, namespace, stop_check=self._turn_over
+            )
+        except Exception as exc:  # noqa: BLE001 - any transport failure retires it
+            # Deliberately broad and deliberately terminal. Whatever went
+            # wrong -- refused connection, a server that died, a protocol
+            # the parser did not expect -- it will still be wrong on the
+            # next action, and the search needs the remaining wall clock
+            # more than this needs a retry.
+            logger.warning(
+                "%s: model unreachable at action %d (%s: %s); the search "
+                "plays the rest of this game",
+                self.game_id, self._steps, type(exc).__name__, exc,
+            )
+            self._llm_dead = True
+            return False
+
+        self._llm_turns += 1
+        if self._turn_actions == 0:
+            # Worth logging every time: a model that reasons and never
+            # acts looks exactly like a working run from the outside,
+            # while the search quietly plays the whole game.
+            logger.info(
+                "%s: model turn %d took no action (%s, %d tool calls); "
+                "the search takes this step",
+                self.game_id, self._llm_turns, outcome["stop"],
+                outcome["tool_calls"],
+            )
+            self._llm_note = (
+                "Your last turn ended without calling action(). A move has "
+                "to be played, so one was chosen for you. Act this turn."
+            )
+        return self._turn_actions > 0
 
     def _convert_raw_frame_data(self, raw: Any) -> FrameData:
         """Convert once per raw frame, not twice.
