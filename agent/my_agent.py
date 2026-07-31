@@ -1370,9 +1370,18 @@ LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
 
 # Objects rendered into the prompt text. The full segmentation is always
 # in the namespace for the model's own code to walk; this caps only what
-# is spelled out in prose, because a noisy board segments into thousands
-# of nodes and rendering them all would evict the model's reasoning.
-LLM_MAX_NODES = _env_int("ARC_LLM_MAX_NODES", 48)
+# is spelled out in prose.
+#
+# 120 is measured, not guessed. Segmenting the opening frame of all 25
+# competition games gives 7-191 objects (median 24) and a turn prompt of
+# 164-839 tokens against a 32768 context. At 48 the cap was truncating 6
+# of those 25 -- bp35 showed 48 of its 191 objects -- to save context
+# that was never scarce. 120 covers 24 of the 25 outright.
+#
+# It stays capped because the opening frame is not the worst case: a
+# noisy mid-game board segments into thousands of nodes, and rendering
+# those would evict the model's own reasoning to describe static.
+LLM_MAX_NODES = _env_int("ARC_LLM_MAX_NODES", 120)
 
 
 def describe_frame(view: dict[str, Any], limit: int = LLM_MAX_NODES) -> str:
