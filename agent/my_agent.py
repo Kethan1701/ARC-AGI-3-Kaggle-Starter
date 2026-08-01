@@ -674,6 +674,29 @@ STATUS_BAND_CAP = _env_float("ARC_STATUS_BAND_CAP", 0.10)
 # `_learn_mask`), which is the part that pays today.
 MASK_SPAN = _env_int("ARC_MASK_SPAN", 0)
 
+# Spend the last actions of a life on probes rather than travel. A game
+# with a step budget takes the avatar back to the start when it runs out
+# -- ls20 every 43-45 actions, ninety times in three thousand -- and a
+# walk to a distant frontier that the respawn interrupts bought nothing,
+# while an untried action taken where the agent already stands records an
+# edge that stays true across every respawn to come.
+RESPAWN_AWARE = _env_int("ARC_RESPAWN_AWARE", 0)
+
+# Periods to keep when estimating how long a life lasts. ls20 measures
+# 43, 44, 45 for the counter running out but also 22 and 23 when a hazard
+# gets there first, so the estimate is a median of recent lives rather
+# than the last one, which would swing by half on a single unlucky death.
+RESPAWN_SAMPLES = _env_int("ARC_RESPAWN_SAMPLES", 8)
+
+# Shortest gap that can be a life. Without a floor the detector calls
+# every flicker a respawn: bp35, vc33 and lf52 all report "period 1"
+# thirty times inside sixty actions, because their readouts toggle
+# constantly and the board returns to states it has already been in. A
+# zero-length life would then leave `_steps_left` permanently at zero and
+# divert those games into local probes on every single action. ls20's
+# real lives measure 22 to 45.
+RESPAWN_MIN_PERIOD = _env_int("ARC_RESPAWN_MIN_PERIOD", 8)
+
 # Re-open exhausted nodes when the status readout changes -- the idea
 # being that a wall the agent bounced off as one thing may not be a wall
 # once it has become another. Default OFF, because measurement says the
@@ -3414,7 +3437,9 @@ class MyAgent(Agent):
         self._level_start_board: Optional[int] = None
         self._last_respawn: Optional[int] = None
         self._respawn_period = 0
+        self._respawn_periods: deque[int] = deque(maxlen=RESPAWN_SAMPLES)
         self._respawns = 0
+        self._deadline_probes = 0
         # Early-fire bookkeeping (see EARLY_MASK): the last unanimous-change
         # mask proposed, and how many consecutive samples have agreed on it.
         self._early_candidate: frozenset[int] = frozenset()
@@ -4680,8 +4705,19 @@ class MyAgent(Agent):
         seen = self._status_boards.get(board, 0) + 1
         self._status_boards[board] = seen
         if seen > 1:
-            if self._last_respawn is not None:
-                self._respawn_period = self._steps - self._last_respawn
+            gap = (
+                None if self._last_respawn is None
+                else self._steps - self._last_respawn
+            )
+            if gap is not None and gap < RESPAWN_MIN_PERIOD:
+                # Too soon to be a life. Still not a discovery -- the
+                # board has been here before -- so the map stays as it
+                # is, but nothing about it is worth timing.
+                return False
+            if gap is not None:
+                self._respawn_periods.append(gap)
+                ordered = sorted(self._respawn_periods)
+                self._respawn_period = ordered[len(ordered) // 2]
             self._last_respawn = self._steps
             self._respawns += 1
             if self._respawns == 1 or self._respawns % 10 == 0:
@@ -5092,6 +5128,13 @@ class MyAgent(Agent):
         #     isn't, using only edges already verified by experience.
         route = self._route_to_frontier(node)
         if route:
+            left = self._steps_left()
+            if left is not None and len(route) > left:
+                code = self._local_probe(node, codes)
+                if code is not None:
+                    self._deadline_probes += 1
+                    self._stuck_steps = 0
+                    return code, "probe-deadline"
             self._plan = route
             _, code = self._plan.popleft()
             self._stuck_steps = 0
@@ -5240,6 +5283,41 @@ class MyAgent(Agent):
                 self._rng.randint(0, _COORD_MAX),
             )
         return encode_action(action_id, None, None)
+
+    def _steps_left(self) -> Optional[int]:
+        """Actions left before the game is expected to take the avatar back.
+
+        None when there is no estimate yet, or when the current life has
+        already outlasted it -- an overdue respawn means the estimate is
+        wrong for this life (a refill was picked up, a hazard was
+        dodged), and acting on a negative budget is worse than ignoring
+        it.
+        """
+        if not RESPAWN_AWARE or self._last_respawn is None:
+            return None
+        if len(self._respawn_periods) < 3:
+            return None
+        if self._respawn_period < RESPAWN_MIN_PERIOD:
+            return None
+        left = self._respawn_period - (self._steps - self._last_respawn)
+        return left if left >= 0 else None
+
+    def _local_probe(self, node: int, codes: list[int]) -> Optional[int]:
+        """An untried action at this node, ignoring the breadth cap.
+
+        Only reached when the cursor has already spent this node at the
+        current breadth, so anything it finds is a candidate the search
+        was saving for later. Later is exactly what a respawn takes away,
+        and unlike a walk, what this buys survives it.
+        """
+        tried = self._edges.get(node, EMPTY_EDGES)
+        for code in codes:
+            if code in tried or self._is_dead(code):
+                continue
+            if (node, code) in self._fatal:
+                continue
+            return code
+        return None
 
     def _route_to_frontier(self, start: int) -> Optional[deque[tuple[int, int]]]:
         """BFS the recorded graph for the closest node with untried work.

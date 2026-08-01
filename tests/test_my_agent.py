@@ -774,7 +774,9 @@ def _status_agent():
     a._level_start_board = None
     a._last_respawn = None
     a._respawn_period = 0
+    a._respawn_periods = agent.deque(maxlen=8)
     a._respawns = 0
+    a._deadline_probes = 0
     a._total = {1: 1}
     a._cursor = {1: 3}
     a._plan = agent.deque()
