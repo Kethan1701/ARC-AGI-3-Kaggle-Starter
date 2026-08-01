@@ -122,12 +122,14 @@ alone is enough to know what has and hasn't been tried.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import queue
 import random
 import re
+import struct
 import sys
 import threading
 import time
@@ -1001,6 +1003,11 @@ class ToolTimeout(Exception):
     """Model-written code outran TOOL_TIMEOUT."""
 
 
+# Sentinel for "this key was absent", so restoring can tell a missing key
+# from one that was legitimately set to None.
+_MISSING = object()
+
+
 def _tool_builtins() -> dict[str, Any]:
     """Builtins for sandboxed code, with the obvious foot-guns removed.
 
@@ -1075,7 +1082,18 @@ def run_python_tool(
         buffer.append(text)
         written += len(text)
 
-    scope = dict(namespace)
+    # The namespace IS the execution scope -- not a copy of it.
+    #
+    # It used to be `dict(namespace)`, copied in and merged back out at the
+    # end. That quietly defeated `action(...)`: the callable refreshes `grid`
+    # and `current_frame` in the namespace as the board moves, but the
+    # running code was reading a snapshot taken before it started, so the
+    # board never appeared to change no matter what was played -- and the
+    # merge afterwards then wrote the stale snapshot back over the fresh
+    # values. Executing in the real dict makes the refresh visible where it
+    # has to be: inside the model's own code, between its own statements.
+    scope = namespace
+    saved = {k: scope.get(k, _MISSING) for k in ("__builtins__", "print", "result")}
     scope["__builtins__"] = _tool_builtins()
     scope["print"] = tool_print
     scope.pop("result", None)
@@ -1108,9 +1126,15 @@ def run_python_tool(
     finally:
         sys.settrace(previous)
 
-    namespace.update(
-        {k: v for k, v in scope.items() if k not in ("__builtins__", "print")}
-    )
+    result = scope.get("result")
+    # Put back only what we borrowed. The model's own definitions stay --
+    # that persistence is the point -- but `print` and `__builtins__` are
+    # ours and must not leak into the next call's view of its workspace.
+    for key, value in saved.items():
+        if value is _MISSING:
+            scope.pop(key, None)
+        else:
+            scope[key] = value
 
     stdout = "".join(buffer)
     truncated = len(stdout) > output_limit
@@ -1119,7 +1143,7 @@ def run_python_tool(
 
     return {
         "stdout": stdout,
-        "result": scope.get("result"),
+        "result": result,
         "error": error,
         "truncated": truncated,
     }
@@ -1140,11 +1164,31 @@ LLM_MODEL = os.getenv("ARC_LLM_MODEL", "vrfai/Qwen3.6-27B-FP8")
 LLM_TEMPERATURE = _env_float("ARC_LLM_TEMPERATURE", 0.6)
 LLM_TOP_P = _env_float("ARC_LLM_TOP_P", 0.95)
 LLM_TOP_K = _env_int("ARC_LLM_TOP_K", 20)
-LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 120.0)
-# How many python calls the model may make per observe-plan-act turn. TAAF
-# tells the model not to ration tool calls, so the cap is a backstop against
-# a loop that never decides, not a budget the model should feel.
-LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
+# Measured on the Blackwell card: a turn averaged 62.5s wall clock across
+# several generations, and one request still ran past a 120s deadline --
+# a thinking model with a grown transcript is simply slow sometimes. 300
+# is chosen to make the timeout mean "something is wrong" rather than
+# "this one was long", which is what it has to mean for the failure count
+# below to be worth anything.
+LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 300.0)
+
+# Consecutive failed model calls before the search takes over the game.
+# Not 1: see `_llm_turn`. A dead server trips this immediately and pays
+# the retries once; a single slow generation costs one search step.
+LLM_MAX_FAILURES = _env_int("ARC_LLM_MAX_FAILURES", 3)
+# How many python calls the model may make per observe-plan-act turn.
+#
+# Was 12, on TAAF's principle that the model should not ration tool calls.
+# Measured on ls20, that backstop was not a backstop: ELEVEN of twelve turns
+# ran to the cap, averaging 370s each at ~31s a call, and the model still had
+# not cleared a 22-action level after 304 actions. A cap that is hit every
+# single time is not bounding a pathological case, it is the schedule.
+#
+# 6 halves the turn while the model is being given the board as an image --
+# most of what those calls were doing was reconstructing by arithmetic what
+# it can now simply look at. If turns still end at the cap with the image in
+# place, the problem is the loop, not the budget.
+LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 6)
 
 PYTHON_TOOL_SCHEMA = {
     "type": "function",
@@ -1252,6 +1296,7 @@ def run_tool_conversation(
     top_p: float = LLM_TOP_P,
     top_k: int = LLM_TOP_K,
     stop_check: Any = None,
+    label: str = "llm",
 ) -> dict[str, Any]:
     """Drive one observe-plan-act turn: ask, run the code, feed back, repeat.
 
@@ -1324,6 +1369,18 @@ def run_tool_conversation(
                         output_limit=output_limit,
                     )
                     rendered = render_tool_result(outcome, limit=output_limit)
+                    # Three GPU runs told us the model was thrashing and
+                    # none of them told us what it believed. This is the
+                    # cheapest possible fix for that: the code itself,
+                    # capped, plus whether it raised.
+                    if LLM_LOG_CODE:
+                        logger.info(
+                            "%s tool call %d:\n%s%s",
+                            label, calls_made,
+                            code[:LLM_LOG_CODE_CHARS],
+                            "" if not outcome["error"]
+                            else f"\n  -> {outcome['error'].splitlines()[-1][:200]}",
+                        )
 
             messages.append(
                 {
@@ -1383,6 +1440,161 @@ LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
 # those would evict the model's own reasoning to describe static.
 LLM_MAX_NODES = _env_int("ARC_LLM_MAX_NODES", 120)
 
+# How much of the model's own `notes` is read back each turn. Generous,
+# because this is the only memory that outlives eviction: at ~170s a turn a
+# game runs to dozens of turns, and without this the rule worked out on turn
+# 3 is gone by turn 8 and gets re-derived at full price.
+LLM_NOTES_CHARS = _env_int("ARC_LLM_NOTES_CHARS", 3000)
+
+# Log the code the model runs. Three GPU runs established that it was
+# thrashing and not one of them showed what it believed, which made every
+# diagnosis a guess. At a handful of calls per turn this is a modest number
+# of log lines, and it is the difference between "it used 60 actions" and
+# knowing why. Set ARC_LLM_LOG_CODE=0 to silence it.
+LLM_LOG_CODE = _env_int("ARC_LLM_LOG_CODE", 1)
+LLM_LOG_CODE_CHARS = _env_int("ARC_LLM_LOG_CODE_CHARS", 700)
+
+
+# The board, drawn. `Qwen3_5ForConditionalGeneration` initialises a ViT and
+# an MM encoder -- confirmed in the vLLM startup log -- so the served model
+# can see. The first real run fed that vision model a prose description of a
+# visual puzzle and it never converged on a hypothesis: twelve turns, every
+# one of them burning the tool-call cap, and level 1 of ls20 (baseline 22)
+# still unsolved after 304 actions. TAAF sends `{context: current_grid,
+# upscale: 4}`. This is that.
+#
+# 8, not TAAF's 4, and the reason is patch geometry rather than taste. A
+# ViT sees the image in patches; Qwen-family encoders merge 2x2 of them, so
+# one visual token covers roughly 28-32 pixels square. At upscale 4 the
+# board is 256px and a single token blurs about EIGHT board cells together
+# -- which loses exactly the cell-level detail the image was added to
+# provide. 8 doubles the linear resolution to 512px, about four cells per
+# token, for 256 visual tokens and a 6KB PNG. Measured across the games:
+#
+#   upscale   px    PNG     encode   ~tokens   cells/token
+#         4   256   1.9KB     3ms         64           8
+#         8   512   6.2KB     9ms        256           4
+#        16  1024  19.9KB    45ms       1024           2
+#
+# All are affordable against a 32768 context whose text half peaks at ~2.3k,
+# so this is not a budget decision. 16 was tempting, but the image's job is
+# the gestalt -- what kind of puzzle this is, how it is laid out -- and the
+# prompt already tells the model to take exact coordinates from the
+# segmentation and the raw grid, which are pixel-perfect. The exact patch
+# size is not something this file can verify, hence the override.
+RENDER_UPSCALE = _env_int("ARC_LLM_UPSCALE", 8)
+
+# 16 colours, because all 16 values occur: measured over the opening frame of
+# all 25 games, every value 0-15 is present and 5 alone accounts for 38,816
+# cells (it is the background on most boards).
+#
+# NOT the framework's COLOR_PALETTE from `langgraph_thinking/vision.py`. That
+# one defines 10 of the 16 and maps both 5 and 11 to the same grey, so two
+# distinct values would render identically -- on a puzzle whose entire content
+# is which cells differ from which. 0-9 follow the familiar ARC palette; 10-15
+# are chosen to sit away from those hues.
+PALETTE: tuple[tuple[int, int, int], ...] = (
+    (0, 0, 0),        # 0  black
+    (0, 116, 217),    # 1  blue
+    (255, 65, 54),    # 2  red
+    (46, 204, 64),    # 3  green
+    (255, 220, 0),    # 4  yellow
+    (170, 170, 170),  # 5  grey
+    (240, 18, 190),   # 6  fuchsia
+    (255, 133, 27),   # 7  orange
+    (127, 219, 255),  # 8  azure
+    (135, 12, 37),    # 9  maroon
+    (255, 255, 255),  # 10 white
+    (75, 0, 130),     # 11 indigo
+    (0, 128, 128),    # 12 teal
+    (139, 69, 19),    # 13 brown
+    (255, 182, 193),  # 14 pink
+    (128, 128, 0),    # 15 olive
+)
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + tag
+        + data
+        + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    )
+
+
+def render_png(
+    grid: tuple[tuple[int, ...], ...], upscale: int = RENDER_UPSCALE
+) -> bytes:
+    """The frame as a PNG, written by hand.
+
+    Hand-rolled because this file is spliced into the notebook and may import
+    only the standard library -- Pillow exists on the Kaggle image but not by
+    any guarantee this file is allowed to rely on. A truecolour PNG is a
+    signature, three chunks and one zlib stream, which is a smaller thing to
+    own than a dependency that would break the contract at the top of this
+    module.
+
+    `upscale` repeats each cell into an NxN block. A 64x64 image is smaller
+    than the model's patch grid, so without it whole objects vanish into a
+    single patch.
+    """
+    height = len(grid)
+    width = len(grid[0]) if height else 0
+    if not height or not width:
+        # A 1x1 black pixel. Callers get a valid image rather than an
+        # exception on the action path.
+        return render_png(((0,),), 1)
+
+    raw = bytearray()
+    for row in grid:
+        line = bytearray()
+        for value in row:
+            line += bytes(PALETTE[value % len(PALETTE)]) * upscale
+        for _ in range(upscale):
+            raw += b"\x00"  # filter type 0 (None) for this scanline
+            raw += line
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(
+            b"IHDR",
+            struct.pack(
+                ">IIBBBBB", width * upscale, height * upscale, 8, 2, 0, 0, 0
+            ),
+        )
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def render_data_uri(
+    grid: tuple[tuple[int, ...], ...], upscale: int = RENDER_UPSCALE
+) -> str:
+    """The frame as a data: URI, ready for an image_url content block."""
+    return "data:image/png;base64," + base64.b64encode(
+        render_png(grid, upscale)
+    ).decode("ascii")
+
+
+def strip_images(messages: list[dict[str, Any]]) -> None:
+    """Drop image blocks from every message, in place, keeping the text.
+
+    Called before appending the current turn, so exactly one image is ever in
+    flight. Without this every turn's board accumulates: the transcript keeps
+    four turns, and four 256x256 images is thousands of tokens spent showing
+    the model three boards that no longer exist and which it cannot act on.
+    """
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        text = " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+        message["content"] = text
+
 
 def describe_frame(view: dict[str, Any], limit: int = LLM_MAX_NODES) -> str:
     """Render a segmentation as prose, largest objects first.
@@ -1437,16 +1649,43 @@ def build_system_prompt(available: list[int]) -> str:
         "code that explores, reads what came back, and decides -- a search, "
         "a flood fill, a hypothesis test. That is the whole job.\n\n"
         "THE BOARD\n"
-        "A 64x64 grid of colours numbered 0-15. You are not shown the raw "
-        "numbers as a picture; you are shown the board parsed into objects "
-        "-- 4-connected runs of one colour -- and you can inspect the grid "
-        "yourself in code.\n\n"
+        "A 64x64 grid of colours numbered 0-15. You get three views of it, "
+        "and they are the same board:\n"
+        "  * an image of it, upscaled so one cell is a block of pixels;\n"
+        "  * the same board parsed into objects, listed below;\n"
+        "  * the raw grid, in code, as `grid[y][x]`.\n"
+        "Look at the image first to see the shape of the problem, then use "
+        "the objects and the grid to pin down exact coordinates. Trust the "
+        "numbers over your reading of the picture when they disagree.\n\n"
         "ACTIONS\n"
         f"This game accepts: {names}. ACTION6 is a click and needs "
         "coordinates; the rest take none. RESET (ACTION0) restarts and is "
         "always accepted.\n"
         "Nothing tells you what any action does. Two games number them "
         "differently. Find out by trying.\n\n"
+        "HOW TO WIN THIS\n"
+        "Every action you play is billed and the penalty is quadratic, so "
+        "the winning strategy is not to search the board -- it is to learn "
+        "the rule, then spend actions only on a plan you have already "
+        "checked.\n"
+        "Concretely, and this is the whole method:\n"
+        "  1. Spend a few actions finding out what each action does.\n"
+        "  2. Write a forward model: a function predict(grid, act) that "
+        "returns the grid you expect. Test it against what really "
+        "happened. Fix it until it agrees.\n"
+        "  3. Search THAT with BFS for a winning sequence. Simulating "
+        "costs nothing. Only then call action(...) with the sequence you "
+        "found.\n"
+        "Your variables persist between turns, so the model you build and "
+        "the notes you keep survive. Build them once and improve them; do "
+        "not start over each turn.\n"
+        "Put durable findings in `notes` (a list) -- what each action does, "
+        "the rule, what failed. `notes` is shown back to you every turn "
+        "even after the rest of this conversation has been trimmed away, so "
+        "anything not in `notes` you will forget.\n"
+        "A loop that just repeats one action 60 times is the single "
+        "worst thing you can do: it is 60 billed actions buying one bit of "
+        "information.\n\n"
         "HOW TO ACT\n"
         "  action('ACTION1')            one move\n"
         "  action(['ACTION1', 'ACTION1'])  a sequence\n"
@@ -1462,6 +1701,9 @@ def build_system_prompt(available: list[int]) -> str:
         "  grid            the raw 64x64 tuple of tuples, grid[y][x]\n"
         "  history         recent (action, changed) pairs\n"
         "  valid_actions   the list above\n"
+        "  notes           your own list, carried across turns\n"
+        "These five are refreshed each turn. Everything else you define "
+        "stays exactly as you left it.\n"
         "Each object has: id, color, pixels, bbox (top, left, bottom, "
         "right), hash (equal hashes mean the same shape in the same "
         "colour, so you can follow one across frames), children (ids it "
@@ -1488,12 +1730,41 @@ def build_system_prompt(available: list[int]) -> str:
     )
 
 
+def render_notes(notes: Any, limit: int = LLM_NOTES_CHARS) -> str:
+    """The model's own durable findings, read back to it.
+
+    Eviction trims the middle of the transcript, so by turn 15 the rule it
+    worked out on turn 3 is gone. This is the channel that survives that,
+    which is why the prompt tells it plainly that anything not in `notes`
+    it will forget.
+    """
+    if not notes:
+        return ""
+    if isinstance(notes, dict):
+        items = [f"{k}: {v}" for k, v in notes.items()]
+    elif isinstance(notes, (list, tuple)):
+        items = [str(n) for n in notes]
+    else:
+        items = [str(notes)]
+
+    lines, used = [], 0
+    for item in items:
+        item = item.replace("\n", " ")
+        if used + len(item) > limit:
+            lines.append(f"  ... {len(items) - len(lines)} more, trimmed")
+            break
+        lines.append(f"  - {item}")
+        used += len(item)
+    return "\nWhat you have worked out so far:\n" + "\n".join(lines) + "\n"
+
+
 def build_turn_prompt(
     view: dict[str, Any],
     history: list[str],
     level: int,
     steps: int,
     note: str = "",
+    notes: Any = None,
 ) -> str:
     """The state message for one turn."""
     seen = "\n".join(f"  {line}" for line in history[-LLM_HISTORY:])
@@ -1502,6 +1773,7 @@ def build_turn_prompt(
     return (
         f"{head}Level {level}. {steps} actions used so far.\n\n"
         f"Objects on the board now:\n{describe_frame(view)}\n"
+        f"{render_notes(notes)}"
         f"{recent}\n"
         "Work out what to do and do it."
     )
@@ -2369,6 +2641,12 @@ class MyAgent(Agent):
         # unreachable. It will not come back, and re-attempting a 27B
         # request per action would spend the wall clock the search needs.
         self._llm_dead = not LLM_ENABLED
+        # Consecutive transport failures; reset by any successful turn.
+        self._llm_failures = 0
+        # The model's own workspace, persisted for the whole game. See
+        # `_llm_turn` -- rebuilding this per turn made a forward model
+        # impossible to keep, and keeping one is the entire strategy.
+        self._llm_ns: dict[str, Any] = {}
         self._llm_messages: list[dict[str, Any]] = []
         self._llm_history: list[str] = []
         self._llm_turns = 0
@@ -2692,7 +2970,27 @@ class MyAgent(Agent):
 
         del self._llm_history[:-LLM_HISTORY]
 
-        view = segment_frame(grid_of(frame), self._volatile) if frame else {}
+        new_grid = grid_of(frame) if frame else ()
+        view = segment_frame(new_grid, self._volatile) if frame else {}
+
+        # Write the new board back into the model's workspace.
+        #
+        # This was missing, and it broke the model's main way of learning
+        # anything. `grid` was bound once at the start of a turn, so after
+        # `action(...)` it still held the PREVIOUS board -- while the model's
+        # own code, logged from the v15 run, did exactly this:
+        #
+        #     result2 = action('ACTION2')
+        #     for y in range(64):
+        #         if grid[y][x] != state_after_action1[y][x]: ...
+        #
+        # and, in a later call, said in a comment: "The grid variable should
+        # have been updated." It should have. Diffing a board against itself
+        # reports no change no matter what the action did, so thirty turns of
+        # probing taught it nothing about any action.
+        self._llm_ns["grid"] = new_grid
+        self._llm_ns["current_frame"] = view
+        self._llm_ns["previous_frame"] = self._last_view
         self._last_view = view
         return {
             "steps": ran,
@@ -2715,6 +3013,7 @@ class MyAgent(Agent):
         """
         available = list(latest_frame.available_actions or [])
         view = segment_frame(grid, self._volatile)
+        started = time.monotonic()
 
         self._turn_actions = 0
         self._turn_frame = latest_frame
@@ -2726,59 +3025,109 @@ class MyAgent(Agent):
             ]
         else:
             self._llm_messages = evict_turns(self._llm_messages, LLM_EVICT_TURNS)
+
+        # Exactly one image in flight: the board as it is now.
+        strip_images(self._llm_messages)
+        turn_text = build_turn_prompt(
+            view,
+            self._llm_history,
+            latest_frame.levels_completed,
+            self._steps,
+            self._llm_note,
+            self._llm_ns.get("notes"),
+        )
         self._llm_messages.append(
             {
                 "role": "user",
-                "content": build_turn_prompt(
-                    view,
-                    self._llm_history,
-                    latest_frame.levels_completed,
-                    self._steps,
-                    self._llm_note,
-                ),
+                "content": [
+                    {"type": "text", "text": turn_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": render_data_uri(grid)},
+                    },
+                ],
             }
         )
         self._llm_note = ""
 
-        namespace: dict[str, Any] = {
-            "current_frame": view,
-            "previous_frame": self._last_view,
-            "grid": grid,
-            "history": list(self._llm_history),
-            "valid_actions": available,
-            "action": self._llm_act,
-        }
+        # ONE namespace for the whole game, refreshed rather than rebuilt.
+        #
+        # It used to be constructed fresh every turn, which quietly made the
+        # intended strategy impossible: a forward model the model writes on
+        # turn 3 was deleted before turn 4 could search it. Told to "build a
+        # simulator and plan in it", it would have had to rebuild the
+        # simulator every turn out of a transcript that is itself evicted
+        # every four turns. Persisting this is what makes planning cheaper
+        # than acting, which is the only way a quadratic metric is won.
+        self._llm_ns.update(
+            {
+                "current_frame": view,
+                "previous_frame": self._last_view,
+                "grid": grid,
+                "history": list(self._llm_history),
+                "valid_actions": available,
+                "action": self._llm_act,
+            }
+        )
+        self._llm_ns.setdefault("notes", [])
+        namespace = self._llm_ns
         self._last_view = view
 
         try:
             outcome = run_tool_conversation(
-                self._llm_messages, namespace, stop_check=self._turn_over
+                self._llm_messages,
+                namespace,
+                stop_check=self._turn_over,
+                label=f"{self.game_id} t{self._llm_turns + 1}",
             )
-        except Exception as exc:  # noqa: BLE001 - any transport failure retires it
-            # Deliberately broad and deliberately terminal. Whatever went
-            # wrong -- refused connection, a server that died, a protocol
-            # the parser did not expect -- it will still be wrong on the
-            # next action, and the search needs the remaining wall clock
-            # more than this needs a retry.
+        except Exception as exc:  # noqa: BLE001 - any transport failure counts
+            # This used to retire the model on the FIRST failure, reasoning
+            # that whatever broke would still be broken next time. That is
+            # true of a refused connection and false of a timeout, and the
+            # first Blackwell run hit exactly the false case: the model
+            # played 136 actions, one generation ran past the deadline, and
+            # a working server was written off for the rest of the game.
+            #
+            # So failures are counted instead. A genuinely dead server
+            # trips the limit immediately and costs a bounded number of
+            # retries once, not per action; a single slow generation costs
+            # one search step and is forgiven.
+            self._llm_failures += 1
+            retiring = self._llm_failures >= LLM_MAX_FAILURES
             logger.warning(
-                "%s: model unreachable at action %d (%s: %s); the search "
-                "plays the rest of this game",
+                "%s: model call failed at action %d (%s: %s) [%d/%d]%s",
                 self.game_id, self._steps, type(exc).__name__, exc,
+                self._llm_failures, LLM_MAX_FAILURES,
+                "; retiring it, the search plays the rest of this game"
+                if retiring else "; falling back for this step only",
             )
-            self._llm_dead = True
+            self._llm_dead = retiring
+            # The transcript is left mid-turn -- possibly with an assistant
+            # tool_call whose result never arrived, which the server
+            # rejects. Drop back to the framing and start the next turn
+            # clean rather than reasoning about how far it got.
+            self._llm_messages = self._llm_messages[:1]
             return False
 
+        self._llm_failures = 0
         self._llm_turns += 1
+
+        # One line per turn. The first Blackwell run reported "136 actions"
+        # and nothing else, which says the loop works but not whether the
+        # model is playing or thrashing -- and on a quadratic metric the
+        # actions-per-turn number is the one that decides the score.
+        logger.info(
+            "%s: model turn %d: %d actions in %.0fs (%s, %d tool calls, "
+            "level %d, %d total)",
+            self.game_id, self._llm_turns, self._turn_actions,
+            time.monotonic() - started, outcome["stop"],
+            outcome["tool_calls"], self._turn_level, self._steps,
+        )
+
         if self._turn_actions == 0:
-            # Worth logging every time: a model that reasons and never
-            # acts looks exactly like a working run from the outside,
-            # while the search quietly plays the whole game.
-            logger.info(
-                "%s: model turn %d took no action (%s, %d tool calls); "
-                "the search takes this step",
-                self.game_id, self._llm_turns, outcome["stop"],
-                outcome["tool_calls"],
-            )
+            # Called out separately: a model that reasons and never acts
+            # looks exactly like a working run from the outside, while the
+            # search quietly plays the whole game.
             self._llm_note = (
                 "Your last turn ended without calling action(). A move has "
                 "to be played, so one was chosen for you. Act this turn."

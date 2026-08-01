@@ -238,27 +238,123 @@ def test_a_failed_server_never_raises_and_kills_the_submission():
     assert "SystemExit" not in server
 
 
+def test_the_framework_is_set_up_outside_the_rerun_branch():
+    """Verified against a real Kaggle run, not reasoned about.
+
+    The framework copy used to live inside `if KAGGLE_IS_COMPETITION_RERUN`,
+    so during Save & Run All the `agents` package did not exist and the
+    smoke test died on `ModuleNotFoundError: No module named 'agents'`
+    before it could test anything at all. `my_agent.py` derives its base
+    class from that package, so everything that imports the agent needs
+    it -- not just the run.
+    """
+    module = _load_build_notebook()
+    cells = [
+        "".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+        for c in module.build()["cells"]
+    ]
+    setup = [c for c in cells if "ARC-AGI-3-Agents/agents/__init__.py" in c]
+    assert setup, "no framework setup cell"
+    assert not any(
+        "KAGGLE_IS_COMPETITION_RERUN" in c for c in setup
+    ), "framework setup is gated on the rerun again"
+
+
+def test_the_smoke_test_points_the_scorer_at_kaggles_paths():
+    """Nothing sits where it does in the repo: the framework is copied to
+    /kaggle/working, the agent is spliced into /tmp, and the games ship
+    inside the competition dataset."""
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert "ARC_FRAMEWORK_DIR" in plumbing
+    assert "ARC_ENVIRONMENTS_DIR" in plumbing
+    assert "ARC_AGENT_PATH" in plumbing
+
+
+def test_the_scorer_honours_those_overrides():
+    """If it ever goes back to hardcoded repo paths, Phase A silently
+    stops testing anything on Kaggle."""
+    src = (ROOT / "scripts" / "score_competition.py").read_text()
+    for var in ("ARC_FRAMEWORK_DIR", "ARC_ENVIRONMENTS_DIR", "ARC_AGENT_PATH"):
+        assert var in src, f"{var} override missing from the scorer"
+
+
+def test_phase_a_plays_a_real_game_not_a_synthetic_one():
+    """The first version played an all-zero frame that could never be
+    solved, so it reported an action count with no way to tell exploration
+    from thrashing."""
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert "environment_files" in plumbing, "no real games wired in"
+    assert "score_competition.py" in plumbing
+    assert module.SMOKE_GAME in plumbing
+
+
+def test_the_vllm_install_stays_out_of_the_notebook_outputs():
+    """Anything under /kaggle/working is a notebook OUTPUT. The first GPU
+    run put several GB of wheels there, where the Submit-to-Competition
+    picker offers them alongside submission.parquet."""
+    module = _load_build_notebook()
+    assert not module.VLLM_TARGET.startswith("/kaggle/working")
+
+
 def test_save_and_run_all_actually_exercises_the_agent():
     """Phase A never plays a game, so for a long time it proved only that
     the cells parsed -- which is how a submission shipped with an
     IndexError on the action path and failed where nobody could see it."""
     module = _load_build_notebook()
     plumbing = _plumbing(module)
-    assert "from my_agent import MyAgent" in plumbing
-    assert "choose_action" in plumbing
+    assert "score_competition.py" in plumbing
     assert "SMOKE FAILED" in plumbing
 
+    # And it must not be able to fail the commit: the run still has to
+    # write a submission.parquet after it. Checked as statements, not as a
+    # substring -- the prose in this cell says "raised" and matching that
+    # would be a test of the comments.
+    smoke = [
+        c["source"] for c in module.build()["cells"]
+        if "SMOKE FAILED" in str(c["source"])
+    ][0]
+    bad = [
+        line for line in smoke.splitlines()
+        if line.strip().startswith(("raise ", "raise\t", "sys.exit", "assert "))
+    ]
+    assert not bad, f"this cell can fail the commit: {bad}"
 
-def test_the_default_notebook_never_switches_a_model_on():
-    """What ships today is the search that scored 0.26: no GPU, no
-    weights, nothing to provision and nothing to fail."""
+
+def test_the_shipped_notebook_matches_the_mode_it_declares():
+    """The guard that matters is agreement, not a fixed value.
+
+    A notebook that says MODE='llm' and carries no server would score what
+    the search scores while looking like a model run -- and one that says
+    'search' but drags in a model would spend GPU quota to no purpose.
+    Both are silent, so both are checked.
+    """
     module = _load_build_notebook()
-    assert module.MODE == "search"
     plumbing = _plumbing(module)
-    assert "ARC_POLICY" not in plumbing
-    assert "api_server" not in plumbing
-    assert "requirements.lock" not in plumbing
     assert "__POLICY_ENV__" not in plumbing, "placeholder left unsubstituted"
+
+    if module.MODE == "search":
+        assert "ARC_POLICY" not in plumbing
+        assert "api_server" not in plumbing
+        assert "requirements.lock" not in plumbing
+    elif module.MODE == "llm":
+        assert "api_server" in plumbing, "llm mode with no server"
+        assert "export ARC_LLM=1" in plumbing
+        assert "ARC_POLICY" not in plumbing, "both policies at once"
+    else:
+        assert "ARC_POLICY=1" in plumbing
+        assert "api_server" not in plumbing
+
+
+def test_a_gpu_mode_ships_with_a_gpu_selected():
+    """The build refuses this combination, but the refusal only fires when
+    someone runs the build -- this fires on every test run."""
+    module = _load_build_notebook()
+    if module.MODE in ("policy", "llm"):
+        assert module._ACCELERATORS[module.ACCELERATOR]["gpu"] is True
+    if module.MODE == "llm":
+        assert module.ACCELERATOR == "rtx6000"
 
 
 def test_the_shipped_metadata_mounts_match_the_selected_mode():

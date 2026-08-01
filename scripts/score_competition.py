@@ -44,10 +44,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-VENDOR = ROOT / "vendor" / "ARC-AGI-3-Agents"
+# All three locations are overridable so this same script can run inside the
+# Kaggle notebook, where nothing sits where it does in the repo: the
+# framework is copied to /kaggle/working, the agent is spliced into /tmp, and
+# the games ship inside the competition dataset. Running the real harness
+# there beats writing a second, less honest one -- Save & Run All otherwise
+# never plays a game at all, which is how a broken agent once reached the
+# leaderboard unseen.
+VENDOR = Path(
+    os.environ.get("ARC_FRAMEWORK_DIR", str(ROOT / "vendor" / "ARC-AGI-3-Agents"))
+)
 if not VENDOR.exists():
     raise SystemExit(f"Framework not found at {VENDOR}. Run `make setup` first.")
 sys.path.insert(0, str(VENDOR))
+
+ENVIRONMENTS_DIR = os.environ.get(
+    "ARC_ENVIRONMENTS_DIR", str(ROOT / "environment_files")
+)
+AGENT_PATH = os.environ.get("ARC_AGENT_PATH", str(ROOT / "agent" / "my_agent.py"))
 
 API_KEY = "local-competition-key"
 
@@ -59,11 +73,9 @@ def free_port() -> int:
 
 
 def load_my_agent_class():
-    spec = importlib.util.spec_from_file_location(
-        "user_agent_module", ROOT / "agent" / "my_agent.py"
-    )
+    spec = importlib.util.spec_from_file_location("user_agent_module", AGENT_PATH)
     if spec is None or spec.loader is None:
-        raise SystemExit("Could not load agent/my_agent.py")
+        raise SystemExit(f"Could not load {AGENT_PATH}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.MyAgent
@@ -79,7 +91,7 @@ def start_gateway(port: int):
     # The server owns the environments; it must NOT talk to the real API.
     arcade = Arcade(
         operation_mode=OperationMode.OFFLINE,
-        environments_dir=str(ROOT / "environment_files"),
+        environments_dir=ENVIRONMENTS_DIR,
     )
     app, _api = create_app(arcade, competition_mode=True)
 

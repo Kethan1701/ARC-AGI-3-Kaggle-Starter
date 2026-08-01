@@ -99,6 +99,8 @@ def _turn_agent(env):
     a.arc_env = env
     a._convert_raw_frame_data = lambda raw: raw
     a._llm_dead = False
+    a._llm_failures = 0
+    a._llm_ns = {}
     a._llm_messages = []
     a._llm_history = []
     a._llm_turns = 0
@@ -257,7 +259,9 @@ def test_a_turn_that_acted_does_not_spend_one_more_action(monkeypatch):
     assert a._noop is False, "the suppression must not persist to the next action"
 
 
-def test_a_dead_server_retires_the_model_for_the_rest_of_the_game(monkeypatch):
+def test_a_dead_server_retires_the_model_after_a_bounded_number_of_tries(
+    monkeypatch,
+):
     env = _FakeEnv(_frame(_grid()))
     a = _turn_agent(env)
 
@@ -265,10 +269,74 @@ def test_a_dead_server_retires_the_model_for_the_rest_of_the_game(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr(agent_mod, "chat_completion", dead)
+    grid = agent_mod.grid_of(env.current)
 
-    assert a._llm_turn(agent_mod.grid_of(env.current), env.current) is False
+    for i in range(1, agent_mod.LLM_MAX_FAILURES):
+        assert a._llm_turn(grid, env.current) is False
+        assert a._llm_dead is False, f"retired after only {i} failure(s)"
+
+    assert a._llm_turn(grid, env.current) is False
     assert a._llm_dead is True
     assert env.sent == []
+
+
+def test_one_slow_generation_does_not_write_off_a_working_server(monkeypatch):
+    """Measured on Kaggle, not imagined: the model played 136 actions, one
+    generation ran past the deadline, and the old code retired a perfectly
+    healthy server for the rest of the game."""
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(1, 1, 5)))] * 4)
+    a = _turn_agent(env)
+    grid = agent_mod.grid_of(env.current)
+
+    calls = {"n": 0}
+
+    def flaky(_payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("timed out")
+        if calls["n"] == 2:
+            return _reply(code="action('ACTION1')")
+        return _reply(content="ok")
+
+    monkeypatch.setattr(agent_mod, "chat_completion", flaky)
+
+    assert a._llm_turn(grid, env.current) is False   # the slow one
+    assert a._llm_dead is False, "a timeout is not a dead server"
+    assert a._llm_turn(grid, env.current) is True    # and it recovers
+    assert env.sent == [(1, None, None)]
+
+
+def test_a_recovered_turn_clears_the_failure_count(monkeypatch):
+    """Otherwise three slow generations spread across a whole game would
+    retire a server that worked fine in between."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    a._llm_failures = agent_mod.LLM_MAX_FAILURES - 1
+    _script(monkeypatch, [_reply(content="thinking")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    assert a._llm_failures == 0
+
+
+def test_a_failed_turn_does_not_leave_a_broken_transcript(monkeypatch):
+    """A half-finished turn can end on an assistant tool_call whose result
+    never arrived, which the server rejects on the next request."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    grid = agent_mod.grid_of(env.current)
+
+    calls = {"n": 0}
+
+    def flaky(_payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _reply(code="action('ACTION1')")
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(agent_mod, "chat_completion", flaky)
+    a._llm_turn(grid, env.current)
+
+    assert [m["role"] for m in a._llm_messages] == ["system"]
 
 
 def test_a_turn_that_only_reasons_falls_back_rather_than_stalling(monkeypatch):
@@ -431,6 +499,180 @@ def test_choose_action_still_plays_the_search_when_the_model_is_off():
 
     assert len(env.sent) == 1
     assert a._noop is False
+
+
+def test_the_turn_sends_the_board_as_an_image(monkeypatch):
+    """The served model has a vision encoder. The first real run fed it
+    prose about a visual puzzle and it never converged."""
+    env = _FakeEnv(_frame(_grid(mark=(3, 3, 9))))
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    user = [m for m in a._llm_messages if m.get("role") == "user"][-1]
+    assert isinstance(user["content"], list)
+    kinds = [p["type"] for p in user["content"]]
+    assert kinds == ["text", "image_url"]
+    assert user["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+
+
+def test_only_the_current_board_is_ever_in_flight(monkeypatch):
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(content="a"), _reply(content="b")])
+    grid = agent_mod.grid_of(env.current)
+
+    a._llm_turn(grid, env.current)
+    a._llm_turn(grid, env.current)
+
+    images = sum(
+        1
+        for m in a._llm_messages
+        if isinstance(m.get("content"), list)
+        for p in m["content"]
+        if p.get("type") == "image_url"
+    )
+    assert images == 1
+
+
+def test_the_system_prompt_tells_the_model_it_can_see(monkeypatch):
+    """It used to say the opposite -- 'you are not shown the raw numbers as
+    a picture' -- which was true then and is a lie now."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6]).lower()
+    assert "image" in prompt
+    assert "not shown" not in prompt
+
+
+def test_a_forward_model_written_one_turn_survives_to_the_next(monkeypatch):
+    """The change the whole strategy rests on.
+
+    The namespace used to be rebuilt each turn, so a simulator written on
+    turn 3 was destroyed before turn 4 could search it -- which made
+    "plan in the model, not the environment" impossible to follow.
+    """
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    grid = agent_mod.grid_of(env.current)
+    _script(monkeypatch, [
+        _reply(code="def predict(g, act):\n    return 'moved'\nnotes.append('A1 moves')"),
+        _reply(content="built it"),
+        _reply(code="result = predict(None, 'ACTION1')"),
+        _reply(content="reused it"),
+    ])
+
+    a._llm_turn(grid, env.current)
+    a._llm_turn(grid, env.current)
+
+    tools = [m["content"] for m in a._llm_messages if m.get("role") == "tool"]
+    assert "moved" in tools[-1], "the simulator did not survive the turn"
+
+
+def test_the_grid_the_model_sees_updates_when_it_acts(monkeypatch):
+    """Straight from the v15 logs. The model wrote:
+
+        result2 = action('ACTION2')
+        for y in range(64):
+            if grid[y][x] != state_after_action1[y][x]: ...
+
+    and later commented "The grid variable should have been updated". It
+    was not -- `grid` was bound once per turn -- so every diff compared a
+    board against itself and reported no change whatever the action did.
+    """
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(2, 2, 7)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="before = grid\naction('ACTION1')\nresult = (grid is before, grid[2][2])"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m["content"] for m in a._llm_messages if m.get("role") == "tool"][0]
+    assert "(False, 7)" in tool, f"grid did not refresh after action(): {tool[:200]}"
+
+
+def test_current_frame_refreshes_alongside_the_grid(monkeypatch):
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(2, 2, 7)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="action('ACTION1')\nresult = sorted(n['color'] for n in current_frame['nodes'])"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m["content"] for m in a._llm_messages if m.get("role") == "tool"][0]
+    assert "7" in tool, "current_frame still describes the old board"
+
+
+def test_notes_survive_and_are_read_back(monkeypatch):
+    """Eviction trims the transcript, so this is the only memory that
+    outlives it."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    grid = agent_mod.grid_of(env.current)
+    _script(monkeypatch, [
+        _reply(code="notes.append('ACTION1 moves the player up')"),
+        _reply(content="noted"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(grid, env.current)
+    a._llm_turn(grid, env.current)
+
+    user = [m for m in a._llm_messages if m.get("role") == "user"][-1]
+    text = user["content"][0]["text"] if isinstance(user["content"], list) else user["content"]
+    assert "ACTION1 moves the player up" in text
+
+
+def test_notes_exist_before_the_model_touches_them(monkeypatch):
+    """`notes.append(...)` has to work on the first turn without the model
+    having to guess whether it needs creating."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(code="notes.append('first')"), _reply("ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    assert a._llm_ns["notes"] == ["first"]
+
+
+def test_the_refreshed_five_do_not_go_stale(monkeypatch):
+    """Persisting the namespace must not persist a stale board."""
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(5, 5, 3)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(content="a"), _reply(content="b")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    first = a._llm_ns["grid"]
+    env.current = _frame(_grid(mark=(5, 5, 3)))
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._llm_ns["grid"] != first
+    assert a._llm_ns["grid"][5][5] == 3
+
+
+def test_notes_render_trims_rather_than_flooding_the_prompt():
+    long = [f"finding number {i} " + "x" * 200 for i in range(50)]
+    text = agent_mod.render_notes(long, limit=500)
+    assert len(text) < 1200
+    assert "trimmed" in text
+
+
+def test_notes_render_handles_whatever_the_model_puts_there():
+    assert agent_mod.render_notes(None) == ""
+    assert agent_mod.render_notes([]) == ""
+    assert "a: 1" in agent_mod.render_notes({"a": 1})
+    assert "just a string" in agent_mod.render_notes("just a string")
+
+
+def test_the_prompt_tells_it_to_simulate_rather_than_probe():
+    prompt = agent_mod.build_system_prompt([1, 2, 6]).lower()
+    assert "predict(" in prompt
+    assert "persist" in prompt
+    assert "notes" in prompt
 
 
 def test_the_namespace_offers_both_views(monkeypatch):
