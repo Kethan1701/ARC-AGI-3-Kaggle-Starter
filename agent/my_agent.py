@@ -1763,6 +1763,74 @@ def verify_predictions(
     }
 
 
+def name_goals(is_goal: Any) -> list[tuple[str, Any]]:
+    """Normalise `is_goal` to a list of (name, function) pairs.
+
+    Accepts one callable, a list of them, or a dict of named ones. The
+    names come back in `routes`, and telling the candidates apart is the
+    entire point of passing more than one, so duplicates -- which a row
+    of lambdas produces by default -- get an index appended.
+    """
+    if callable(is_goal):
+        return [(getattr(is_goal, "__name__", None) or "goal", is_goal)]
+
+    if isinstance(is_goal, dict):
+        pairs = [(str(k), v) for k, v in is_goal.items() if callable(v)]
+    elif isinstance(is_goal, (list, tuple)):
+        pairs = [
+            (getattr(fn, "__name__", None) or f"goal{i}", fn)
+            for i, fn in enumerate(is_goal)
+            if callable(fn)
+        ]
+    else:
+        return []
+
+    counts: dict[str, int] = {}
+    for name, _ in pairs:
+        counts[name] = counts.get(name, 0) + 1
+    seen: dict[str, int] = {}
+    out = []
+    for name, fn in pairs:
+        if counts[name] > 1:
+            seen[name] = seen.get(name, 0) + 1
+            name = f"{name}{seen[name]}"
+        out.append((name, fn))
+    return out
+
+
+def _plan_result(
+    routes: dict[str, list[Any]],
+    goals: list[tuple[str, Any]],
+    nodes: int,
+    reason: str,
+) -> dict[str, Any]:
+    """Assemble what `plan` hands back, from whatever the search reached.
+
+    Partial success is still success when several goals were asked for:
+    finding routes to six candidates out of ten and then running out of
+    budget is six hypotheses tested for free, not a failure.
+    """
+    names = [n for n, _ in goals]
+    found = [n for n in names if n in routes]
+    if not found:
+        return {
+            "found": False, "actions": [], "nodes": nodes,
+            "routes": {}, "reason": reason,
+        }
+    best = min(found, key=lambda n: len(routes[n]))
+    out: dict[str, Any] = {
+        "found": True,
+        "actions": list(routes[best]),
+        "nodes": nodes,
+        "routes": {n: list(routes[n]) for n in found},
+        "reason": reason,
+    }
+    if len(goals) > 1:
+        out["goal"] = best
+        out["unreachable"] = [n for n in names if n not in routes]
+    return out
+
+
 def plan_actions(
     predict: Any,
     is_goal: Any,
@@ -1772,6 +1840,7 @@ def plan_actions(
     max_nodes: int = PLAN_MAX_NODES,
     max_depth: int = PLAN_MAX_DEPTH,
     seconds: float = PLAN_SECONDS,
+    first_only: bool = False,
 ) -> dict[str, Any]:
     """Breadth-first search over the model's simulator for a route.
 
@@ -1779,27 +1848,68 @@ def plan_actions(
     accepts. Shortest matters literally here: the plan's length is what
     gets billed, and the score is its square.
 
+    `is_goal` may instead be a list or a dict of candidate goal
+    functions, in which case one pass finds the shortest route to EACH of
+    them and reports them all in `routes`. On an unfamiliar game the goal
+    is a hypothesis like any other, and the whole reason to test ten of
+    them here is that testing them by execution costs ten times as much.
+    `first_only` stops at the nearest one instead, which is what
+    `plan_tour` wants for each leg.
+
     Nothing about this trusts `predict`. It may raise, loop, or return
     junk on any state; each of those just prunes that branch. A simulator
     that is wrong produces a plan that fails on execution, which is
     detected there and fed back -- it does not produce a crash here.
     """
+    goals = name_goals(is_goal)
+    if not goals:
+        return {
+            "found": False, "actions": [], "nodes": 0, "routes": {},
+            "reason": "is_goal must be a function, or a list or dict of them",
+        }
     if not actions:
-        return {"found": False, "actions": [], "nodes": 0, "reason": "no actions given"}
+        return {
+            "found": False, "actions": [], "nodes": 0, "routes": {},
+            "reason": "no actions given",
+        }
 
     deadline = min(time.monotonic() + max(seconds, 0.0), _DEADLINE)
-    try:
-        if is_goal(start):
+    routes: dict[str, list[Any]] = {}
+
+    def record(state: Any, path: list[Any]) -> bool:
+        """Note every goal this state satisfies. True when there is no point going on."""
+        for name, fn in goals:
+            if name in routes:
+                continue
+            try:
+                if fn(state):
+                    routes[name] = list(path)
+            except Exception:  # noqa: BLE001 - one bad candidate, not a bad search
+                continue
+        return bool(routes) if first_only else len(routes) == len(goals)
+
+    # A lone `is_goal` that raises on the very first board is nearly
+    # always a typo in the model's own code. Searching on regardless is
+    # how that goes unnoticed for a whole turn, so it is reported. With
+    # several candidates a single broken one is just ignored -- the
+    # others are still worth searching for.
+    if len(goals) == 1:
+        try:
+            if goals[0][1](start):
+                return _plan_result(
+                    {goals[0][0]: []}, goals, 0,
+                    "the current board already satisfies is_goal",
+                )
+        except Exception as exc:  # noqa: BLE001 - the model wrote this
             return {
-                "found": True, "actions": [], "nodes": 0,
-                "reason": "the current board already satisfies is_goal",
+                "found": False, "actions": [], "nodes": 0, "routes": {},
+                "reason": f"is_goal raised on the current board: "
+                          f"{type(exc).__name__}: {exc}",
             }
-    except Exception as exc:  # noqa: BLE001 - the model wrote this
-        return {
-            "found": False, "actions": [], "nodes": 0,
-            "reason": f"is_goal raised on the current board: "
-                      f"{type(exc).__name__}: {exc}",
-        }
+    elif record(start, []):
+        return _plan_result(
+            routes, goals, 0, "the current board already satisfies every goal"
+        )
 
     frontier: deque[tuple[tuple[tuple[int, ...], ...], list[Any]]] = deque(
         [(start, [])]
@@ -1811,15 +1921,14 @@ def plan_actions(
 
     while frontier:
         if nodes >= max_nodes:
-            return {
-                "found": False, "actions": [], "nodes": nodes,
-                "reason": f"gave up after {nodes} simulated states",
-            }
+            return _plan_result(
+                routes, goals, nodes, f"gave up after {nodes} simulated states"
+            )
         if time.monotonic() >= deadline:
-            return {
-                "found": False, "actions": [], "nodes": nodes,
-                "reason": f"planning ran out of time after {nodes} states",
-            }
+            return _plan_result(
+                routes, goals, nodes,
+                f"planning ran out of time after {nodes} states",
+            )
 
         state, path = frontier.popleft()
         if len(path) >= max_depth:
@@ -1836,15 +1945,13 @@ def plan_actions(
             if nxt is None or nxt in seen:
                 continue
             route = path + [act]
-            try:
-                done = bool(is_goal(nxt))
-            except Exception:  # noqa: BLE001
-                done = False
-            if done:
-                return {
-                    "found": True, "actions": route, "nodes": nodes,
-                    "reason": f"found a {len(route)}-action route",
-                }
+            if record(nxt, route):
+                done = routes[min(routes, key=lambda n: len(routes[n]))]
+                return _plan_result(
+                    routes, goals, nodes,
+                    f"found a {len(done)}-action route" if len(goals) == 1
+                    else f"found routes to {len(routes)} of {len(goals)} goals",
+                )
             seen.add(nxt)
             frontier.append((nxt, route))
 
@@ -1853,7 +1960,103 @@ def plan_actions(
         reason += f" within {max_depth} actions"
     if predict_errors:
         reason += f"; predict raised on {predict_errors} branches"
-    return {"found": False, "actions": [], "nodes": nodes, "reason": reason}
+    return _plan_result(routes, goals, nodes, reason)
+
+
+def plan_tour(
+    predict: Any,
+    goals: Any,
+    start: tuple[tuple[int, ...], ...],
+    actions: list[Any],
+    *,
+    max_nodes: int = PLAN_MAX_NODES,
+    max_depth: int = PLAN_MAX_DEPTH,
+    seconds: float = PLAN_SECONDS,
+) -> dict[str, Any]:
+    """One billed sequence that visits every candidate goal in turn.
+
+    The reason this exists: a perfect simulator still does not tell you
+    which board completes the level. Only the environment knows that, so
+    the goal has to be tested by playing, and testing candidates one at
+    a time pays full price for every wrong guess.
+
+    But `action(...)` stops the instant the level advances. So a single
+    route that passes through candidate A, then B, then C is billed only
+    as far as whichever one was really the goal -- the rest is never
+    played. Ten hypotheses cost what the correct one costs, plus the
+    wrong ones cheaper than it.
+
+    Greedy nearest-first. Not an optimal tour, but the right bias
+    anyway: the cheap hypotheses get tested first, and the expensive
+    ones are the likeliest never to be paid for at all.
+    """
+    named = name_goals(goals)
+    if not named:
+        return {
+            "actions": [], "checkpoints": [], "reached": [], "unreachable": [],
+            "nodes": 0,
+            "reason": "goals must be a function, or a list or dict of them",
+        }
+
+    deadline = min(time.monotonic() + max(seconds, 0.0), _DEADLINE)
+    state = start
+    route: list[Any] = []
+    checkpoints: list[dict[str, Any]] = []
+    remaining = list(named)
+    nodes = 0
+    reason = ""
+
+    while remaining:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            reason = f"ran out of time after reaching {len(checkpoints)} goals"
+            break
+        leg = plan_actions(
+            predict, dict(remaining), state, actions,
+            max_nodes=max_nodes, max_depth=max_depth, seconds=left,
+            first_only=True,
+        )
+        nodes += leg["nodes"]
+        if not leg["found"]:
+            reason = leg["reason"]
+            break
+
+        name = leg.get("goal") or next(iter(leg["routes"]))
+        step = leg["actions"]
+
+        # Walk the simulator to where this leg ends, so the next leg
+        # starts from the right board. `predict` found this route, so it
+        # should replay -- but it is the model's code and a route that
+        # will not replay is a broken tour, not a crash.
+        board = state
+        try:
+            for act in step:
+                board = normalise_grid(predict(board, act))
+                if board is None:
+                    raise ValueError("predict returned something that is not a grid")
+        except Exception as exc:  # noqa: BLE001
+            reason = (
+                f"could not replay the route to {name} through predict: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            break
+
+        state = board
+        route.extend(step)
+        checkpoints.append({"after": len(route), "goal": name})
+        remaining = [(n, f) for n, f in remaining if n != name]
+    else:
+        reason = f"a {len(route)}-action tour through all {len(named)} goals"
+
+    reached = [c["goal"] for c in checkpoints]
+    return {
+        "actions": route,
+        "checkpoints": checkpoints,
+        "reached": reached,
+        "unreachable": [n for n, _ in named if n not in reached],
+        "nodes": nodes,
+        "reason": reason,
+    }
 
 
 def describe_frame(view: dict[str, Any], limit: int = LLM_MAX_NODES) -> str:
@@ -1955,17 +2158,37 @@ def build_system_prompt(available: list[int]) -> str:
         "single action.\n"
         "  4. EXECUTE. Pass that sequence straight to `action(...)`. Only "
         "now are you charged, and only for a route you already know works. "
-        "The result comes back with `mispredicted`: the places the real "
-        "board diverged from `predict`. If that list is non-empty your "
-        "model is wrong -- go back to step 2 with the counterexample, "
-        "which is worth more than any amount of further probing because it "
-        "is the exact case your model gets wrong.\n"
+        "Two different things can now be wrong, and the result tells you "
+        "which:\n"
+        "     * `mispredicted` is non-empty -- your SIMULATOR is wrong. Go "
+        "back to step 2 with the counterexample, which is worth more than "
+        "any amount of further probing because it is the exact case your "
+        "model gets wrong.\n"
+        "     * `mispredicted` is empty and `levels_completed` did not "
+        "change -- your simulator is RIGHT and your GOAL is wrong. You "
+        "went exactly where you meant to go and it was not the finish. Do "
+        "not touch `predict`. Rewrite `is_goal`.\n"
         "Being wrong in the simulator is free. Being wrong in the game is "
         "quadratic. Do your being-wrong in the simulator.\n"
-        "The failure to avoid: building a good `predict` and then never "
-        "calling `plan`, and drifting back to playing actions one at a "
-        "time to see what happens. If you have a `predict` worth anything "
-        "at all, plan with it.\n"
+        "WHERE THE FINISH IS, IS ALSO A GUESS\n"
+        "Nothing tells you what completes a level, and only the game can "
+        "confirm it, so the goal is a hypothesis exactly like the rule is. "
+        "The expensive mistake is testing one guessed target per "
+        "execution: three wrong guesses at five actions each is fifteen "
+        "billed actions and no level.\n"
+        "Test them together instead. Write every target you find "
+        "plausible -- each highlighted square, each place the movable "
+        "piece could line up with something, each edge -- and call "
+        "`tour(predict, {...})`. It returns ONE sequence that passes "
+        "through all of them, cheapest first, and it bills nothing to "
+        "build. Play that sequence and it STOPS the moment the level "
+        "advances, so the candidates after the real goal are never played "
+        "at all. Ten hypotheses for the price of the one that was right.\n"
+        "The two failures to avoid: building a good `predict` and then "
+        "never calling `plan`; and, once you are planning, guessing "
+        "targets one at a time and paying for each. If you have a "
+        "`predict` worth anything at all, plan with it -- and if you do "
+        "not know what to aim at, tour every candidate at once.\n"
         "Your variables persist between turns, so the model you build and "
         "the notes you keep survive. Build them once and improve them; do "
         "not start over each turn.\n"
@@ -1983,10 +2206,13 @@ def build_system_prompt(available: list[int]) -> str:
         "It returns a dict: `changed` (did the board differ), `state`, "
         "`levels_completed`, `frame` (the new segmentation), `steps` "
         "(how many ran -- fewer than you asked means it stopped, and "
-        "`stopped` says why), and `mispredicted` (once you have defined "
-        "`predict`: every step where the real board disagreed with it).\n"
+        "`stopped` says why), `mispredicted` (once you have defined "
+        "`predict`: every step where the real board disagreed with it), "
+        "and sometimes `goal_miss`, which appears when a route ran "
+        "perfectly and still did not finish the level -- read it, it is "
+        "telling you `is_goal` is the thing that is wrong.\n"
         "Coordinates are (x=column, y=row), both 0-63.\n\n"
-        "THE TWO FREE TOOLS\n"
+        "THE THREE FREE TOOLS\n"
         "  verify(predict)\n"
         "      Replays every real move made so far through your `predict` "
         "and returns {accuracy, checked, correct, raised, wrong}. `wrong` "
@@ -1999,7 +2225,18 @@ def build_system_prompt(available: list[int]) -> str:
         "non-click moves -- for a click game, pass your own shortlist of "
         "targets like [('ACTION6', 12, 30), ...], because there are 4096 "
         "of them and searching all of them finds nothing. Costs no "
-        "actions.\n\n"
+        "actions.\n"
+        "      `is_goal` can also be a dict of candidates, "
+        "{'name': fn, ...}, and you get the shortest route to each of "
+        "them in `routes` from the one search.\n"
+        "  tour(predict, goals, actions=None, max_depth=60)\n"
+        "      `goals` is a dict {'name': is_goal_fn, ...}. Returns one "
+        "sequence visiting every one of them, nearest first: "
+        "{actions, checkpoints, reached, unreachable, nodes, reason}. "
+        "`actions` goes straight into action(...), and because execution "
+        "stops at the level change, you are billed only up to whichever "
+        "candidate was the real goal. This is how you test what the "
+        "finish is without paying per guess. Costs no actions to build.\n\n"
         "WHAT YOU START WITH\n"
         "  current_frame   the segmentation now\n"
         "  previous_frame  the one before it, or None\n"
@@ -2007,7 +2244,7 @@ def build_system_prompt(available: list[int]) -> str:
         "  history         recent (action, changed) pairs\n"
         "  valid_actions   the list above\n"
         "  notes           your own list, carried across turns\n"
-        "  action, verify, plan   the three tools above\n"
+        "  action, verify, plan, tour   the tools above\n"
         "These are refreshed each turn. Everything else you define stays "
         "exactly as you left it -- including `predict` and `is_goal`, so "
         "build them once and keep improving them rather than starting "
@@ -2982,6 +3219,13 @@ class MyAgent(Agent):
         self._verify_best = 0.0
         self._plan_calls = 0
         self._plans_found = 0
+        self._tour_calls = 0
+        # Routes that executed exactly as `predict` said and still did not
+        # advance the level. That is the signature of a wrong `is_goal`
+        # rather than a wrong `predict`, and v17 spent half a run reading
+        # it the other way round -- so it is counted, reported in the
+        # result, and nudged on.
+        self._goal_misses = 0
         # Actions the model took inside the current turn, and the frame it
         # was last handed, which `action()` diffs against to report
         # `changed`.
@@ -3362,6 +3606,35 @@ class MyAgent(Agent):
             outcome["mispredicted"] = drift
         elif callable(predict) and ran:
             outcome["mispredicted"] = []
+
+        # Name which of the two things was wrong.
+        #
+        # A route that played exactly as `predict` said and left the level
+        # where it was has an unambiguous diagnosis: the simulator is
+        # right and the board it aimed at is not the goal. In v17 the
+        # model hit this three times, concluded its simulator must be
+        # broken, and went back to probing at 1.00 verify accuracy. It is
+        # the one inference the result was not carrying, so it carries it
+        # now. Gated on a plan having been made, so ordinary probing --
+        # which of course does not advance the level either -- stays
+        # quiet.
+        if (
+            (self._plan_calls or self._tour_calls)
+            and ran >= 2
+            and not drift
+            and callable(predict)
+            and frame is not None
+            and frame.levels_completed == self._turn_level
+        ):
+            self._goal_misses += 1
+            outcome["goal_miss"] = (
+                "This route played exactly as `predict` said it would, and "
+                "the level did not advance. Your simulator is right; the "
+                "board you aimed at is not the goal. Do NOT go back to "
+                "probing and do NOT rewrite `predict` -- rewrite "
+                "`is_goal`. Write several candidate goals and pass them "
+                "all to tour(predict, {...}) at once."
+            )
         return outcome
 
     def _llm_verify(
@@ -3396,6 +3669,24 @@ class MyAgent(Agent):
         )
         return report
 
+    def _plan_inputs(
+        self, actions: Optional[list[Any]], start: Any
+    ) -> tuple[Optional[tuple[tuple[int, ...], ...]], list[Any]]:
+        """The board and the move set both `plan` and `tour` search over."""
+        board = normalise_grid(
+            start if start is not None else self._llm_ns.get("grid")
+        )
+        if actions is None:
+            # Clicks are excluded by default: ACTION6 needs coordinates,
+            # and branching on all 4,096 of them makes the first level of
+            # the search larger than the whole node budget. A click game
+            # has to pass its own shortlist of targets.
+            available = (
+                self._turn_frame.available_actions if self._turn_frame else None
+            ) or []
+            actions = [f"ACTION{i}" for i in available if i != 6]
+        return board, list(actions)
+
     def _llm_plan(
         self,
         predict: Any,
@@ -3410,37 +3701,71 @@ class MyAgent(Agent):
         the cost of looking for a route is paid in GPU seconds instead of
         in score. What comes back is the shortest sequence found, ready to
         hand straight to `action(...)`.
+
+        `is_goal` may be several candidates at once -- see `plan_actions`.
         """
-        if not callable(predict) or not callable(is_goal):
+        if not callable(predict):
             raise TypeError(
-                "plan(predict, is_goal) expects two functions: "
-                "predict(grid, action) -> grid, and is_goal(grid) -> bool"
+                "plan(predict, is_goal) expects predict(grid, action) -> grid"
             )
-        board = normalise_grid(
-            start if start is not None else self._llm_ns.get("grid")
-        )
+        if not (callable(is_goal) or isinstance(is_goal, (list, tuple, dict))):
+            raise TypeError(
+                "plan(predict, is_goal) expects is_goal(grid) -> bool, or a "
+                "list or dict of such functions to test several at once"
+            )
+        board, actions = self._plan_inputs(actions, start)
         if board is None:
             return {
-                "found": False, "actions": [], "nodes": 0,
+                "found": False, "actions": [], "nodes": 0, "routes": {},
                 "reason": "no board to plan from",
             }
-        if actions is None:
-            # Clicks are excluded by default: ACTION6 needs coordinates,
-            # and branching on all 4,096 of them makes the first level of
-            # the search larger than the whole node budget. A click game
-            # has to pass its own shortlist of targets.
-            available = (
-                self._turn_frame.available_actions if self._turn_frame else None
-            ) or []
-            actions = [f"ACTION{i}" for i in available if i != 6]
-        out = plan_actions(predict, is_goal, board, list(actions), **kwargs)
+        out = plan_actions(predict, is_goal, board, actions, **kwargs)
         self._plan_calls += 1
         self._plans_found += 1 if out["found"] else 0
         logger.info(
             "%s: plan #%d: %s (%d states, %s)",
             self.game_id, self._plan_calls,
-            f"found a {len(out['actions'])}-action route" if out["found"]
-            else "no route", out["nodes"], out["reason"],
+            f"found a {len(out['actions'])}-action route to "
+            f"{len(out.get('routes') or {})} of "
+            f"{len(name_goals(is_goal))} goals" if out["found"] else "no route",
+            out["nodes"], out["reason"],
+        )
+        return out
+
+    def _llm_tour(
+        self,
+        predict: Any,
+        goals: Any,
+        actions: Optional[list[Any]] = None,
+        start: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """`tour(predict, goals)` as the model sees it. Bills nothing.
+
+        Chains candidate goals into one sequence. See `plan_tour` for why
+        that is cheaper than testing them one at a time: execution stops
+        at whichever candidate was really the goal, so the ones after it
+        are never played.
+        """
+        if not callable(predict):
+            raise TypeError(
+                "tour(predict, goals) expects predict(grid, action) -> grid"
+            )
+        board, actions = self._plan_inputs(actions, start)
+        if board is None:
+            return {
+                "actions": [], "checkpoints": [], "reached": [],
+                "unreachable": [], "nodes": 0,
+                "reason": "no board to plan from",
+            }
+        out = plan_tour(predict, goals, board, actions, **kwargs)
+        self._tour_calls += 1
+        logger.info(
+            "%s: tour #%d: %d actions through %d/%d goals (%d states, %s)",
+            self.game_id, self._tour_calls, len(out["actions"]),
+            len(out["reached"]),
+            len(out["reached"]) + len(out["unreachable"]),
+            out["nodes"], out["reason"],
         )
         return out
 
@@ -3512,6 +3837,7 @@ class MyAgent(Agent):
                 "action": self._llm_act,
                 "verify": self._llm_verify,
                 "plan": self._llm_plan,
+                "tour": self._llm_tour,
             }
         )
         self._llm_ns.setdefault("notes", [])
@@ -3564,15 +3890,34 @@ class MyAgent(Agent):
         logger.info(
             "%s: model turn %d: %d actions in %.0fs (%s, %d tool calls, "
             "level %d, %d total) | predict %.2f best over %d verifies, "
-            "%d/%d plans found",
+            "%d/%d plans found, %d tours, %d goal misses",
             self.game_id, self._llm_turns, self._turn_actions,
             time.monotonic() - started, outcome["stop"],
             outcome["tool_calls"], self._turn_level, self._steps,
             self._verify_best, self._verify_calls,
             self._plans_found, self._plan_calls,
+            self._tour_calls, self._goal_misses,
         )
 
-        if self._verify_best >= PLAN_NUDGE_ACCURACY and not self._plan_calls:
+        if self._goal_misses and not self._tour_calls:
+            # The v17 failure, addressed where it happened. Outranks the
+            # plan nudge because it is strictly later in the same
+            # pipeline: a model here already has a simulator and already
+            # planned with it, and the only thing left in its way is that
+            # it is guessing the goal one coordinate at a time and paying
+            # for each guess.
+            self._llm_note = (
+                f"{self._goal_misses} of your routes played exactly as "
+                "`predict` said and still did not finish the level. That "
+                "means `predict` is right and `is_goal` is wrong -- you "
+                "are guessing where to go. Stop testing one guess per "
+                "execution. Write every plausible goal you can think of "
+                "and pass them together to tour(predict, {...}): it "
+                "returns ONE sequence through all of them, it costs no "
+                "actions to build, and playing it stops the moment one "
+                "of them turns out to be the real goal."
+            )
+        elif self._verify_best >= PLAN_NUDGE_ACCURACY and not self._plan_calls:
             # The v16 failure, addressed where it happened. Takes priority
             # over the no-action nudge below: a model sitting on a usable
             # simulator and probing by hand is burning the score far faster

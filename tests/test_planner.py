@@ -271,3 +271,215 @@ def test_the_diff_is_capped_so_a_wrong_model_cannot_flood_the_prompt():
 
 def test_the_diff_reads_predicted_then_actual():
     assert agent.grid_diff(((1, 2),), ((1, 9),)) == [(1, 0, 2, 9)]
+
+
+# --- name_goals ---------------------------------------------------------
+
+
+def _at(target: int):
+    def goal(grid):
+        return where(grid) == target
+    goal.__name__ = f"at{target}"
+    return goal
+
+
+def test_a_single_function_is_named_after_itself():
+    assert [n for n, _ in agent.name_goals(_at(3))] == ["at3"]
+
+
+def test_a_dict_keeps_the_models_own_names():
+    named = agent.name_goals({"left": _at(0), "right": _at(11)})
+    assert [n for n, _ in named] == ["left", "right"]
+
+
+def test_repeated_names_are_disambiguated():
+    """A row of lambdas is all `<lambda>`, and the names are the answer."""
+    named = agent.name_goals([lambda g: False, lambda g: False])
+    assert len({n for n, _ in named}) == 2
+
+
+def test_junk_goals_are_rejected_rather_than_raising():
+    for bad in (None, 5, "goal", object()):
+        assert agent.name_goals(bad) == []
+
+
+def test_non_callable_entries_are_dropped():
+    assert len(agent.name_goals([_at(3), None, 7])) == 1
+
+
+# --- planning to several goals at once ----------------------------------
+#
+# The v17 failure this addresses: the model built a perfect simulator, then
+# guessed a single target coordinate, executed a route to it, and learned
+# only that that one guess was wrong -- at full price. Testing candidates
+# is what costs; the search itself is free.
+
+
+def test_every_candidate_gets_its_own_route():
+    out = agent.plan_actions(
+        truth, {"a": _at(2), "b": _at(8)}, line(5), MOVES
+    )
+    assert out["found"]
+    assert out["routes"]["a"] == ["ACTION2"] * 3
+    assert out["routes"]["b"] == ["ACTION1"] * 3
+
+
+def test_the_headline_route_is_the_cheapest_candidate():
+    """`actions` is what gets billed, so it must be the shortest found."""
+    out = agent.plan_actions(
+        truth, {"far": _at(11), "near": _at(6)}, line(5), MOVES
+    )
+    assert out["goal"] == "near"
+    assert out["actions"] == ["ACTION1"]
+
+
+def test_candidates_that_cannot_be_reached_are_named():
+    out = agent.plan_actions(
+        truth, {"here": _at(6), "nowhere": lambda g: False}, line(5), MOVES
+    )
+    assert out["found"] is True
+    assert out["unreachable"] == ["nowhere"]
+
+
+def test_one_broken_candidate_does_not_sink_the_others():
+    """With several goals a raising one is just a bad hypothesis."""
+    def explodes(grid):
+        raise ValueError("the model wrote this")
+
+    out = agent.plan_actions(
+        truth, {"bad": explodes, "good": _at(7)}, line(5), MOVES
+    )
+    assert out["found"]
+    assert out["routes"]["good"] == ["ACTION1"] * 2
+    assert out["unreachable"] == ["bad"]
+
+
+def test_a_single_broken_goal_is_still_reported_loudly():
+    """Alone, it is a typo worth naming rather than an idea worth dropping."""
+    def explodes(grid):
+        raise ValueError("boom")
+
+    out = agent.plan_actions(truth, explodes, line(5), MOVES)
+    assert out["found"] is False
+    assert "ValueError" in out["reason"]
+
+
+def test_running_out_of_budget_still_returns_what_was_found():
+    """Six hypotheses tested for free is six tested, not a failure."""
+    out = agent.plan_actions(
+        truth, {"near": _at(6), "far": _at(0)}, line(5), MOVES, max_nodes=4
+    )
+    assert out["found"] is True
+    assert out["routes"] == {"near": ["ACTION1"]}
+    assert out["unreachable"] == ["far"]
+
+
+def test_first_only_stops_at_the_nearest():
+    out = agent.plan_actions(
+        truth, {"far": _at(9), "near": _at(6)}, line(5), MOVES, first_only=True
+    )
+    assert list(out["routes"]) == ["near"]
+
+
+def test_the_single_goal_shape_is_unchanged():
+    """Existing callers pass one function and read `actions`."""
+    out = agent.plan_actions(truth, _at(8), line(5), MOVES)
+    assert out["found"] and out["actions"] == ["ACTION1"] * 3
+    assert "goal" not in out
+
+
+# --- touring the candidates ---------------------------------------------
+
+
+def _walk(grid, route):
+    for act in route:
+        grid = truth(grid, act)
+    return grid
+
+
+def test_the_tour_visits_every_candidate():
+    out = agent.plan_tour(
+        truth, {"a": _at(2), "b": _at(6), "c": _at(8)}, line(5), MOVES
+    )
+    assert set(out["reached"]) == {"a", "b", "c"}
+    assert out["unreachable"] == []
+
+
+def test_each_checkpoint_is_where_it_says_it_is():
+    """The invariant the whole idea rests on: play up to checkpoint k in
+    the real game and you are standing on candidate k. If that does not
+    hold, the tour tests nothing and bills for the privilege."""
+    goals = {"a": _at(2), "b": _at(6), "c": _at(8)}
+    out = agent.plan_tour(truth, goals, line(5), MOVES)
+    for mark in out["checkpoints"]:
+        board = _walk(line(5), out["actions"][: mark["after"]])
+        assert goals[mark["goal"]](board), mark
+
+
+def test_the_nearest_candidate_is_tested_first():
+    """Greedy on purpose: the guesses least likely to be paid for are the
+    expensive ones, so they go last."""
+    out = agent.plan_tour(
+        truth, {"a": _at(2), "b": _at(6), "c": _at(8)}, line(5), MOVES
+    )
+    assert out["reached"] == ["b", "c", "a"]
+    assert [m["after"] for m in out["checkpoints"]] == [1, 3, 9]
+
+
+def test_the_tour_is_cheaper_than_testing_one_at_a_time():
+    """The claim being made to the model, checked. Reaching all three
+    separately from the start costs 3 + 1 + 3 and strands you at the last
+    one each time; the tour reaches all three for 9 and, stopping at
+    whichever is real, usually far less."""
+    goals = {"a": _at(2), "b": _at(6), "c": _at(8)}
+    out = agent.plan_tour(truth, goals, line(5), MOVES)
+    assert out["checkpoints"][0]["after"] == 1
+    assert len(out["actions"]) == 9
+
+
+def test_an_unreachable_candidate_does_not_strand_the_tour():
+    out = agent.plan_tour(
+        truth, {"real": _at(6), "never": lambda g: False}, line(5), MOVES
+    )
+    assert out["reached"] == ["real"]
+    assert out["unreachable"] == ["never"]
+    assert out["actions"] == ["ACTION1"]
+
+
+def test_a_goal_already_true_costs_nothing():
+    out = agent.plan_tour(truth, {"here": _at(5)}, line(5), MOVES)
+    assert out["actions"] == []
+    assert out["checkpoints"] == [{"after": 0, "goal": "here"}]
+
+
+def test_a_predict_that_will_not_replay_is_reported_not_raised():
+    """Found the route, then refuses to walk it. The model wrote both."""
+    calls = {"n": 0}
+
+    def flaky(grid, act):
+        calls["n"] += 1
+        if calls["n"] > 200:
+            raise RuntimeError("no")
+        return truth(grid, act)
+
+    out = agent.plan_tour(flaky, {"a": _at(6), "b": _at(2)}, line(5), MOVES)
+    assert isinstance(out["actions"], list)
+    assert out["nodes"] >= 0
+
+
+def test_junk_goals_give_an_empty_tour_rather_than_a_crash():
+    out = agent.plan_tour(truth, None, line(5), MOVES)
+    assert out["actions"] == [] and out["reached"] == []
+    assert "function" in out["reason"]
+
+
+def test_the_tour_is_bounded_in_time():
+    def slow(grid, act):
+        for _ in range(200_000):
+            pass
+        return truth(grid, act)
+
+    out = agent.plan_tour(
+        slow, {"a": _at(0), "b": _at(11)}, line(5), MOVES, seconds=0.05
+    )
+    assert isinstance(out["actions"], list)
