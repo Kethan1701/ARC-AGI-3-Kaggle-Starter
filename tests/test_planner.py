@@ -483,3 +483,60 @@ def test_the_tour_is_bounded_in_time():
         slow, {"a": _at(0), "b": _at(11)}, line(5), MOVES, seconds=0.05
     )
     assert isinstance(out["actions"], list)
+
+
+# --- running out of world before running out of goals -------------------
+#
+# v18's real finding. The model's `predict` moved a coloured block and
+# copied everything else, so the only states it had were positions of that
+# block -- about eight hundred. It visited all of them, satisfied none of
+# its goals, and read that as evidence about the goals. It is evidence
+# about the simulator: one wrong goal is one hypothesis failing, every
+# reachable state failing is the state space being too small.
+
+
+def test_exhausting_the_state_space_is_called_out():
+    note = agent.exhaustion_note(
+        "explored every reachable state without reaching is_goal", 807, 13
+    )
+    assert note is not None
+    assert "807" in note and "13" in note
+    assert "too small" in note
+
+
+def test_running_out_of_time_is_not_exhaustion():
+    """A search that was cut off proves nothing about the state space."""
+    assert agent.exhaustion_note("planning ran out of time after 3596 states",
+                                 3596, 5) is None
+
+
+def test_giving_up_on_the_node_budget_is_not_exhaustion():
+    assert agent.exhaustion_note("gave up after 200000 simulated states",
+                                 200000, 5) is None
+
+
+def test_reaching_every_goal_is_not_exhaustion():
+    """Exhausting the space having answered every question is a success."""
+    assert agent.exhaustion_note(
+        "explored every reachable state without reaching is_goal", 807, 0
+    ) is None
+
+
+def test_the_diagnosis_points_at_predict_not_at_the_goals():
+    note = agent.exhaustion_note(
+        "explored every reachable state without reaching is_goal", 500, 4
+    )
+    assert "not a wrong goal" in note
+    assert "`predict`" in note
+    assert "Do not write more goals" in note
+
+
+def test_a_real_exhausted_tour_carries_the_reason_it_is_built_on():
+    """The wording keys off `reason`, so the search must really produce it."""
+    out = agent.plan_tour(
+        truth, {"a": _at(6), "never": lambda g: False}, line(5), MOVES
+    )
+    assert "explored every reachable state" in out["reason"]
+    assert agent.exhaustion_note(
+        out["reason"], out["nodes"], len(out["unreachable"])
+    ) is not None

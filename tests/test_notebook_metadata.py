@@ -287,7 +287,18 @@ def test_phase_a_plays_a_real_game_not_a_synthetic_one():
     plumbing = _plumbing(module)
     assert "environment_files" in plumbing, "no real games wired in"
     assert "score_competition.py" in plumbing
-    assert module.SMOKE_GAME in plumbing
+    for game in module.SMOKE_GAMES:
+        assert game in plumbing, game
+
+
+def test_each_rehearsed_game_gets_its_own_deadline():
+    """The agent computes its deadline once at import, so two games in one
+    process means the first spends the whole budget. v18 did exactly that:
+    3806 seconds, one game, and twenty-four that never started."""
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert "for game in" in plumbing, "games must be played one process each"
+    assert len(module.SMOKE_GAMES) > 1
 
 
 def test_the_vllm_install_stays_out_of_the_notebook_outputs():

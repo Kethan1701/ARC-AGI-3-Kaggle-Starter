@@ -117,7 +117,13 @@ SERVER_WAIT_SECONDS = 900
 # baselines are known ([22, 123, 73, 84, 96, 192, 186]) and it is
 # movement-driven, so "did the model make progress" is legible in the
 # actions/baseline column rather than needing interpretation.
-SMOKE_GAME = "ls20"
+# ls20 is first for continuity: v16, v17 and v18 all played it, so its
+# numbers are directly comparable and every diagnosis so far came from it.
+# vc33 is the contrast -- a 7-action level-1 baseline against ls20's 22 --
+# which asks a different question. ls20 tests whether the pipeline can find
+# a goal at all; vc33 tests whether it can be CHEAP, and cheap is the only
+# thing the quadratic actually pays for.
+SMOKE_GAMES = ["ls20", "vc33"]
 
 # This was 300, and 300 invalidated three GPU runs.
 #
@@ -146,7 +152,12 @@ SMOKE_STEPS = 1200
 # finish converging. It costs nothing in the real run: there the 25 games
 # are played concurrently in one process, so an hour per game is normal
 # rather than 25 hours of work.
-SMOKE_SECONDS = 3600
+# Now PER GAME, not for the whole rehearsal. Two games at half an hour
+# each costs the same wall clock as v18's single hour and samples twice as
+# much. Half an hour bought v18 roughly three turns, which is enough to
+# see the pipeline reach the planning stage but not enough to watch it
+# converge -- that is the deliberate trade for a second game.
+SMOKE_SECONDS = 1800
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
@@ -542,16 +553,26 @@ def build() -> dict:
                 # Bound the rehearsal by time, not by the step cap. See
                 # SMOKE_STEPS in build_notebook.py for why that distinction
                 # cost three runs.
-                env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
-
-                rc = subprocess.call(
-                    [sys.executable, '/tmp/score_competition.py',
-                     '--game', {SMOKE_GAME!r}, '--max-steps', str({SMOKE_STEPS})],
-                    env=env)
+                #
+                # One subprocess PER GAME, because the agent computes its
+                # deadline once at import: a single process playing two
+                # games serially gives the whole budget to the first, which
+                # is what v18 did -- 3806 seconds, one game, and 24 games
+                # that never started.
+                rcs = []
+                for game in {SMOKE_GAMES!r}:
+                    env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
+                    print(f'=== rehearsing {{game}} '
+                          f'({SMOKE_SECONDS}s budget) ===', flush=True)
+                    rcs.append(subprocess.call(
+                        [sys.executable, '/tmp/score_competition.py',
+                         '--game', game, '--max-steps', str({SMOKE_STEPS})],
+                        env=env))
 
                 # A non-zero exit is reported, not raised. This cell must not
                 # be able to fail the commit -- the run still has to produce
                 # a submission.parquet below.
+                rc = max(rcs) if rcs else 0
                 print('SMOKE OK' if rc == 0 else
                       f'SMOKE FAILED (rc={{rc}}) -- this agent would error on '
                       f'the leaderboard. Fix before submitting.')
