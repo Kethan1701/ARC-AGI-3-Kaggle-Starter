@@ -119,11 +119,27 @@ SERVER_WAIT_SECONDS = 900
 # actions/baseline column rather than needing interpretation.
 SMOKE_GAME = "ls20"
 
-# Enough to cross level 1 at a sane action count and see level 2 begin;
-# small enough that Save & Run All stays a rehearsal rather than becoming
-# a run of its own. At the measured 62.5s/turn and ~27 actions/turn this
-# is roughly ten minutes on top of the ~6 minutes of server startup.
-SMOKE_STEPS = 300
+# This was 300, and 300 invalidated three GPU runs.
+#
+# The claim it carried -- "enough to cross level 1" -- was never checked.
+# It is false: our own search needs 526 actions to clear ls20 level 1, and
+# at 300 steps the search clears nothing either. So v13, v14 and v15 all
+# stopped at 304/289/317 actions and were read as "the model cannot clear
+# a level", when what they actually showed was a cap being hit. Three runs
+# and about eight GPU hours went into answering a question the harness had
+# already decided.
+#
+# The bound that matters is wall clock, not steps, so the step cap is now
+# set well clear of anything we might legitimately hit and the rehearsal is
+# limited by ARC_RUN_BUDGET_SECONDS below instead. 1200 leaves room to
+# clear level 1 (baseline 22) and get a real look at level 2 (baseline 123).
+SMOKE_STEPS = 1200
+
+# The real bound on the rehearsal. The agent reads this into `_DEADLINE`
+# and stops on its own, so a slow turn shortens the run instead of
+# overrunning Save & Run All. Forty minutes on top of ~6 minutes of server
+# startup keeps the whole notebook comfortably inside its limit.
+SMOKE_SECONDS = 2400
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
@@ -515,6 +531,11 @@ def build() -> dict:
                             k, _, v = line.partition('=')
                             env[k] = v
                 print('ARC_LLM =', env.get('ARC_LLM', '0'))
+
+                # Bound the rehearsal by time, not by the step cap. See
+                # SMOKE_STEPS in build_notebook.py for why that distinction
+                # cost three runs.
+                env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
                 rc = subprocess.call(
                     [sys.executable, '/tmp/score_competition.py',
