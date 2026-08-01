@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,7 @@ def _turn_agent(env):
     a._llm_history = []
     a._llm_turns = 0
     a._llm_note = ""
+    a._transitions = deque(maxlen=agent_mod.TRANSITION_LOG)
     a._turn_actions = 0
     a._turn_frame = None
     a._turn_level = 0
@@ -690,3 +692,203 @@ def test_the_namespace_offers_both_views(monkeypatch):
     tool = [m for m in a._llm_messages if m.get("role") == "tool"][0]
     assert "9" in tool["content"]
     assert "[1, 2, 6]" in tool["content"]
+
+
+# --- the forward-model contract ----------------------------------------
+#
+# The agent now does the mechanical half of the strategy the prompt asks
+# for: it keeps every real transition, replays them against the model's
+# `predict` on demand, searches that simulator for a route, and reports
+# where reality diverged from it. The model supplies only `predict` and
+# `is_goal`. These pin that seam, because it decides whether actions get
+# spent on a checked route or on exploration.
+
+# A forward model for the fake game below: the mark of colour 5 slides one
+# column right. Written as source, because the model writes it as source.
+SLIDE_RIGHT = (
+    "def predict(g, act):\n"
+    "    rows = [list(r) for r in g]\n"
+    "    for y, row in enumerate(rows):\n"
+    "        for x, v in enumerate(row):\n"
+    "            if v == 5:\n"
+    "                rows[y][x] = 0\n"
+    "                rows[y][x + 1] = 5\n"
+    "                return rows\n"
+    "    return rows\n"
+)
+
+
+def test_real_transitions_are_recorded_as_they_are_played(monkeypatch):
+    """These are the evidence `verify` runs on. Every one cost a billed
+    action, so they are kept rather than recomputed."""
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)))],
+    )
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="action(['ACTION1', 'ACTION1'])"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert len(a._transitions) == 2
+    before, label, after = a._transitions[0]
+    assert label == "ACTION1"
+    assert before[1][1] == 5 and after[1][2] == 5
+
+
+def test_verify_scores_a_forward_model_without_spending_actions(monkeypatch):
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="action('ACTION1')"),
+        _reply(code=SLIDE_RIGHT + "result = verify(predict)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._steps == 1, "verify must not play anything"
+    report = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "'accuracy': 1.0" in report
+
+
+def test_verify_before_anything_has_been_played_says_so(monkeypatch):
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "result = verify(predict)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "nothing to check against yet" in tool
+
+
+def test_plan_searches_the_simulator_and_returns_a_route(monkeypatch):
+    """The point of the design: the search that finds the route runs over
+    `predict`, so it costs GPU seconds instead of score."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "def is_goal(g):\n"
+        "    return any(row[5] == 5 for row in g)\n"
+        "result = plan(predict, is_goal)\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._steps == 0, "planning must not touch the environment"
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "'found': True" in tool
+    # The mark starts at column 1 and the goal is column 5: four moves, and
+    # the planner must not come back with five.
+    assert tool.count("ACTION1") == 4
+
+
+def test_plan_excludes_clicks_unless_the_model_supplies_targets():
+    """ACTION6 has 4,096 targets. Branching on all of them makes the first
+    level of the search bigger than the whole node budget, so a click game
+    has to shortlist its own."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5)), available=(1, 2, 6)))
+    a = _turn_agent(env)
+    a._turn_frame = env.current
+    a._llm_ns["grid"] = agent_mod.grid_of(env.current)
+    seen: list = []
+
+    a._llm_plan(
+        lambda grid, act: seen.append(act) or grid, lambda g: False, max_depth=1
+    )
+
+    assert set(seen) == {"ACTION1", "ACTION2"}
+
+
+def test_a_wrong_forward_model_comes_back_as_a_counterexample(monkeypatch):
+    """A plan is only as good as the simulator it was found in, so the
+    first divergence is the most useful thing a turn can report."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    wrong = SLIDE_RIGHT.replace("rows[y][x + 1]", "rows[y][x - 1]")
+    _script(monkeypatch, [
+        _reply(code=wrong + "result = action('ACTION1')"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "mispredicted" in tool
+    # It predicted column 0; the mark really went to column 2.
+    assert "(0, 1, 5, 0)" in tool and "(2, 1, 0, 5)" in tool
+
+
+def test_a_correct_forward_model_reports_an_empty_disagreement(monkeypatch):
+    """Empty rather than absent: "I checked and it held" is a different
+    message from "nobody checked", and the model acts on the difference."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "result = action('ACTION1')"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "'mispredicted': []" in tool
+
+
+def test_a_predict_that_raises_never_stops_the_game_being_played(monkeypatch):
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="def predict(g, act):\n    raise RuntimeError('boom')\n"
+                    "result = action('ACTION1')"),
+        _reply(content="ok"),
+    ])
+
+    assert a._llm_turn(agent_mod.grid_of(env.current), env.current) is True
+    assert a._steps == 1
+
+
+def test_the_forward_model_and_goal_survive_into_the_next_turn(monkeypatch):
+    """Rebuilding them each turn would make the strategy impossible: the
+    model would re-derive its simulator at full price every turn."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "def is_goal(g):\n    return False\n"),
+        _reply(content="built it"),
+        _reply(code="result = (callable(predict), callable(is_goal))"),
+        _reply(content="still here"),
+    ])
+
+    grid = agent_mod.grid_of(env.current)
+    a._llm_turn(grid, env.current)
+    a._llm_turn(grid, env.current)
+
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "(True, True)" in tool
+
+
+def test_the_transition_log_is_bounded():
+    """It rides in memory for a whole game, across 25 concurrent threads."""
+    assert agent_mod.TRANSITION_LOG <= 1000
+    a = _turn_agent(_FakeEnv(_frame(_grid())))
+    assert a._transitions.maxlen == agent_mod.TRANSITION_LOG
+
+
+def test_the_prompt_teaches_the_free_tools():
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "verify(predict)" in prompt
+    assert "plan(predict, is_goal" in prompt
+    assert "mispredicted" in prompt
+    # The two scoring facts that redirected the whole approach.
+    assert "capped" in prompt
+    assert "tutorial" in prompt

@@ -1454,6 +1454,42 @@ LLM_NOTES_CHARS = _env_int("ARC_LLM_NOTES_CHARS", 3000)
 LLM_LOG_CODE = _env_int("ARC_LLM_LOG_CODE", 1)
 LLM_LOG_CODE_CHARS = _env_int("ARC_LLM_LOG_CODE_CHARS", 700)
 
+# Planning in a learned simulator, and checking that simulator against
+# transitions we already bought.
+#
+# This is the whole bet, and it follows from the scoring rather than from
+# any belief about the model. `EnvironmentScoreCalculator.add_level` scores
+# a level `(baseline/actions)**2 * 100`, weights it by the level index, and
+# divides by the sum of weights over EVERY level in the game -- reached or
+# not. Two consequences drive the design:
+#
+#   * Beating the baseline earns nothing. `to_score` clamps the result to
+#     `max_weights / total_weights * 100`, so a level cleared in half the
+#     intended actions scores exactly what one cleared in the intended
+#     number scores. The target is baseline, not better than baseline.
+#   * Clearing slowly earns nothing either. Our own search clears ls20
+#     level 1 in 526 actions against a baseline of 22 -- 24x, worth 0.17
+#     out of 100. Across the suite, "clears level 1 eventually" tops out
+#     around 0.14 of final score. The metric is a speedrun.
+#
+# So exploration must be paid for once and then amortised, which means the
+# search that finds the route cannot run in the live environment. The model
+# supplies `predict(grid, act)`; the agent searches THAT. Simulated actions
+# are free, real ones are billed, and the only ones played are the ones on
+# a route already found.
+PLAN_MAX_NODES = _env_int("ARC_LLM_PLAN_NODES", 200_000)
+PLAN_MAX_DEPTH = _env_int("ARC_LLM_PLAN_DEPTH", 60)
+# Kept well under TOOL_TIMEOUT (30s), because planning runs INSIDE a tool
+# call: a plan budget at or above the tool budget would turn "the search
+# was inconclusive", which the model can act on, into "your code was
+# killed", which it cannot. Raising one of these means raising both.
+PLAN_SECONDS = _env_float("ARC_LLM_PLAN_SECONDS", 10.0)
+
+# Real transitions kept for checking the forward model. Every one was paid
+# for in billed actions, so replaying them against a candidate `predict` is
+# the one kind of evidence that costs nothing to collect twice.
+TRANSITION_LOG = _env_int("ARC_LLM_TRANSITION_LOG", 400)
+
 
 # The board, drawn. `Qwen3_5ForConditionalGeneration` initialises a ViT and
 # an MM encoder -- confirmed in the vLLM startup log -- so the served model
@@ -1596,6 +1632,200 @@ def strip_images(messages: list[dict[str, Any]]) -> None:
         message["content"] = text
 
 
+def normalise_grid(value: Any) -> Optional[tuple[tuple[int, ...], ...]]:
+    """Coerce whatever `predict` returned into a hashable grid, or None.
+
+    The model writes `predict`, so it can hand back a list of lists, a
+    generator, ragged rows, or nonsense. Planning hashes states into a
+    visited set, so anything unhashable or misshapen has to be rejected
+    here rather than raising from inside the BFS frontier, where the
+    failure would read as "no route exists".
+    """
+    if value is None:
+        return None
+    try:
+        rows = tuple(tuple(int(cell) for cell in row) for row in value)
+    except (TypeError, ValueError):
+        return None
+    if not rows:
+        return None
+    width = len(rows[0])
+    if width == 0 or any(len(row) != width for row in rows):
+        return None
+    return rows
+
+
+def grid_diff(
+    left: tuple[tuple[int, ...], ...],
+    right: tuple[tuple[int, ...], ...],
+    limit: int = 4,
+) -> list[tuple[int, int, int, int]]:
+    """Where two boards disagree, as (x, y, left, right), up to `limit`.
+
+    Returned rather than counted because a forward model is corrected by
+    seeing the cell it got wrong, not by being told a percentage.
+    """
+    out: list[tuple[int, int, int, int]] = []
+    for y in range(min(len(left), len(right))):
+        lrow, rrow = left[y], right[y]
+        for x in range(min(len(lrow), len(rrow))):
+            if lrow[x] != rrow[x]:
+                out.append((x, y, lrow[x], rrow[x]))
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def verify_predictions(
+    predict: Any,
+    transitions: list[tuple[Any, str, Any]],
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Replay real transitions through a candidate forward model.
+
+    This is the free evidence. Every transition in the log cost a billed
+    action when it happened; checking a hypothesis against it again costs
+    nothing, so the model can iterate on `predict` as many times as it
+    likes without touching the score. That asymmetry is the point of the
+    whole design -- being wrong in the simulator is free, being wrong in
+    the environment is quadratic.
+    """
+    rows = transitions[-limit:] if limit else list(transitions)
+    checked = correct = errors = 0
+    wrong: list[dict[str, Any]] = []
+
+    for before, label, after in rows:
+        checked += 1
+        try:
+            got = normalise_grid(predict(before, label))
+        except Exception as exc:  # noqa: BLE001 - the model wrote this
+            errors += 1
+            if len(wrong) < 5:
+                wrong.append(
+                    {"action": label, "raised": f"{type(exc).__name__}: {exc}"}
+                )
+            continue
+        if got == after:
+            correct += 1
+        elif len(wrong) < 5:
+            wrong.append(
+                {
+                    "action": label,
+                    "cells_wrong": sum(
+                        1
+                        for y in range(min(len(got or ()), len(after)))
+                        for x in range(min(len((got or ())[y]), len(after[y])))
+                        if got[y][x] != after[y][x]
+                    )
+                    if got
+                    else None,
+                    "sample": grid_diff(got, after) if got else None,
+                    "note": None if got else "predict did not return a grid",
+                }
+            )
+
+    return {
+        "checked": checked,
+        "correct": correct,
+        "accuracy": (correct / checked) if checked else 0.0,
+        "raised": errors,
+        "wrong": wrong,
+    }
+
+
+def plan_actions(
+    predict: Any,
+    is_goal: Any,
+    start: tuple[tuple[int, ...], ...],
+    actions: list[Any],
+    *,
+    max_nodes: int = PLAN_MAX_NODES,
+    max_depth: int = PLAN_MAX_DEPTH,
+    seconds: float = PLAN_SECONDS,
+) -> dict[str, Any]:
+    """Breadth-first search over the model's simulator for a route.
+
+    Returns the shortest action sequence reaching a state `is_goal`
+    accepts. Shortest matters literally here: the plan's length is what
+    gets billed, and the score is its square.
+
+    Nothing about this trusts `predict`. It may raise, loop, or return
+    junk on any state; each of those just prunes that branch. A simulator
+    that is wrong produces a plan that fails on execution, which is
+    detected there and fed back -- it does not produce a crash here.
+    """
+    if not actions:
+        return {"found": False, "actions": [], "nodes": 0, "reason": "no actions given"}
+
+    deadline = min(time.monotonic() + max(seconds, 0.0), _DEADLINE)
+    try:
+        if is_goal(start):
+            return {
+                "found": True, "actions": [], "nodes": 0,
+                "reason": "the current board already satisfies is_goal",
+            }
+    except Exception as exc:  # noqa: BLE001 - the model wrote this
+        return {
+            "found": False, "actions": [], "nodes": 0,
+            "reason": f"is_goal raised on the current board: "
+                      f"{type(exc).__name__}: {exc}",
+        }
+
+    frontier: deque[tuple[tuple[tuple[int, ...], ...], list[Any]]] = deque(
+        [(start, [])]
+    )
+    seen = {start}
+    nodes = 0
+    predict_errors = 0
+    depth_hit = False
+
+    while frontier:
+        if nodes >= max_nodes:
+            return {
+                "found": False, "actions": [], "nodes": nodes,
+                "reason": f"gave up after {nodes} simulated states",
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "found": False, "actions": [], "nodes": nodes,
+                "reason": f"planning ran out of time after {nodes} states",
+            }
+
+        state, path = frontier.popleft()
+        if len(path) >= max_depth:
+            depth_hit = True
+            continue
+
+        for act in actions:
+            nodes += 1
+            try:
+                nxt = normalise_grid(predict(state, act))
+            except Exception:  # noqa: BLE001 - a bad branch, not a bad search
+                predict_errors += 1
+                continue
+            if nxt is None or nxt in seen:
+                continue
+            route = path + [act]
+            try:
+                done = bool(is_goal(nxt))
+            except Exception:  # noqa: BLE001
+                done = False
+            if done:
+                return {
+                    "found": True, "actions": route, "nodes": nodes,
+                    "reason": f"found a {len(route)}-action route",
+                }
+            seen.add(nxt)
+            frontier.append((nxt, route))
+
+    reason = "explored every reachable state without reaching is_goal"
+    if depth_hit:
+        reason += f" within {max_depth} actions"
+    if predict_errors:
+        reason += f"; predict raised on {predict_errors} branches"
+    return {"found": False, "actions": [], "nodes": nodes, "reason": reason}
+
+
 def describe_frame(view: dict[str, Any], limit: int = LLM_MAX_NODES) -> str:
     """Render a segmentation as prose, largest objects first.
 
@@ -1666,16 +1896,29 @@ def build_system_prompt(available: list[int]) -> str:
         "HOW TO WIN THIS\n"
         "Every action you play is billed and the penalty is quadratic, so "
         "the winning strategy is not to search the board -- it is to learn "
-        "the rule, then spend actions only on a plan you have already "
-        "checked.\n"
-        "Concretely, and this is the whole method:\n"
-        "  1. Spend a few actions finding out what each action does.\n"
-        "  2. Write a forward model: a function predict(grid, act) that "
-        "returns the grid you expect. Test it against what really "
-        "happened. Fix it until it agrees.\n"
-        "  3. Search THAT with BFS for a winning sequence. Simulating "
-        "costs nothing. Only then call action(...) with the sequence you "
-        "found.\n"
+        "the rule, then spend actions only on a route you have already "
+        "checked. You are given tools that make everything except the "
+        "final route free, and the method is exactly these four steps:\n"
+        "  1. PROBE. Spend a handful of actions -- ten is plenty -- to see "
+        "what each action does. This is the only exploring you should pay "
+        "for.\n"
+        "  2. MODEL. Write `predict(grid, act) -> grid`: given a board and "
+        "an action label, return the board you expect next. Then call "
+        "`verify(predict)`. It replays every real move this game has "
+        "already made and tells you where you were wrong, down to the "
+        "cell. It bills NOTHING, so run it as often as you like. Fix "
+        "`predict` and verify again until accuracy is 1.0.\n"
+        "  3. PLAN. Write `is_goal(grid) -> bool` describing the board you "
+        "are trying to reach. Call `plan(predict, is_goal)`. It breadth-"
+        "first searches YOUR simulator and returns the shortest action "
+        "sequence that gets there. It bills NOTHING either.\n"
+        "  4. EXECUTE. Pass that sequence straight to `action(...)`. Only "
+        "now are you charged, and only for a route you already know works. "
+        "The result comes back with `mispredicted`: the places the real "
+        "board diverged from `predict`. If that list is non-empty your "
+        "model is wrong -- go back to step 2 with the counterexample.\n"
+        "Being wrong in the simulator is free. Being wrong in the game is "
+        "quadratic. Do your being-wrong in the simulator.\n"
         "Your variables persist between turns, so the model you build and "
         "the notes you keep survive. Build them once and improve them; do "
         "not start over each turn.\n"
@@ -1691,10 +1934,25 @@ def build_system_prompt(available: list[int]) -> str:
         "  action(['ACTION1', 'ACTION1'])  a sequence\n"
         "  action(('ACTION6', 12, 30))  a click at column 12, row 30\n"
         "It returns a dict: `changed` (did the board differ), `state`, "
-        "`levels_completed`, `frame` (the new segmentation), and `steps` "
+        "`levels_completed`, `frame` (the new segmentation), `steps` "
         "(how many ran -- fewer than you asked means it stopped, and "
-        "`stopped` says why).\n"
+        "`stopped` says why), and `mispredicted` (once you have defined "
+        "`predict`: every step where the real board disagreed with it).\n"
         "Coordinates are (x=column, y=row), both 0-63.\n\n"
+        "THE TWO FREE TOOLS\n"
+        "  verify(predict)\n"
+        "      Replays every real move made so far through your `predict` "
+        "and returns {accuracy, checked, correct, raised, wrong}. `wrong` "
+        "lists the action and a sample of disagreeing cells as "
+        "(x, y, predicted, actual). Costs no actions.\n"
+        "  plan(predict, is_goal, actions=None, max_depth=60)\n"
+        "      Breadth-first search over your simulator. Returns "
+        "{found, actions, nodes, reason}; `actions` is the shortest route "
+        "and goes straight into action(...). `actions=` defaults to the "
+        "non-click moves -- for a click game, pass your own shortlist of "
+        "targets like [('ACTION6', 12, 30), ...], because there are 4096 "
+        "of them and searching all of them finds nothing. Costs no "
+        "actions.\n\n"
         "WHAT YOU START WITH\n"
         "  current_frame   the segmentation now\n"
         "  previous_frame  the one before it, or None\n"
@@ -1702,21 +1960,31 @@ def build_system_prompt(available: list[int]) -> str:
         "  history         recent (action, changed) pairs\n"
         "  valid_actions   the list above\n"
         "  notes           your own list, carried across turns\n"
-        "These five are refreshed each turn. Everything else you define "
-        "stays exactly as you left it.\n"
+        "  action, verify, plan   the three tools above\n"
+        "These are refreshed each turn. Everything else you define stays "
+        "exactly as you left it -- including `predict` and `is_goal`, so "
+        "build them once and keep improving them rather than starting "
+        "over.\n"
         "Each object has: id, color, pixels, bbox (top, left, bottom, "
         "right), hash (equal hashes mean the same shape in the same "
         "colour, so you can follow one across frames), children (ids it "
         "encloses).\n\n"
         "SCORING -- read this twice\n"
-        "You are scored on how FEW actions the level takes, and the "
+        "You are scored on how FEW actions each level takes, and the "
         "penalty is quadratic: taking twice the intended number scores a "
         "quarter, ten times scores about one point in a hundred. Finishing "
         "a level slowly is worth almost nothing. There is exactly one "
         "attempt per game and every action is billed, including the ones "
-        "you spend exploring and including RESET. So think before you act, "
-        "and prefer one experiment that settles a question to ten that "
-        "each nudge something.\n\n"
+        "you spend exploring and including RESET.\n"
+        "Two things follow that are not obvious:\n"
+        "  * Beating the intended count earns you nothing extra -- the "
+        "score is capped. Aim to match it, not to beat it.\n"
+        "  * Later levels are worth much more than level 1, and they allow "
+        "more actions. Level 1 is the tutorial: it is worth very little, "
+        "and it is the right place to spend actions learning the rules. "
+        "Get the rules right there, then play the later levels tightly. "
+        "Do not grind level 1 for a low action count at the cost of not "
+        "understanding the game.\n\n"
         "THE TOOL\n"
         "Variables persist between your `python` calls within a turn. "
         "Available modules: "
@@ -2651,6 +2919,13 @@ class MyAgent(Agent):
         self._llm_history: list[str] = []
         self._llm_turns = 0
         self._llm_note = ""
+        # Every real transition we have paid for, as (before, label, after).
+        # `verify()` replays these against a candidate forward model, which
+        # is how the model can be wrong for free: the actions were already
+        # billed once, and re-reading them costs nothing.
+        self._transitions: deque[
+            tuple[tuple[tuple[int, ...], ...], str, tuple[tuple[int, ...], ...]]
+        ] = deque(maxlen=TRANSITION_LOG)
         # Actions the model took inside the current turn, and the frame it
         # was last handed, which `action()` diffs against to report
         # `changed`.
@@ -2932,6 +3207,12 @@ class MyAgent(Agent):
         ran = 0
         changed = False
         stopped: Optional[str] = None
+        # Where the simulator and the environment disagreed while executing.
+        # A plan is only as good as the model it was found in, so the first
+        # divergence is the single most useful thing to report back: it is
+        # the counterexample that corrects `predict`.
+        drift: list[dict[str, Any]] = []
+        predict = self._llm_ns.get("predict")
 
         for action_id, x, y in parsed:
             if self._turn_actions >= LLM_TURN_ACTIONS:
@@ -2942,6 +3223,15 @@ class MyAgent(Agent):
                 break
 
             before = grid_of(frame) if frame is not None else None
+            label = name_action(action_id, x, y)
+
+            expected = None
+            if callable(predict) and before is not None:
+                try:
+                    expected = normalise_grid(predict(before, label))
+                except Exception:  # noqa: BLE001 - reported, never fatal
+                    expected = None
+
             frame = self._step_env(action_id, x, y)
             self.append_frame(frame)
             self._turn_frame = frame
@@ -2953,10 +3243,22 @@ class MyAgent(Agent):
             # anything.
             self.action_counter += 1
 
-            changed = grid_of(frame) != before
+            after = grid_of(frame)
+            if before is not None:
+                self._transitions.append((before, label, after))
+            if expected is not None and expected != after and len(drift) < 3:
+                drift.append(
+                    {
+                        "after_step": ran,
+                        "action": label,
+                        "sample": grid_diff(expected, after),
+                        "note": "predicted vs actual, as (x, y, predicted, actual)",
+                    }
+                )
+
+            changed = after != before
             self._llm_history.append(
-                f"{name_action(action_id, x, y)} -> "
-                f"{'board changed' if changed else 'no change'}"
+                f"{label} -> {'board changed' if changed else 'no change'}"
             )
 
             if frame.state in (GameState.GAME_OVER, GameState.WIN):
@@ -2992,7 +3294,7 @@ class MyAgent(Agent):
         self._llm_ns["current_frame"] = view
         self._llm_ns["previous_frame"] = self._last_view
         self._last_view = view
-        return {
+        outcome = {
             "steps": ran,
             "changed": changed,
             "state": frame.state.name if frame else "UNKNOWN",
@@ -3000,6 +3302,74 @@ class MyAgent(Agent):
             "frame": view,
             "stopped": stopped,
         }
+        if drift:
+            outcome["mispredicted"] = drift
+        elif callable(predict) and ran:
+            outcome["mispredicted"] = []
+        return outcome
+
+    def _llm_verify(
+        self, predict: Any, limit: Optional[int] = None
+    ) -> dict[str, Any]:
+        """`verify(predict)` as the model sees it. Bills nothing.
+
+        Scores a candidate forward model against every real transition
+        this game has produced so far. The actions were paid for when they
+        happened, so a wrong hypothesis costs nothing to discover here --
+        which is the only reason iterating on `predict` is affordable at
+        all.
+        """
+        if not callable(predict):
+            raise TypeError(
+                "verify(predict) expects a function predict(grid, action)"
+            )
+        if not self._transitions:
+            return {
+                "checked": 0, "correct": 0, "accuracy": 0.0, "raised": 0,
+                "wrong": [],
+                "note": "nothing to check against yet -- play a few actions "
+                        "first, then verify against what they did",
+            }
+        return verify_predictions(predict, list(self._transitions), limit)
+
+    def _llm_plan(
+        self,
+        predict: Any,
+        is_goal: Any,
+        actions: Optional[list[Any]] = None,
+        start: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """`plan(predict, is_goal)` as the model sees it. Bills nothing.
+
+        Searches the model's own simulator rather than the environment, so
+        the cost of looking for a route is paid in GPU seconds instead of
+        in score. What comes back is the shortest sequence found, ready to
+        hand straight to `action(...)`.
+        """
+        if not callable(predict) or not callable(is_goal):
+            raise TypeError(
+                "plan(predict, is_goal) expects two functions: "
+                "predict(grid, action) -> grid, and is_goal(grid) -> bool"
+            )
+        board = normalise_grid(
+            start if start is not None else self._llm_ns.get("grid")
+        )
+        if board is None:
+            return {
+                "found": False, "actions": [], "nodes": 0,
+                "reason": "no board to plan from",
+            }
+        if actions is None:
+            # Clicks are excluded by default: ACTION6 needs coordinates,
+            # and branching on all 4,096 of them makes the first level of
+            # the search larger than the whole node budget. A click game
+            # has to pass its own shortlist of targets.
+            available = (
+                self._turn_frame.available_actions if self._turn_frame else None
+            ) or []
+            actions = [f"ACTION{i}" for i in available if i != 6]
+        return plan_actions(predict, is_goal, board, list(actions), **kwargs)
 
     def _llm_turn(
         self, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
@@ -3067,6 +3437,8 @@ class MyAgent(Agent):
                 "history": list(self._llm_history),
                 "valid_actions": available,
                 "action": self._llm_act,
+                "verify": self._llm_verify,
+                "plan": self._llm_plan,
             }
         )
         self._llm_ns.setdefault("notes", [])
