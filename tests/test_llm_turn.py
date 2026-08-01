@@ -107,6 +107,12 @@ def _turn_agent(env):
     a._llm_turns = 0
     a._llm_note = ""
     a._transitions = deque(maxlen=agent_mod.TRANSITION_LOG)
+    a._verify_calls = 0
+    a._verify_best = 0.0
+    a._plan_calls = 0
+    a._plans_found = 0
+    a._tour_calls = 0
+    a._goal_misses = 0
     a._turn_actions = 0
     a._turn_frame = None
     a._turn_level = 0
@@ -788,8 +794,10 @@ def test_plan_searches_the_simulator_and_returns_a_route(monkeypatch):
     tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
     assert "'found': True" in tool
     # The mark starts at column 1 and the goal is column 5: four moves, and
-    # the planner must not come back with five.
-    assert tool.count("ACTION1") == 4
+    # the planner must not come back with five. Counted off the route
+    # itself rather than off the rendered dict, which also carries the
+    # per-candidate `routes` and would double every name in it.
+    assert "'actions': [" + ", ".join(["'ACTION1'"] * 4) + "]" in tool
 
 
 def test_plan_excludes_clicks_unless_the_model_supplies_targets():
@@ -884,6 +892,113 @@ def test_the_transition_log_is_bounded():
     assert a._transitions.maxlen == agent_mod.TRANSITION_LOG
 
 
+def test_whether_the_forward_model_improved_is_recorded(monkeypatch):
+    """The question a GPU run exists to answer. Three previous runs could
+    not answer theirs because nothing recorded it, so the best accuracy
+    seen is tracked and printed on every turn line."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    wrong = SLIDE_RIGHT.replace("rows[y][x + 1]", "rows[y][x - 1]")
+    _script(monkeypatch, [
+        _reply(code="action('ACTION1')"),
+        _reply(code=wrong + "result = verify(predict)"),
+        _reply(code=SLIDE_RIGHT + "result = verify(predict)"),
+        _reply(content="fixed it"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_calls == 2
+    assert a._verify_best == 1.0, "the improvement must be visible"
+
+
+def test_planning_attempts_are_counted_separately_from_successes(monkeypatch):
+    """A model that plans constantly and never finds a route looks, in the
+    action counts alone, exactly like one that never tried."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT
+               + "plan(predict, lambda g: False, max_depth=2)\n"
+                 "result = plan(predict, lambda g: any(r[5] == 5 for r in g))"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._plan_calls == 2
+    assert a._plans_found == 1
+
+
+def test_a_usable_model_that_never_planned_is_called_out(monkeypatch):
+    """The exact v16 failure. It drove verify accuracy from 0.04 to 0.58,
+    called plan() zero times in the whole run, and went back to playing
+    actions one at a time. Reaching a usable model and not planning with it
+    is the most expensive state the agent can sit in, so it is named."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "action('ACTION1')\nresult = verify(predict)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_best >= agent_mod.PLAN_NUDGE_ACCURACY
+    assert a._plan_calls == 0
+    assert "not called plan() once" in a._llm_note
+
+
+def test_the_nudge_stops_once_it_has_planned(monkeypatch):
+    """Otherwise it becomes noise the model learns to skip."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "action('ACTION1')\nverify(predict)\n"
+                                  "result = plan(predict, lambda g: False)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._plan_calls == 1
+    assert "not called plan() once" not in a._llm_note
+
+
+def test_a_weak_model_is_not_nudged_to_plan(monkeypatch):
+    """Planning on a model that is wrong about everything wastes a turn."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    wrong = SLIDE_RIGHT.replace("rows[y][x + 1]", "rows[y][x - 1]")
+    _script(monkeypatch, [
+        _reply(code=wrong + "action('ACTION1')\nresult = verify(predict)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_best == 0.0
+    assert "not called plan() once" not in a._llm_note
+
+
+def test_the_prompt_no_longer_gates_planning_on_perfection():
+    """The bug that cost v16 its whole run: 'verify again until accuracy is
+    1.0' is a gate that never opens on a board with any noise in it, and
+    the model obeyed it literally."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "until accuracy is 1.0" not in prompt
+    assert "Do NOT wait for 1.0" in prompt
+    assert "never calling `plan`" in prompt
+
+
+def test_the_prompt_forbids_the_repeat_loop_by_name():
+    """v16 turns 6 and 7 ran `for i in range(10): action('ACTION4')` and
+    spent 104 actions between them."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "for i in range(10): action" in prompt
+    assert "no more than twenty" in prompt
+
+
 def test_the_prompt_teaches_the_free_tools():
     prompt = agent_mod.build_system_prompt([1, 2, 6])
     assert "verify(predict)" in prompt
@@ -892,3 +1007,162 @@ def test_the_prompt_teaches_the_free_tools():
     # The two scoring facts that redirected the whole approach.
     assert "capped" in prompt
     assert "tutorial" in prompt
+
+
+# --- knowing WHICH of the two things was wrong --------------------------
+#
+# v17 built a forward model that verified at 1.00 accuracy, planned with
+# it three times, executed all three routes, and cleared nothing -- because
+# `is_goal` was a coordinate it had guessed. It read each failure as
+# evidence against the simulator, went back to probing, and spent the rest
+# of the run grinding sixty actions a turn. The simulator was never the
+# problem. These cover saying so.
+
+
+def test_tour_is_available_and_costs_no_actions(monkeypatch):
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "result = tour(predict, {'a': lambda g: any(r[3] == 5 for r in g),\n"
+          "                        'b': lambda g: any(r[5] == 5 for r in g)})\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._steps == 0, "touring must not touch the environment"
+    assert a._tour_calls == 1
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "'reached': ['a', 'b']" in tool
+
+
+def test_the_tour_orders_the_candidates_by_what_they_cost(monkeypatch):
+    """Cheapest hypothesis first, so the dear ones are the likeliest never
+    to be played at all."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "r = tour(predict, {'far': lambda g: any(x[6] == 5 for x in g),\n"
+          "                   'near': lambda g: any(x[2] == 5 for x in g)})\n"
+        "result = r['reached']\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "['near', 'far']" in tool
+
+
+def _goal_miss_agent(monkeypatch, extra=""):
+    """A turn that plans, then plays a route the simulator gets exactly
+    right, and does not clear the level."""
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)))],
+    )
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "plan(predict, lambda g: any(r[3] == 5 for r in g))\n"
+        + extra
+        + "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    return a
+
+
+def test_a_route_that_ran_clean_and_cleared_nothing_blames_the_goal(monkeypatch):
+    a = _goal_miss_agent(monkeypatch)
+
+    assert a._goal_misses == 1
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "goal_miss" in tool
+    assert "is not the goal" in tool
+
+
+def test_the_goal_miss_says_not_to_touch_the_simulator(monkeypatch):
+    """The inference v17 got backwards, stated in the words that stop it."""
+    a = _goal_miss_agent(monkeypatch)
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "do NOT rewrite `predict`" in tool
+    assert "rewrite `is_goal`" in tool
+    assert "tour(predict" in tool
+
+
+def test_probing_before_any_plan_is_not_a_goal_miss(monkeypatch):
+    """Ordinary exploration does not advance the level either, and calling
+    that a wrong goal would fire the diagnosis on every early turn."""
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)))],
+    )
+    a = _turn_agent(env)
+    code = SLIDE_RIGHT + "result = action(['ACTION1', 'ACTION1'])\n"
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._goal_misses == 0
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "goal_miss" not in tool
+
+
+def test_a_route_the_simulator_got_wrong_is_not_a_goal_miss(monkeypatch):
+    """`mispredicted` is non-empty, so the simulator IS the suspect and the
+    two diagnoses must not both fire."""
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(5, 5, 5))), _frame(_grid(mark=(6, 6, 5)))],
+    )
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "plan(predict, lambda g: any(r[3] == 5 for r in g))\n"
+        "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._goal_misses == 0
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "mispredicted" in tool and "goal_miss" not in tool
+
+
+def test_a_route_that_cleared_the_level_is_not_a_goal_miss(monkeypatch):
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)), levels=1)],
+    )
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "plan(predict, lambda g: any(r[3] == 5 for r in g))\n"
+        "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._goal_misses == 0
+
+
+def test_guessing_targets_one_at_a_time_gets_nudged_towards_tour(monkeypatch):
+    a = _goal_miss_agent(monkeypatch)
+    assert "tour(" in a._llm_note
+    assert "`is_goal` is wrong" in a._llm_note
+
+
+def test_the_goal_nudge_stops_once_it_has_toured(monkeypatch):
+    """Belt and braces, but only until the braces are on -- a nudge that
+    keeps firing after it has been acted on is noise in the prompt."""
+    a = _goal_miss_agent(
+        monkeypatch, extra="tour(predict, {'a': lambda g: False})\n"
+    )
+    assert a._goal_misses == 1
+    assert a._tour_calls == 1
+    assert "tour(" not in a._llm_note
