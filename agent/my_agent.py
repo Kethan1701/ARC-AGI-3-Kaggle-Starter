@@ -2926,6 +2926,15 @@ class MyAgent(Agent):
         self._transitions: deque[
             tuple[tuple[tuple[int, ...], ...], str, tuple[tuple[int, ...], ...]]
         ] = deque(maxlen=TRANSITION_LOG)
+        # Did the forward model actually get better? This is the question a
+        # GPU run exists to answer, and the previous three could not answer
+        # theirs because nothing recorded it. `_verify_best` is the headline:
+        # if it never climbs, the model is not learning the game and no
+        # amount of further planning will help.
+        self._verify_calls = 0
+        self._verify_best = 0.0
+        self._plan_calls = 0
+        self._plans_found = 0
         # Actions the model took inside the current turn, and the frame it
         # was last handed, which `action()` diffs against to report
         # `changed`.
@@ -3330,7 +3339,15 @@ class MyAgent(Agent):
                 "note": "nothing to check against yet -- play a few actions "
                         "first, then verify against what they did",
             }
-        return verify_predictions(predict, list(self._transitions), limit)
+        report = verify_predictions(predict, list(self._transitions), limit)
+        self._verify_calls += 1
+        self._verify_best = max(self._verify_best, report["accuracy"])
+        logger.info(
+            "%s: verify #%d: %.2f accuracy over %d transitions (best %.2f)",
+            self.game_id, self._verify_calls, report["accuracy"],
+            report["checked"], self._verify_best,
+        )
+        return report
 
     def _llm_plan(
         self,
@@ -3369,7 +3386,16 @@ class MyAgent(Agent):
                 self._turn_frame.available_actions if self._turn_frame else None
             ) or []
             actions = [f"ACTION{i}" for i in available if i != 6]
-        return plan_actions(predict, is_goal, board, list(actions), **kwargs)
+        out = plan_actions(predict, is_goal, board, list(actions), **kwargs)
+        self._plan_calls += 1
+        self._plans_found += 1 if out["found"] else 0
+        logger.info(
+            "%s: plan #%d: %s (%d states, %s)",
+            self.game_id, self._plan_calls,
+            f"found a {len(out['actions'])}-action route" if out["found"]
+            else "no route", out["nodes"], out["reason"],
+        )
+        return out
 
     def _llm_turn(
         self, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
@@ -3490,10 +3516,13 @@ class MyAgent(Agent):
         # actions-per-turn number is the one that decides the score.
         logger.info(
             "%s: model turn %d: %d actions in %.0fs (%s, %d tool calls, "
-            "level %d, %d total)",
+            "level %d, %d total) | predict %.2f best over %d verifies, "
+            "%d/%d plans found",
             self.game_id, self._llm_turns, self._turn_actions,
             time.monotonic() - started, outcome["stop"],
             outcome["tool_calls"], self._turn_level, self._steps,
+            self._verify_best, self._verify_calls,
+            self._plans_found, self._plan_calls,
         )
 
         if self._turn_actions == 0:

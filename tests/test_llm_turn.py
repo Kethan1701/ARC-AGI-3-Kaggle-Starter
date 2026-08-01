@@ -107,6 +107,10 @@ def _turn_agent(env):
     a._llm_turns = 0
     a._llm_note = ""
     a._transitions = deque(maxlen=agent_mod.TRANSITION_LOG)
+    a._verify_calls = 0
+    a._verify_best = 0.0
+    a._plan_calls = 0
+    a._plans_found = 0
     a._turn_actions = 0
     a._turn_frame = None
     a._turn_level = 0
@@ -882,6 +886,44 @@ def test_the_transition_log_is_bounded():
     assert agent_mod.TRANSITION_LOG <= 1000
     a = _turn_agent(_FakeEnv(_frame(_grid())))
     assert a._transitions.maxlen == agent_mod.TRANSITION_LOG
+
+
+def test_whether_the_forward_model_improved_is_recorded(monkeypatch):
+    """The question a GPU run exists to answer. Three previous runs could
+    not answer theirs because nothing recorded it, so the best accuracy
+    seen is tracked and printed on every turn line."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    wrong = SLIDE_RIGHT.replace("rows[y][x + 1]", "rows[y][x - 1]")
+    _script(monkeypatch, [
+        _reply(code="action('ACTION1')"),
+        _reply(code=wrong + "result = verify(predict)"),
+        _reply(code=SLIDE_RIGHT + "result = verify(predict)"),
+        _reply(content="fixed it"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_calls == 2
+    assert a._verify_best == 1.0, "the improvement must be visible"
+
+
+def test_planning_attempts_are_counted_separately_from_successes(monkeypatch):
+    """A model that plans constantly and never finds a route looks, in the
+    action counts alone, exactly like one that never tried."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT
+               + "plan(predict, lambda g: False, max_depth=2)\n"
+                 "result = plan(predict, lambda g: any(r[5] == 5 for r in g))"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._plan_calls == 2
+    assert a._plans_found == 1
 
 
 def test_the_prompt_teaches_the_free_tools():
