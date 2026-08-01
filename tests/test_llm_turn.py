@@ -113,6 +113,10 @@ def _turn_agent(env):
     a._plans_found = 0
     a._tour_calls = 0
     a._goal_misses = 0
+    a._exhaustions = 0
+    a._verify_live = 0.0
+    a._verify_live_best = 0.0
+    a._verify_peak = 0.0
     a._turn_actions = 0
     a._turn_frame = None
     a._turn_level = 0
@@ -1166,3 +1170,158 @@ def test_the_goal_nudge_stops_once_it_has_toured(monkeypatch):
     assert a._goal_misses == 1
     assert a._tour_calls == 1
     assert "tour(" not in a._llm_note
+
+
+# --- checking the simulator without being asked -------------------------
+#
+# v18 called verify() four times, all inside turn 2, scored 1.00 over
+# thirteen transitions, and then played a hundred and forty more actions
+# across three turns without ever checking again. The only number anyone
+# saw was the model's own high-water mark, which is not a check on
+# anything. The turn now measures it.
+
+
+def _drifting_agent(monkeypatch, second_code):
+    """Turn 1 fits a simulator to the moves so far; turn 2 plays moves it
+    does not fit."""
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5))),
+         _frame(_grid(mark=(7, 7, 5))), _frame(_grid(mark=(6, 6, 5)))],
+    )
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "result = action(['ACTION1', 'ACTION1'])\n"),
+        _reply(content="ok"),
+        _reply(code=second_code),
+        _reply(content="ok"),
+    ])
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    first = a._verify_live
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    return a, first
+
+
+def test_the_turn_scores_the_live_simulator_without_being_asked(monkeypatch):
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)))],
+    )
+    a = _turn_agent(env)
+    code = SLIDE_RIGHT + "result = action(['ACTION1', 'ACTION1'])\n"
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_live == 1.0
+    assert a._verify_calls == 0, "the model never called verify itself"
+
+
+def test_a_simulator_that_has_gone_stale_is_reported(monkeypatch):
+    """The v18 mechanism: a 1.00 measured once and trusted long after."""
+    a, first = _drifting_agent(
+        monkeypatch, "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    assert first == 1.0
+    assert a._verify_live < 1.0
+    assert "Checked for you" in a._llm_note
+    assert "%" in a._llm_note
+
+
+def test_a_simulator_that_still_fits_is_not_nagged(monkeypatch):
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)))],
+    )
+    a = _turn_agent(env)
+    code = SLIDE_RIGHT + "result = action(['ACTION1', 'ACTION1'])\n"
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert "Checked for you" not in a._llm_note
+
+
+def test_the_check_survives_a_predict_that_raises(monkeypatch):
+    """It runs outside the model's own try/except, so it must not be able
+    to end the game."""
+    env = _FakeEnv(
+        _frame(_grid(mark=(1, 1, 5))),
+        [_frame(_grid(mark=(1, 2, 5))), _frame(_grid(mark=(1, 3, 5)))],
+    )
+    a = _turn_agent(env)
+    code = (
+        "def predict(g, act):\n    raise RuntimeError('boom')\n"
+        "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_live == 0.0
+
+
+def test_no_simulator_yet_means_nothing_to_check(monkeypatch):
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))),
+                   [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [_reply(code="result = action('ACTION1')\n"),
+                          _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_live == 0.0
+    assert "Checked for you" not in a._llm_note
+
+
+def test_exhausting_the_state_space_reaches_the_model_and_outranks_the_rest(
+    monkeypatch,
+):
+    """Three diagnoses now compete for one note. This is the deepest of
+    them -- while the state space is wrong, nothing else is worth saying."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "result = tour(predict, {'a': lambda g: any(r[3] == 5 for r in g),\n"
+          "                        'never': lambda g: False})\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._exhaustions == 1
+    tool = [m for m in a._llm_messages if m.get("role") == "tool"][-1]["content"]
+    assert "exhausted" in tool
+    assert "Stop writing goals" in a._llm_note
+
+
+def test_a_tour_that_reached_everything_is_not_an_exhaustion(monkeypatch):
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))))
+    a = _turn_agent(env)
+    code = (
+        SLIDE_RIGHT
+        + "result = tour(predict, {'a': lambda g: any(r[3] == 5 for r in g)})\n"
+    )
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._exhaustions == 0
+
+
+def test_drift_is_measured_against_the_harness_own_readings(monkeypatch):
+    """A model that never calls verify() still gets caught.
+
+    The first cut compared the live score against `_verify_best`, which is
+    only ever set by the model calling verify() itself -- so a model that
+    never called it had that sitting at 0.0 and could never be found to
+    have drifted, which is precisely the model most likely to.
+    """
+    a, first = _drifting_agent(
+        monkeypatch, "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    assert a._verify_calls == 0, "the model never self-reported anything"
+    assert a._verify_best == 0.0
+    assert first == 1.0 and a._verify_live < 1.0
+    assert "Checked for you" in a._llm_note

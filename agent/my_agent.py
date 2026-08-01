@@ -1520,6 +1520,28 @@ TRANSITION_LOG = _env_int("ARC_LLM_TRANSITION_LOG", 400)
 # so directly on the next turn.
 PLAN_NUDGE_ACCURACY = _env_float("ARC_LLM_PLAN_NUDGE", 0.5)
 
+# How many of the most recent real transitions the turn re-scores the
+# model's live `predict` against, without being asked.
+#
+# v18 is why. The model called verify() four times, all inside turn 2,
+# scored 1.00 over THIRTEEN transitions, and never verified again -- while
+# going on to play 140 more actions across three further turns. A 1.00
+# earned on thirteen samples was load-bearing for the rest of the run, and
+# nothing anywhere would have noticed if it had gone stale, because the
+# only number reported was the best the model had ever self-reported.
+#
+# So the harness now checks, every turn, against everything played. The
+# most recent slice rather than all of TRANSITION_LOG because this runs
+# outside a tool call on the wall clock, and staleness is a question about
+# recent moves anyway.
+AUTOVERIFY_LIMIT = _env_int("ARC_LLM_AUTOVERIFY", 150)
+
+# How far the live score may sit below the model's own best before the
+# turn says so. Some slack: a forward model that is right about the moves
+# that matter and wrong about an animated HUD is still worth planning
+# with, and that is deliberate policy from v16.
+AUTOVERIFY_DRIFT = _env_float("ARC_LLM_AUTOVERIFY_DRIFT", 0.25)
+
 
 # The board, drawn. `Qwen3_5ForConditionalGeneration` initialises a ViT and
 # an MM encoder -- confirmed in the vLLM startup log -- so the served model
@@ -1963,6 +1985,41 @@ def plan_actions(
     return _plan_result(routes, goals, nodes, reason)
 
 
+def exhaustion_note(reason: str, nodes: int, missed: int) -> Optional[str]:
+    """What it means when the search runs out of world before it runs out of goals.
+
+    v18 produced this line and nobody acted on it:
+
+        tour #10: 37 actions through 29/42 goals (807 states,
+                  explored every reachable state without reaching is_goal)
+
+    The model's `predict` located a coloured block, moved it, and copied
+    the rest of the board unchanged -- so the only states its simulator
+    had were positions of that block, about eight hundred of them. It
+    visited all of them and none finished the level.
+
+    That is a proof, inside the model's own world, that the world is
+    wrong. A wrong `is_goal` is one hypothesis failing; every reachable
+    state failing is the state space being too small. The two need
+    different repairs and only this one points at `predict`.
+    """
+    if "explored every reachable state" not in reason or not missed:
+        return None
+    return (
+        f"Your simulator says only {nodes} states are reachable from here, "
+        f"and the search has now visited every one of them without "
+        f"satisfying {missed} of your goals. That is not a wrong goal -- "
+        "one wrong goal is one hypothesis failing, and this is all of "
+        "them. It means your state space is too small: `predict` is "
+        "copying part of the board that the real game changes, so the "
+        "winning position is not a state your simulator can even "
+        "represent. Look at what your `predict` carries over untouched -- "
+        "counters, doors, things the piece passes over -- and model that "
+        "too. Do not write more goals until you do; there is nowhere left "
+        "for them to be."
+    )
+
+
 def plan_tour(
     predict: Any,
     goals: Any,
@@ -2168,6 +2225,18 @@ def build_system_prompt(available: list[int]) -> str:
         "change -- your simulator is RIGHT and your GOAL is wrong. You "
         "went exactly where you meant to go and it was not the finish. Do "
         "not touch `predict`. Rewrite `is_goal`.\n"
+        "     * `plan` or `tour` comes back with `exhausted` -- your "
+        "simulator is TOO SMALL. It visited every state it believes in "
+        "and none of them wins, so the winning board is not one your "
+        "model can represent. That is a third thing, and it is the "
+        "important one: stop writing goals and go find the part of the "
+        "board your `predict` copies over unchanged while the real game "
+        "changes it.\n"
+        "Your accuracy is re-checked for you against every move you have "
+        "played, at the end of every turn, whether you ask or not. A "
+        "score of 1.0 measured once over a dozen moves is not a "
+        "simulator you can trust two hundred actions later, and you will "
+        "be told when it has drifted.\n"
         "Being wrong in the simulator is free. Being wrong in the game is "
         "quadratic. Do your being-wrong in the simulator.\n"
         "WHERE THE FINISH IS, IS ALSO A GUESS\n"
@@ -3226,6 +3295,18 @@ class MyAgent(Agent):
         # it the other way round -- so it is counted, reported in the
         # result, and nudged on.
         self._goal_misses = 0
+        # Searches that visited every state their simulator admits and
+        # still found nothing. Distinct from a goal miss: that is one
+        # hypothesis failing, this is all of them, and only this one
+        # points back at `predict`.
+        self._exhaustions = 0
+        # What the model's CURRENT `predict` scores against everything
+        # really played, measured by the turn rather than reported by the
+        # model. `_verify_best` is the model's own high-water mark and is
+        # not a check on anything; this is.
+        self._verify_live = 0.0
+        self._verify_live_best = 0.0
+        self._verify_peak = 0.0
         # Actions the model took inside the current turn, and the frame it
         # was last handed, which `action()` diffs against to report
         # `changed`.
@@ -3669,6 +3750,46 @@ class MyAgent(Agent):
         )
         return report
 
+    def _note_exhaustion(self, out: dict[str, Any], missed: int) -> None:
+        """Attach the too-small-simulator diagnosis to a search result."""
+        note = exhaustion_note(out.get("reason", ""), out.get("nodes", 0), missed)
+        if note:
+            self._exhaustions += 1
+            out["exhausted"] = note
+            logger.info(
+                "%s: search exhausted its own state space (%d states, "
+                "%d goals unreached)",
+                self.game_id, out.get("nodes", 0), missed,
+            )
+
+    def _autoverify(self) -> Optional[dict[str, Any]]:
+        """Re-score the model's live `predict` against what was really played.
+
+        Runs every turn, unasked, because v18 showed the model will not do
+        it: four verifies in turn 2, then 140 further actions on the
+        strength of a 1.00 measured over thirteen transitions. Costs no
+        actions -- the transitions were billed when they happened.
+        """
+        predict = self._llm_ns.get("predict")
+        if not callable(predict) or not self._transitions:
+            return None
+        try:
+            report = verify_predictions(
+                predict, list(self._transitions), AUTOVERIFY_LIMIT
+            )
+        except Exception:  # noqa: BLE001 - never let a checkup end the game
+            return None
+        # Compare against the best anyone has measured -- the model's own
+        # high-water mark OR this check's -- and take that reading BEFORE
+        # folding today's in, or a simulator can only ever drift against
+        # itself. Using `_verify_best` alone was wrong: it is whatever the
+        # model last reported, and a model that never calls verify() has
+        # it sitting at zero while its simulator rots unnoticed.
+        self._verify_peak = max(self._verify_best, self._verify_live_best)
+        self._verify_live = report["accuracy"]
+        self._verify_live_best = max(self._verify_live_best, self._verify_live)
+        return report
+
     def _plan_inputs(
         self, actions: Optional[list[Any]], start: Any
     ) -> tuple[Optional[tuple[tuple[int, ...], ...]], list[Any]]:
@@ -3722,6 +3843,10 @@ class MyAgent(Agent):
         out = plan_actions(predict, is_goal, board, actions, **kwargs)
         self._plan_calls += 1
         self._plans_found += 1 if out["found"] else 0
+        self._note_exhaustion(
+            out, len(out.get("unreachable") or [])
+            or (0 if out["found"] else len(name_goals(is_goal)))
+        )
         logger.info(
             "%s: plan #%d: %s (%d states, %s)",
             self.game_id, self._plan_calls,
@@ -3760,6 +3885,7 @@ class MyAgent(Agent):
             }
         out = plan_tour(predict, goals, board, actions, **kwargs)
         self._tour_calls += 1
+        self._note_exhaustion(out, len(out["unreachable"]))
         logger.info(
             "%s: tour #%d: %d actions through %d/%d goals (%d states, %s)",
             self.game_id, self._tour_calls, len(out["actions"]),
@@ -3887,19 +4013,49 @@ class MyAgent(Agent):
         # and nothing else, which says the loop works but not whether the
         # model is playing or thrashing -- and on a quadratic metric the
         # actions-per-turn number is the one that decides the score.
+        live = self._autoverify()
+
         logger.info(
             "%s: model turn %d: %d actions in %.0fs (%s, %d tool calls, "
-            "level %d, %d total) | predict %.2f best over %d verifies, "
-            "%d/%d plans found, %d tours, %d goal misses",
+            "level %d, %d total) | predict %.2f live / %.2f claimed over "
+            "%d transitions, %d verifies, %d/%d plans found, %d tours, "
+            "%d goal misses, %d exhaustions",
             self.game_id, self._llm_turns, self._turn_actions,
             time.monotonic() - started, outcome["stop"],
             outcome["tool_calls"], self._turn_level, self._steps,
-            self._verify_best, self._verify_calls,
+            self._verify_live, self._verify_best,
+            live["checked"] if live else 0, self._verify_calls,
             self._plans_found, self._plan_calls,
-            self._tour_calls, self._goal_misses,
+            self._tour_calls, self._goal_misses, self._exhaustions,
         )
 
-        if self._goal_misses and not self._tour_calls:
+        if self._exhaustions:
+            # The v18 failure, and the deepest of the three: a model here
+            # has a simulator, has planned with it, has toured candidate
+            # goals, and has run out of world. Nothing below is worth
+            # saying while the state space itself is wrong.
+            self._llm_note = (
+                "Your search has now visited every state your `predict` "
+                "says exists and finished nothing. Stop writing goals -- "
+                "there is nowhere left for them to be. Your simulator is "
+                "missing state: something on the board changes that your "
+                "`predict` copies over unchanged. Find it, model it, and "
+                "verify against ALL the moves you have played, not the "
+                "last few."
+            )
+        elif live and self._verify_peak - self._verify_live > AUTOVERIFY_DRIFT:
+            # The mechanism behind v18: a 1.00 measured once, over thirteen
+            # transitions, trusted for a hundred and forty actions after.
+            self._llm_note = (
+                f"Checked for you, free: your current `predict` scores "
+                f"{self._verify_live:.0%} against the last "
+                f"{live['checked']} moves actually played, not the "
+                f"{self._verify_peak:.0%} it reached before. You have been "
+                "planning with a simulator that no longer matches the "
+                "game. Re-read `wrong` from verify(predict) and fix it "
+                "before spending another action."
+            )
+        elif self._goal_misses and not self._tour_calls:
             # The v17 failure, addressed where it happened. Outranks the
             # plan nudge because it is strictly later in the same
             # pipeline: a model here already has a simulator and already
