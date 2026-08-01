@@ -926,6 +926,75 @@ def test_planning_attempts_are_counted_separately_from_successes(monkeypatch):
     assert a._plans_found == 1
 
 
+def test_a_usable_model_that_never_planned_is_called_out(monkeypatch):
+    """The exact v16 failure. It drove verify accuracy from 0.04 to 0.58,
+    called plan() zero times in the whole run, and went back to playing
+    actions one at a time. Reaching a usable model and not planning with it
+    is the most expensive state the agent can sit in, so it is named."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "action('ACTION1')\nresult = verify(predict)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_best >= agent_mod.PLAN_NUDGE_ACCURACY
+    assert a._plan_calls == 0
+    assert "not called plan() once" in a._llm_note
+
+
+def test_the_nudge_stops_once_it_has_planned(monkeypatch):
+    """Otherwise it becomes noise the model learns to skip."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code=SLIDE_RIGHT + "action('ACTION1')\nverify(predict)\n"
+                                  "result = plan(predict, lambda g: False)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._plan_calls == 1
+    assert "not called plan() once" not in a._llm_note
+
+
+def test_a_weak_model_is_not_nudged_to_plan(monkeypatch):
+    """Planning on a model that is wrong about everything wastes a turn."""
+    env = _FakeEnv(_frame(_grid(mark=(1, 1, 5))), [_frame(_grid(mark=(1, 2, 5)))])
+    a = _turn_agent(env)
+    wrong = SLIDE_RIGHT.replace("rows[y][x + 1]", "rows[y][x - 1]")
+    _script(monkeypatch, [
+        _reply(code=wrong + "action('ACTION1')\nresult = verify(predict)"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._verify_best == 0.0
+    assert "not called plan() once" not in a._llm_note
+
+
+def test_the_prompt_no_longer_gates_planning_on_perfection():
+    """The bug that cost v16 its whole run: 'verify again until accuracy is
+    1.0' is a gate that never opens on a board with any noise in it, and
+    the model obeyed it literally."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "until accuracy is 1.0" not in prompt
+    assert "Do NOT wait for 1.0" in prompt
+    assert "never calling `plan`" in prompt
+
+
+def test_the_prompt_forbids_the_repeat_loop_by_name():
+    """v16 turns 6 and 7 ran `for i in range(10): action('ACTION4')` and
+    spent 104 actions between them."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "for i in range(10): action" in prompt
+    assert "no more than twenty" in prompt
+
+
 def test_the_prompt_teaches_the_free_tools():
     prompt = agent_mod.build_system_prompt([1, 2, 6])
     assert "verify(predict)" in prompt

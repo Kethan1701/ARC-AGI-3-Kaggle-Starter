@@ -139,7 +139,14 @@ SMOKE_STEPS = 1200
 # and stops on its own, so a slow turn shortens the run instead of
 # overrunning Save & Run All. Forty minutes on top of ~6 minutes of server
 # startup keeps the whole notebook comfortably inside its limit.
-SMOKE_SECONDS = 2400
+#
+# v16 spent all of 2400s and got 7 turns and 140 actions out of it -- it
+# died on this budget, not on SMOKE_STEPS, with verify accuracy still
+# climbing when the clock ran out. An hour buys the turns it needed to
+# finish converging. It costs nothing in the real run: there the 25 games
+# are played concurrently in one process, so an hour per game is normal
+# rather than 25 hours of work.
+SMOKE_SECONDS = 3600
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #

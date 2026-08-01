@@ -1188,7 +1188,22 @@ LLM_MAX_FAILURES = _env_int("ARC_LLM_MAX_FAILURES", 3)
 # most of what those calls were doing was reconstructing by arithmetic what
 # it can now simply look at. If turns still end at the cap with the image in
 # place, the problem is the loop, not the budget.
-LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 6)
+#
+# v16 ended every turn at the cap, so by that test the problem is the loop.
+# Reading the calls themselves says otherwise, and the test was too coarse.
+# In v15 the six calls repeated one another because the board never
+# refreshed. In v16 they are six DIFFERENT experiments -- test ACTION2,
+# move up seven times and look, write find_mouth, test left/right, test
+# right, test a click -- and across them verify accuracy went 0.04 -> 0.25
+# -> 0.58. That is a turn running out of room mid-investigation, not a loop.
+#
+# The distinguishing evidence is content and accuracy, not whether the cap
+# was reached, so the cap moves to 12. A turn boundary is not free: it
+# re-sends the system prompt, the segmentation and a fresh image, so a cap
+# set below what the work needs buys overhead rather than thinking. If v17
+# still ends every turn at 12 AND accuracy has stopped climbing, then it is
+# the loop and this should come back down rather than up.
+LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
 
 PYTHON_TOOL_SCHEMA = {
     "type": "function",
@@ -1489,6 +1504,21 @@ PLAN_SECONDS = _env_float("ARC_LLM_PLAN_SECONDS", 10.0)
 # for in billed actions, so replaying them against a candidate `predict` is
 # the one kind of evidence that costs nothing to collect twice.
 TRANSITION_LOG = _env_int("ARC_LLM_TRANSITION_LOG", 400)
+
+# When a forward model is good enough to be worth planning with.
+#
+# v16 is the reason this exists. The model built a real simulator -- it
+# found the movable piece by colour, computed its bounding box, worked out
+# that a move shifts it five cells -- and drove verify accuracy from 0.04
+# to 0.58. Then it called `plan` zero times in the entire run and went back
+# to playing actions one at a time to see what happened.
+#
+# The prompt caused that: it said to fix `predict` "until accuracy is 1.0",
+# which on a board with any noise in it is a gate that never opens. The
+# wording is fixed, and this is the belt to that pair of braces -- if the
+# model has something worth planning with and has not planned, it gets told
+# so directly on the next turn.
+PLAN_NUDGE_ACCURACY = _env_float("ARC_LLM_PLAN_NUDGE", 0.5)
 
 
 # The board, drawn. `Qwen3_5ForConditionalGeneration` initialises a ViT and
@@ -1899,26 +1929,43 @@ def build_system_prompt(available: list[int]) -> str:
         "the rule, then spend actions only on a route you have already "
         "checked. You are given tools that make everything except the "
         "final route free, and the method is exactly these four steps:\n"
-        "  1. PROBE. Spend a handful of actions -- ten is plenty -- to see "
-        "what each action does. This is the only exploring you should pay "
-        "for.\n"
+        "  1. PROBE. Spend a handful of actions -- about ten, and no more "
+        "than twenty -- to see what each action does. Play each action "
+        "ONCE and read the result. This is the only exploring you should "
+        "pay for.\n"
+        "     NEVER write `for i in range(10): action(...)`. That is ten "
+        "billed actions buying one fact, and it is the most expensive "
+        "mistake available to you.\n"
         "  2. MODEL. Write `predict(grid, act) -> grid`: given a board and "
         "an action label, return the board you expect next. Then call "
         "`verify(predict)`. It replays every real move this game has "
         "already made and tells you where you were wrong, down to the "
-        "cell. It bills NOTHING, so run it as often as you like. Fix "
-        "`predict` and verify again until accuracy is 1.0.\n"
-        "  3. PLAN. Write `is_goal(grid) -> bool` describing the board you "
-        "are trying to reach. Call `plan(predict, is_goal)`. It breadth-"
+        "cell. It bills NOTHING, so run it as often as you like.\n"
+        "  3. PLAN as soon as `predict` is roughly right -- around 0.8 "
+        "accuracy, or sooner if it is right about the moves you care "
+        "about. Do NOT wait for 1.0 and do NOT keep probing to chase it. "
+        "A partly-right model that finds a short route is worth far more "
+        "than a perfect one you never planned with, because executing the "
+        "route is what tells you the rest.\n"
+        "     Write `is_goal(grid) -> bool` describing the board you are "
+        "trying to reach, and call `plan(predict, is_goal)`. It breadth-"
         "first searches YOUR simulator and returns the shortest action "
-        "sequence that gets there. It bills NOTHING either.\n"
+        "sequence that gets there. It bills NOTHING either. If it finds no "
+        "route, loosen `is_goal` or raise max_depth before you spend a "
+        "single action.\n"
         "  4. EXECUTE. Pass that sequence straight to `action(...)`. Only "
         "now are you charged, and only for a route you already know works. "
         "The result comes back with `mispredicted`: the places the real "
         "board diverged from `predict`. If that list is non-empty your "
-        "model is wrong -- go back to step 2 with the counterexample.\n"
+        "model is wrong -- go back to step 2 with the counterexample, "
+        "which is worth more than any amount of further probing because it "
+        "is the exact case your model gets wrong.\n"
         "Being wrong in the simulator is free. Being wrong in the game is "
         "quadratic. Do your being-wrong in the simulator.\n"
+        "The failure to avoid: building a good `predict` and then never "
+        "calling `plan`, and drifting back to playing actions one at a "
+        "time to see what happens. If you have a `predict` worth anything "
+        "at all, plan with it.\n"
         "Your variables persist between turns, so the model you build and "
         "the notes you keep survive. Build them once and improve them; do "
         "not start over each turn.\n"
@@ -3525,7 +3572,19 @@ class MyAgent(Agent):
             self._plans_found, self._plan_calls,
         )
 
-        if self._turn_actions == 0:
+        if self._verify_best >= PLAN_NUDGE_ACCURACY and not self._plan_calls:
+            # The v16 failure, addressed where it happened. Takes priority
+            # over the no-action nudge below: a model sitting on a usable
+            # simulator and probing by hand is burning the score far faster
+            # than one that thought for a turn without moving.
+            self._llm_note = (
+                f"You have a forward model that is {self._verify_best:.0%} "
+                "accurate and you have not called plan() once. Stop probing "
+                "and plan with it now: plan(predict, is_goal) costs no "
+                "actions, and executing what it finds is what will tell you "
+                "the rest. Do not wait for predict to be perfect."
+            )
+        elif self._turn_actions == 0:
             # Called out separately: a model that reasons and never acts
             # looks exactly like a working run from the outside, while the
             # search quietly plays the whole game.
