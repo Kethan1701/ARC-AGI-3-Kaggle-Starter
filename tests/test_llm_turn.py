@@ -570,6 +570,44 @@ def test_a_forward_model_written_one_turn_survives_to_the_next(monkeypatch):
     assert "moved" in tools[-1], "the simulator did not survive the turn"
 
 
+def test_the_grid_the_model_sees_updates_when_it_acts(monkeypatch):
+    """Straight from the v15 logs. The model wrote:
+
+        result2 = action('ACTION2')
+        for y in range(64):
+            if grid[y][x] != state_after_action1[y][x]: ...
+
+    and later commented "The grid variable should have been updated". It
+    was not -- `grid` was bound once per turn -- so every diff compared a
+    board against itself and reported no change whatever the action did.
+    """
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(2, 2, 7)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="before = grid\naction('ACTION1')\nresult = (grid is before, grid[2][2])"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m["content"] for m in a._llm_messages if m.get("role") == "tool"][0]
+    assert "(False, 7)" in tool, f"grid did not refresh after action(): {tool[:200]}"
+
+
+def test_current_frame_refreshes_alongside_the_grid(monkeypatch):
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(2, 2, 7)))])
+    a = _turn_agent(env)
+    _script(monkeypatch, [
+        _reply(code="action('ACTION1')\nresult = sorted(n['color'] for n in current_frame['nodes'])"),
+        _reply(content="ok"),
+    ])
+
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    tool = [m["content"] for m in a._llm_messages if m.get("role") == "tool"][0]
+    assert "7" in tool, "current_frame still describes the old board"
+
+
 def test_notes_survive_and_are_read_back(monkeypatch):
     """Eviction trims the transcript, so this is the only memory that
     outlives it."""

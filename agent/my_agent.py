@@ -1003,6 +1003,11 @@ class ToolTimeout(Exception):
     """Model-written code outran TOOL_TIMEOUT."""
 
 
+# Sentinel for "this key was absent", so restoring can tell a missing key
+# from one that was legitimately set to None.
+_MISSING = object()
+
+
 def _tool_builtins() -> dict[str, Any]:
     """Builtins for sandboxed code, with the obvious foot-guns removed.
 
@@ -1077,7 +1082,18 @@ def run_python_tool(
         buffer.append(text)
         written += len(text)
 
-    scope = dict(namespace)
+    # The namespace IS the execution scope -- not a copy of it.
+    #
+    # It used to be `dict(namespace)`, copied in and merged back out at the
+    # end. That quietly defeated `action(...)`: the callable refreshes `grid`
+    # and `current_frame` in the namespace as the board moves, but the
+    # running code was reading a snapshot taken before it started, so the
+    # board never appeared to change no matter what was played -- and the
+    # merge afterwards then wrote the stale snapshot back over the fresh
+    # values. Executing in the real dict makes the refresh visible where it
+    # has to be: inside the model's own code, between its own statements.
+    scope = namespace
+    saved = {k: scope.get(k, _MISSING) for k in ("__builtins__", "print", "result")}
     scope["__builtins__"] = _tool_builtins()
     scope["print"] = tool_print
     scope.pop("result", None)
@@ -1110,9 +1126,15 @@ def run_python_tool(
     finally:
         sys.settrace(previous)
 
-    namespace.update(
-        {k: v for k, v in scope.items() if k not in ("__builtins__", "print")}
-    )
+    result = scope.get("result")
+    # Put back only what we borrowed. The model's own definitions stay --
+    # that persistence is the point -- but `print` and `__builtins__` are
+    # ours and must not leak into the next call's view of its workspace.
+    for key, value in saved.items():
+        if value is _MISSING:
+            scope.pop(key, None)
+        else:
+            scope[key] = value
 
     stdout = "".join(buffer)
     truncated = len(stdout) > output_limit
@@ -1121,7 +1143,7 @@ def run_python_tool(
 
     return {
         "stdout": stdout,
-        "result": scope.get("result"),
+        "result": result,
         "error": error,
         "truncated": truncated,
     }
@@ -2948,7 +2970,27 @@ class MyAgent(Agent):
 
         del self._llm_history[:-LLM_HISTORY]
 
-        view = segment_frame(grid_of(frame), self._volatile) if frame else {}
+        new_grid = grid_of(frame) if frame else ()
+        view = segment_frame(new_grid, self._volatile) if frame else {}
+
+        # Write the new board back into the model's workspace.
+        #
+        # This was missing, and it broke the model's main way of learning
+        # anything. `grid` was bound once at the start of a turn, so after
+        # `action(...)` it still held the PREVIOUS board -- while the model's
+        # own code, logged from the v15 run, did exactly this:
+        #
+        #     result2 = action('ACTION2')
+        #     for y in range(64):
+        #         if grid[y][x] != state_after_action1[y][x]: ...
+        #
+        # and, in a later call, said in a comment: "The grid variable should
+        # have been updated." It should have. Diffing a board against itself
+        # reports no change no matter what the action did, so thirty turns of
+        # probing taught it nothing about any action.
+        self._llm_ns["grid"] = new_grid
+        self._llm_ns["current_frame"] = view
+        self._llm_ns["previous_frame"] = self._last_view
         self._last_view = view
         return {
             "steps": ran,
