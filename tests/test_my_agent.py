@@ -642,3 +642,190 @@ def test_an_erratic_cell_does_not_trigger_the_early_mask(monkeypatch):
         flat[3 * width + 3] = (step // 3) % 6
         frames.append(flat)
     assert _feed(_blank_agent(), frames, width, height) is None
+
+
+# -- Masking the widget, not the line (see `_widget_span`) -------------
+#
+# ls20 is the case these exist for. Its step counter occupies rows 61-62
+# of the frame; the only display of the avatar's shape, colour and
+# rotation is a 10x10 box sharing those rows. Masking the rows end to
+# end takes the box with the counter, and those three attributes are the
+# whole game -- you clear a level by standing on a target while matching
+# its triple, and they appear nowhere else on the board.
+_W = 16
+_ROW = 10
+_BAR = range(4, 12)        # the counter
+_READOUT = range(0, 3)     # a status box beside it, in the same row
+
+
+def _bar_frames(drained):
+    """Two frames of a bar draining left to right, as flat bytes.
+
+    `drained` is how many segments have gone. The readout keeps a colour
+    of its own throughout, which is what should save it from the mask.
+    """
+    out = []
+    for gone in (0, drained):
+        flat = [0] * (_W * _W)
+        for x in _READOUT:
+            flat[_ROW * _W + x] = 5
+        for i, x in enumerate(_BAR):
+            flat[_ROW * _W + x] = 1 if i < gone else 3
+        out.append(bytes(flat))
+    return out
+
+
+def _bar_counts(changed):
+    """cell_changes/row_changes for a bar whose first `changed` cells moved."""
+    cells = [0] * (_W * _W)
+    for x in list(_BAR)[:changed]:
+        cells[_ROW * _W + x] = 10       # well under the per-cell cutoff
+    rows = [0] * _W
+    rows[_ROW] = 95                     # the row itself is unmistakable
+    return cells, rows
+
+
+def test_the_mask_stops_at_the_edge_of_the_widget():
+    cells, rows = _bar_counts(4)
+    mask = agent.hud_mask(
+        cells, rows, [0] * _W, 100, _W, _W, frames=_bar_frames(4), span=True
+    )
+    assert mask == {_ROW * _W + x for x in _BAR}
+
+
+def test_a_readout_sharing_the_row_survives():
+    """The regression this whole change exists to prevent."""
+    cells, rows = _bar_counts(4)
+    mask = agent.hud_mask(
+        cells, rows, [0] * _W, 100, _W, _W, frames=_bar_frames(4), span=True
+    )
+    assert not any(_ROW * _W + x in mask for x in _READOUT)
+
+
+def test_the_span_covers_the_part_of_the_bar_that_has_not_moved_yet():
+    """A bar drains one segment per step, so a 25-frame warmup sees only
+    its leading edge. Masking just the cells that changed leaves the rest
+    of the counter in the state key, and a counter in the key mints a new
+    node every step -- measured on ls20 as 96 nodes becoming 735."""
+    cells, rows = _bar_counts(2)
+    mask = agent.hud_mask(
+        cells, rows, [0] * _W, 100, _W, _W, frames=_bar_frames(2), span=True
+    )
+    assert mask == {_ROW * _W + x for x in _BAR}
+
+
+def test_without_frames_the_span_is_only_what_changed():
+    """No evidence of the widget's colours means no basis to grow, so it
+    falls back to the cells actually seen moving rather than guessing."""
+    cells, rows = _bar_counts(2)
+    mask = agent.hud_mask(cells, rows, [0] * _W, 100, _W, _W, span=True)
+    assert mask == {_ROW * _W + x for x in list(_BAR)[:2]}
+
+
+def test_the_whole_row_is_masked_by_default():
+    """The span rule ships off: it is correct and it costs score (see
+    MASK_SPAN). The default therefore has to be the whole-line rule that
+    produced 0.1299, exactly, or the A/B measures two changes at once."""
+    assert agent.MASK_SPAN == 0
+    cells, rows = _bar_counts(4)
+    mask = agent.hud_mask(
+        cells, rows, [0] * _W, 100, _W, _W, frames=_bar_frames(4)
+    )
+    assert mask == set(range(_ROW * _W, _ROW * _W + _W))
+
+
+# -- The status band (see `status_band`) -------------------------------
+def test_the_band_is_what_shares_the_line_but_does_not_tick():
+    rows = [0] * _W
+    rows[_ROW] = 95
+    volatile = frozenset(_ROW * _W + x for x in _BAR)
+    band = agent.status_band(rows, [0] * _W, volatile, 100, _W, _W)
+    assert set(band) == {
+        _ROW * _W + x for x in range(_W) if x not in _BAR
+    }
+
+
+def test_the_band_is_empty_when_no_line_ticks():
+    assert agent.status_band([0] * _W, [0] * _W, frozenset(), 100, _W, _W) == ()
+
+
+def test_a_band_the_size_of_the_board_is_not_a_band():
+    """Every row ticking means the reading is the board, and re-opening
+    the map whenever the board changes would mean never settling."""
+    band = agent.status_band(
+        [100] * _W, [0] * _W, frozenset(), 100, _W, _W
+    )
+    assert band == ()
+
+
+# -- Telling a respawn from a discovery (see `_check_status`) ----------
+def _status_agent():
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._steps = 0
+    a._status_idx = (0, 1)
+    a._status = None
+    a._status_reopens = 0
+    a._status_boards = {}
+    a._board_idx = (2, 3)
+    a._kept = None
+    a._last_flat = None
+    a._level_start_node = None
+    a._level_start_board = None
+    a._last_respawn = None
+    a._respawn_period = 0
+    a._respawns = 0
+    a._total = {1: 1}
+    a._cursor = {1: 3}
+    a._plan = agent.deque()
+    return a
+
+
+def _read(a, status, board, step):
+    a._steps = step
+    a._last_flat = tuple(status) + tuple(board)
+    return a._check_status(node=1)
+
+
+def test_a_status_change_on_a_new_board_re_opens_the_map(monkeypatch):
+    monkeypatch.setattr(agent, "STATUS_REOPEN", 1)
+    a = _status_agent()
+    _read(a, (1, 1), (7, 7), 0)
+    assert _read(a, (2, 1), (8, 8), 10) is True
+    assert a._cursor == {}
+
+
+def test_a_status_change_back_onto_a_known_board_is_a_respawn(monkeypatch):
+    """ls20 dies every 42 steps and puts the avatar back at the start.
+    That moves the readout too, and means the opposite thing: nothing was
+    learned. Before this check the search re-opened every 43 actions and
+    level 1 stopped finishing at all inside 3000."""
+    monkeypatch.setattr(agent, "STATUS_REOPEN", 1)
+    a = _status_agent()
+    _read(a, (1, 1), (7, 7), 0)
+    _read(a, (2, 1), (9, 9), 44)       # first sighting: taken at face value
+    assert _read(a, (3, 1), (9, 9), 88) is False
+    assert a._respawns == 1
+    assert a._status_reopens == 1      # only the first sighting re-opened
+
+
+def test_the_respawn_period_is_measured():
+    a = _status_agent()
+    _read(a, (1, 1), (7, 7), 0)
+    _read(a, (2, 1), (9, 9), 44)
+    _read(a, (3, 1), (9, 9), 88)
+    _read(a, (4, 1), (9, 9), 131)
+    assert a._respawn_period == 43
+
+
+def test_re_opening_is_off_by_default():
+    """It is subsumed: the readout is in the state key, so a square that
+    rejected the agent at one rotation is a different node from the same
+    square at another, with its own untried candidates. Re-opening only
+    replays edges already recorded, and on ls20 turned a 914-action level
+    1 into one that never finished."""
+    assert agent.STATUS_REOPEN == 0
+    a = _status_agent()
+    _read(a, (1, 1), (7, 7), 0)
+    assert _read(a, (2, 1), (8, 8), 10) is False
+    assert a._cursor == {1: 3}

@@ -650,6 +650,47 @@ MASK_MIN_DISTINCT = _env_int("ARC_MASK_MIN_DISTINCT", 2)
 # collapse unrelated states together.
 MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 
+# The status band is what shares a row or column with the HUD without
+# ticking itself (see `status_band`). Capped for the same reason the mask
+# is: past a certain size the "band" is just the board, and re-opening
+# the whole map every time any of it changes would mean never settling.
+STATUS_BAND_CAP = _env_float("ARC_STATUS_BAND_CAP", 0.10)
+
+# Mask a ticking row/column only across the widget that ticks on it,
+# rather than end to end. Off restores the whole-line rule that produced
+# the 0.1299 baseline, which is what makes the two comparable.
+# Measured over the 25 dev games, correctness is not free here. The span
+# mask stops conflating states that differ only by the avatar's shape,
+# colour and rotation -- which is what ls20's levels 3-7 are actually
+# about -- and the honest map is ~24x larger, so blind search takes
+# longer to cross it. Cost of level 1, span on vs off: sp80 138 vs 79,
+# vc33 169 vs 100, r11l 205 vs 113, ls20 914 vs 527. The score is
+# quadratic in actions, so on sp80 -- our best game at 1.19 -- that is
+# 24.4 points of level score becoming 8.0.
+#
+# So it ships off. Not because it is wrong: because a truer state key
+# with no search able to exploit it is worth less than the score it
+# costs. The respawn detector it enables runs either way (see
+# `_learn_mask`), which is the part that pays today.
+MASK_SPAN = _env_int("ARC_MASK_SPAN", 0)
+
+# Re-open exhausted nodes when the status readout changes -- the idea
+# being that a wall the agent bounced off as one thing may not be a wall
+# once it has become another. Default OFF, because measurement says the
+# premise is already handled: the readout is part of the state key, so
+# "goal square at rotation 270" and "goal square at rotation 0" are
+# different nodes with their own cursors, and re-opening only replays
+# edges already recorded. On ls20 it turned a 914-action level 1 into one
+# that never finished inside 3000. Kept, off, because a game that shows
+# status the agent cannot key on would need exactly this.
+STATUS_REOPEN = _env_int("ARC_STATUS_REOPEN", 0)
+
+# Cap on how many times a status change may re-open the map. A game whose
+# readout flickers would otherwise reset the search forever and never
+# close a level; ls20 changes it once per modifier tile, so a small
+# allowance is plenty and an unbounded one is only a risk.
+STATUS_REOPEN_LIMIT = _env_int("ARC_STATUS_REOPEN_LIMIT", 40)
+
 # The base class keeps every frame it has ever seen in `self.frames` and
 # appends a full 64x64 frame to a JSONL recording on every action. At the
 # stock 80-action cap that is nothing; at our cap it is fatal. 250k
@@ -2626,6 +2667,114 @@ def lattice_targets(
     ]
 
 
+def _widget_span(
+    cell_changes: list[int],
+    frames: list[bytes],
+    start: int,
+    stride: int,
+    length: int,
+) -> Optional[tuple[int, int]]:
+    """Offsets of the first and last cell of the widget ticking on a line.
+
+    `start`/`stride`/`length` address one row (start=y*width, stride=1)
+    or one column (start=x, stride=width). Returns None when nothing on
+    the line ever moved, which cannot happen for a line that qualified
+    but is cheap to be safe about.
+
+    The cells that changed during warmup are only *part* of the widget.
+    A bar that drains one segment per step shows nothing but its leading
+    edge in a short warmup: the undrained tail never changes, so a span
+    built from changed cells alone stops short and leaves most of the
+    counter in the state key. That is worse than masking the whole row,
+    because a counter in the key mints a fresh node every single step.
+    Measured on ls20: changed-cells-only masks 50 of the counter's 84
+    cells and the map goes from 96 nodes to 735.
+
+    So grow outward from the changed cells while the colour is one those
+    cells themselves have worn at some point in warmup -- that is the
+    rest of the same widget -- and stop at the first pixel that is not.
+    Striking the line's dominant colour from that palette first looks
+    like the right guard against a widget drawn in the background
+    colour, and is not: a bar wide enough to be worth masking is often
+    the most common thing on its own row, so the guard deletes exactly
+    the colour the extension needs. The check that works is on the
+    result -- an extension that swallows the whole line never found a
+    boundary, so fall back to the cells actually seen moving.
+    """
+    changed = [o for o in range(length) if cell_changes[start + o * stride]]
+    if not changed:
+        return None
+    first, last = changed[0], changed[-1]
+
+    usable = [f for f in frames if len(f) > start + (length - 1) * stride]
+    if not usable:
+        return (first, last)
+    latest = usable[-1]
+    line = [latest[start + o * stride] for o in range(length)]
+    palette = {f[start + o * stride] for f in usable for o in changed}
+
+    grown_first, grown_last = first, last
+    while grown_first > 0 and line[grown_first - 1] in palette:
+        grown_first -= 1
+    while grown_last < length - 1 and line[grown_last + 1] in palette:
+        grown_last += 1
+
+    # Growing across the entire line means the widget's colours are also
+    # the line's background, so there was never a boundary to find and
+    # the "widget" is indistinguishable from everything beside it. Fall
+    # back to what was actually seen moving rather than mask the lot --
+    # masking a whole line is the failure this function exists to avoid.
+    if grown_first == 0 and grown_last == length - 1 and (first, last) != (0, length - 1):
+        return (first, last)
+    return (grown_first, grown_last)
+
+
+def status_band(
+    row_changes: list[int],
+    col_changes: list[int],
+    volatile: frozenset[int],
+    samples: int,
+    width: int,
+    height: int,
+    threshold: float = VOLATILE_THRESHOLD,
+) -> tuple[int, ...]:
+    """Kept cells that share a line with the HUD -- the status readout.
+
+    A widget that ticks every step is a counter and gets masked. What
+    sits beside it on the same rows is usually the rest of the same
+    status bar: lives, a score, and -- on ls20 -- a 10x10 box that is
+    the *only* place the avatar's shape, colour and rotation are drawn.
+
+    Those cells matter for a reason the search cannot otherwise reach.
+    When the agent walks over a tile that recolours or rotates it, the
+    board does not change at all; only this readout does. Every wall the
+    agent has bounced off, every node it has written off as exhausted,
+    was concluded under the old reading and may be wrong under the new
+    one -- on ls20 the level's goal square is passable only at the right
+    rotation, so it is literally a wall that stops being one. Watching
+    this band is what lets the agent notice it has become a different
+    thing and re-open what it thought it had settled.
+
+    Returns the flat indices in ascending order, empty when no line
+    qualified or when the band would be so large it is really the board.
+    """
+    total = width * height
+    if samples <= 0 or total <= 0:
+        return ()
+    cutoff = threshold * samples
+    rows = {y for y, count in enumerate(row_changes) if count >= cutoff}
+    cols = {x for x, count in enumerate(col_changes) if count >= cutoff}
+    if not rows and not cols:
+        return ()
+    band = tuple(
+        index
+        for index in range(total)
+        if index not in volatile
+        and (index // width in rows or index % width in cols)
+    )
+    return () if len(band) > STATUS_BAND_CAP * total else band
+
+
 def hud_mask(
     cell_changes: list[int],
     row_changes: list[int],
@@ -2635,15 +2784,29 @@ def hud_mask(
     height: int,
     threshold: float = VOLATILE_THRESHOLD,
     cap_fraction: float = MASK_CAP_FRACTION,
+    frames: Optional[list[bytes]] = None,
+    span: Optional[bool] = None,
 ) -> frozenset[int]:
     """Flat cell indices to exclude from the node key, or an empty set.
 
     A cell qualifies if it changed in `threshold` of transitions, and so
-    does every cell of any row or column that contained *some* change in
-    that fraction of transitions. The row/column rule is the one that
-    matters: a shrinking progress bar advances one segment per step, so
-    no individual bar cell is volatile, but the bar's rows change
-    constantly.
+    does the *ticking span* of any row or column that contained some
+    change in that fraction of transitions. The row/column rule is the
+    one that matters: a shrinking progress bar advances one segment per
+    step, so no individual bar cell is volatile, but the bar's rows
+    change constantly.
+
+    The span is what keeps that rule honest. Masking the whole row is
+    collateral damage on anything that shares it, and on ls20 the thing
+    sharing it is the only display of the avatar's shape, colour and
+    rotation -- a 10x10 box at rows 55-64, cols 3-12, whose bottom two
+    rows are also the step counter's. Those three attributes are the
+    entire puzzle (you clear a level by standing on a target while
+    matching its triple) and they appear nowhere else on the board, so
+    masking them fuses states that differ by the only thing that counts.
+    Restricting to the span that actually ticks can only re-admit cells
+    that never changed during warmup, so it cannot reintroduce a
+    counter; it just stops the counter taking its neighbours with it.
 
     Returns empty if nothing qualifies or if more than `cap_fraction` of
     the frame does -- at that point the reading is not a HUD, and masking
@@ -2653,14 +2816,30 @@ def hud_mask(
     if samples <= 0 or total <= 0:
         return frozenset()
 
+    kept_frames = [f for f in (frames or []) if len(f) == total]
+    by_span = MASK_SPAN if span is None else span
     cutoff = threshold * samples
     masked = {index for index, count in enumerate(cell_changes) if count >= cutoff}
     for y, count in enumerate(row_changes):
-        if count >= cutoff:
-            masked.update(range(y * width, y * width + width))
+        if count < cutoff:
+            continue
+        span = (
+            _widget_span(cell_changes, kept_frames, y * width, 1, width)
+            if by_span else (0, width - 1)
+        )
+        if span is None:
+            continue
+        masked.update(range(y * width + span[0], y * width + span[1] + 1))
     for x, count in enumerate(col_changes):
-        if count >= cutoff:
-            masked.update(range(x, total, width))
+        if count < cutoff:
+            continue
+        span = (
+            _widget_span(cell_changes, kept_frames, x, width, height)
+            if by_span else (0, height - 1)
+        )
+        if span is None:
+            continue
+        masked.update(range(x + span[0] * width, x + span[1] * width + 1, width))
 
     if not masked or len(masked) > cap_fraction * total:
         return frozenset()
@@ -3225,6 +3404,17 @@ class MyAgent(Agent):
         self._mask_frozen = False
         self._kept: Optional[tuple[int, ...]] = None   # flat indices in the key
         self._volatile: frozenset[int] = frozenset()   # flat indices excluded
+        self._status_idx: tuple[int, ...] = ()         # the status readout
+        self._status: Optional[tuple[int, ...]] = None  # its last reading
+        self._status_reopens = 0
+        self._last_flat: Optional[tuple[int, ...]] = None
+        self._level_start_node: Optional[int] = None
+        self._board_idx: Optional[tuple[int, ...]] = None
+        self._status_boards: dict[int, int] = {}
+        self._level_start_board: Optional[int] = None
+        self._last_respawn: Optional[int] = None
+        self._respawn_period = 0
+        self._respawns = 0
         # Early-fire bookkeeping (see EARLY_MASK): the last unanimous-change
         # mask proposed, and how many consecutive samples have agreed on it.
         self._early_candidate: frozenset[int] = frozenset()
@@ -3404,6 +3594,11 @@ class MyAgent(Agent):
             self._sol_edges = {}
 
         node = self._node_key(flat)
+        self._last_flat = flat
+        if self._level_start_node is None:
+            self._level_start_node = node
+            self._level_start_board = self._board_key(flat)
+        self._check_status(node)
 
         if BUDGET_REPORT_EVERY and self._steps % BUDGET_REPORT_EVERY == 0:
             self._report_budget(f"still on level {self._level}")
@@ -4412,6 +4607,106 @@ class MyAgent(Agent):
         )
         return False
 
+    def _board_key(self, flat: tuple[int, ...]) -> int:
+        """The state key with the status readout taken back out.
+
+        A respawn puts the avatar back at the start and restores every
+        tile, so the board is pixel-identical to the level opening --
+        while the status is not, because a life has gone. Comparing on
+        the board is what separates "the game reset me" from "I changed
+        into something else", and only the second makes stale verdicts
+        worth revisiting.
+        """
+        if not self._status_idx:
+            return self._node_key(flat)
+        if self._board_idx is None:
+            status = set(self._status_idx)
+            kept = self._kept
+            source = range(len(flat)) if kept is None else kept
+            self._board_idx = tuple(i for i in source if i not in status)
+        return hash(tuple(map(flat.__getitem__, self._board_idx)))
+
+    def _check_status(self, node: int) -> bool:
+        """Re-open the map when the status readout changes.
+
+        A node is written off as exhausted once every candidate from it
+        has been tried. That verdict is only ever true *for the agent
+        that tried them*. On ls20 the agent walks over a tile, its
+        rotation changes, and a goal square that rejected it five
+        actions ago now accepts it -- but the search has already spent
+        that node's cursor and will not go back. The board looks
+        identical either way; the only evidence anything happened is
+        this readout.
+
+        So when it moves, clear the cursors. Nodes keep their edges --
+        experience stays true -- but every one of them becomes worth
+        revisiting at the breadth it has already reached. Costs no
+        actions to do and is bounded by STATUS_REOPEN_LIMIT so a game
+        with a flickering readout cannot restart the search forever.
+        """
+        if not self._status_idx:
+            return False
+        flat = self._last_flat
+        if flat is None:
+            return False
+        try:
+            reading = tuple(map(flat.__getitem__, self._status_idx))
+        except IndexError:
+            # The frame resized under us; the band is indexed for the old
+            # one and will be rebuilt with the next mask.
+            self._status_idx = ()
+            return False
+
+        previous, self._status = self._status, reading
+        if previous is None or previous == reading:
+            return False
+
+        # A respawn changes the readout too, and means the opposite thing.
+        # ls20 gives 42 steps and three lives: run the counter out and it
+        # puts the avatar back at the start with its attributes reset, so
+        # the readout moves without anything having been discovered.
+        # Re-opening there restarts the search every 43 actions forever --
+        # measured before this check: 39 re-opens, every one a death.
+        #
+        # Telling them apart by comparing against the level opening does
+        # not work, because the mask is adopted ~26 actions in and drops
+        # the graph with it, so "the opening" is whatever the avatar was
+        # standing on at the time. What does work is that a respawn is a
+        # *cycle*: it returns the board to a state a previous status
+        # change already saw. Walking onto a rotation tile does not -- it
+        # happens somewhere new. So learn the boards status changes land
+        # on, and trust only the first sighting of each.
+        board = self._board_key(flat)
+        seen = self._status_boards.get(board, 0) + 1
+        self._status_boards[board] = seen
+        if seen > 1:
+            if self._last_respawn is not None:
+                self._respawn_period = self._steps - self._last_respawn
+            self._last_respawn = self._steps
+            self._respawns += 1
+            if self._respawns == 1 or self._respawns % 10 == 0:
+                logger.info(
+                    "%s: respawned at action %d (period %s, %d so far); "
+                    "plans longer than that cannot finish",
+                    self.game_id, self._steps,
+                    self._respawn_period or "?", self._respawns,
+                )
+            return False
+
+        if not STATUS_REOPEN or self._status_reopens >= STATUS_REOPEN_LIMIT:
+            return False
+
+        self._status_reopens += 1
+        self._cursor.clear()
+        self._plan.clear()
+        logger.info(
+            "%s: status readout changed at action %d; re-opening %d nodes "
+            "(%d/%d)",
+            self.game_id, self._steps, len(self._total),
+            self._status_reopens, STATUS_REOPEN_LIMIT,
+        )
+        return True
+
     def _learn_mask(self, flat: tuple[int, ...], width: int, height: int) -> bool:
         """Accumulate change rates; freeze the HUD mask when ready.
 
@@ -4475,6 +4770,7 @@ class MyAgent(Agent):
             candidate = hud_mask(
                 counts, self._row_changes, self._col_changes,
                 self._samples, width, height, threshold=1.0,
+                frames=self._mask_frames,
             )
             if not candidate or candidate != self._early_candidate:
                 self._early_candidate = candidate
@@ -4485,6 +4781,10 @@ class MyAgent(Agent):
                 return False
             # Converged. Adopt it and stop sampling.
             self._mask_frozen = True
+            self._status_idx = status_band(
+                self._row_changes, self._col_changes, candidate,
+                self._samples, width, height, threshold=1.0,
+            )
             self._cell_changes = []
             self._row_changes = []
             self._col_changes = []
@@ -4499,7 +4799,7 @@ class MyAgent(Agent):
         self._mask_frozen = True
         volatile = hud_mask(
             counts, self._row_changes, self._col_changes,
-            self._samples, width, height,
+            self._samples, width, height, frames=self._mask_frames,
         )
 
         # Nothing cleared VOLATILE_THRESHOLD. On a game with a HUD that
@@ -4526,6 +4826,7 @@ class MyAgent(Agent):
                 candidate = hud_mask(
                     counts, self._row_changes, self._col_changes,
                     self._samples, width, height, threshold=threshold,
+                    frames=self._mask_frames,
                 )
                 # An over-cap mask comes back empty, so a non-empty
                 # candidate has already cleared MASK_CAP_FRACTION.
@@ -4543,6 +4844,26 @@ class MyAgent(Agent):
                     self.game_id, VOLATILE_THRESHOLD, chosen_at, len(chosen),
                 )
                 volatile = chosen
+
+        if volatile:
+            # Deliberately not `volatile`. Under the whole-line rule the
+            # mask covers the entire row, so the band would come back
+            # empty and the respawn detector with it -- and the detector
+            # is the half of this change that pays. The band is the
+            # readout beside the widget, which is a fact about the frame
+            # and not about which masking rule is shipped, so ask for the
+            # span reading regardless. These cells are excluded from the
+            # state key under the whole-line rule; that does not stop us
+            # reading them off the frame to notice a respawn.
+            self._status_idx = status_band(
+                self._row_changes, self._col_changes,
+                hud_mask(
+                    counts, self._row_changes, self._col_changes,
+                    self._samples, width, height,
+                    frames=self._mask_frames, span=True,
+                ),
+                self._samples, width, height,
+            )
 
         # Free the counters and the retained frames; both are dead weight for
         # the rest of the run, and the frames are the larger of the two.
@@ -4565,6 +4886,16 @@ class MyAgent(Agent):
         return hash(tuple(map(flat.__getitem__, kept)))
 
     def _reset_graph(self) -> None:
+        # Node ids are about to stop meaning what they meant -- a new level,
+        # or a new mask. The opening node and the last status reading are
+        # both keyed on the old ones, so re-learn them rather than compare
+        # across the boundary and call it a respawn.
+        self._level_start_node = None
+        self._level_start_board = None
+        self._board_idx = None
+        self._status_boards = {}
+        self._status = None
+        self._last_respawn = None
         self._total.clear()
         self._cursor.clear()
         self._edges.clear()
