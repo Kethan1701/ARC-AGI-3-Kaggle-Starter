@@ -946,6 +946,9 @@ def test_the_model_outlives_the_graph():
     a = _status_agent()
     for name in ("_edges", "_fatal", "_deaths", "_cache"):
         setattr(a, name, {1: 2})
+    a._blocked = {(0, 4, 5)}
+    a._at = (5, 5)
+    a._at_confirmed = 3
     a._motion = agent.MotionModel()
     for _ in range(agent.MOTION_SAMPLES):
         a._motion.observe(1, _board((3, (5, 5))), _board((3, (4, 5))))
@@ -960,3 +963,156 @@ def test_learning_the_motion_is_on_and_costs_no_actions():
     """It reads frames the search was handed anyway. Measured on ls20:
     level 1 still costs 527 actions over 96 nodes with it running."""
     assert agent.MOTION_LEARN == 1
+
+
+# ---------------------------------------------------------------------
+# Following the avatar, and what refuses it
+# ---------------------------------------------------------------------
+
+
+def _flat(width, height, cells):
+    board = [0] * (width * height)
+    for (y, x), value in cells.items():
+        board[y * width + x] = value
+    return tuple(board)
+
+
+def _tracker():
+    """An agent that knows what the four actions do and where it is."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._steps = 0
+    a._volatile = frozenset()
+    a._at = (5, 5)
+    a._at_size = (1, 1)
+    a._at_confirmed = 1
+    a._look = 0
+    a._track_flat = None
+    a._anchors = 0
+    a._blocked = set()
+    a._skipped_blocked = 0
+    a._pending = None
+    a._motion = agent.MotionModel()
+    for _ in range(agent.MOTION_SAMPLES):
+        for action, (dy, dx) in ((1, (-1, 0)), (2, (1, 0)),
+                                 (3, (0, -1)), (4, (0, 1))):
+            a._motion.observe(
+                action,
+                _board((3, (10, 10))),
+                _board((3, (10 + dy, 10 + dx))),
+            )
+    assert a._motion.settled
+    return a
+
+
+def _walk(a, action, before, after, size=12):
+    a._pending = (0, agent.encode_action(action, None, None))
+    a._track_flat = before
+    a._track(after, size, size)
+
+
+def test_a_move_that_lands_updates_the_position():
+    a = _tracker()
+    _walk(a, 1, _flat(12, 12, {(5, 5): 3}), _flat(12, 12, {(4, 5): 3}))
+    assert a._at == (4, 5)
+    assert not a._blocked
+
+
+def test_a_move_that_goes_nowhere_records_a_wall():
+    """Neither the square we left nor the square we aimed at changed, so
+    we did not go anywhere and something is in the way."""
+    a = _tracker()
+    board = _flat(12, 12, {(5, 5): 3})
+    _walk(a, 1, board, board)
+    assert a._at == (5, 5)
+    assert any(key[1:] == (4, 5) for key in a._blocked)
+
+
+def test_the_edge_of_the_board_is_a_wall():
+    a = _tracker()
+    a._at = (0, 5)
+    board = _flat(12, 12, {(0, 5): 3})
+    _walk(a, 1, board, board)
+    assert any(key[1:] == (-1, 5) for key in a._blocked)
+
+
+def test_walking_onto_a_square_forgets_it_was_a_wall():
+    """A locked door opens. Whatever we believed while wearing something
+    else, standing on the square settles it."""
+    a = _tracker()
+    a._blocked.add((999, 4, 5))
+    _walk(a, 1, _flat(12, 12, {(5, 5): 3}), _flat(12, 12, {(4, 5): 3}))
+    assert a._at == (4, 5)
+    assert not any(key[1:] == (4, 5) for key in a._blocked)
+
+
+def test_half_a_move_loses_the_avatar_rather_than_guessing():
+    """Something happened that this model does not describe. Admitting
+    we no longer know where we are beats accumulating drift into a map
+    that later gets trusted."""
+    a = _tracker()
+    _walk(
+        a, 1,
+        _flat(12, 12, {(5, 5): 3}),
+        _flat(12, 12, {(5, 5): 3, (4, 5): 7}),
+    )
+    assert a._at is None
+    assert a._at_confirmed == 0
+
+
+def test_an_action_with_no_known_effect_loses_the_avatar():
+    """A click or a reset may well have moved us; we cannot say."""
+    a = _tracker()
+    a._pending = (0, agent.encode_action(6, 3, 3))
+    a._track_flat = _flat(12, 12, {(5, 5): 3})
+    a._track(_flat(12, 12, {(5, 5): 3}), 12, 12)
+    assert a._at is None
+
+
+def test_a_two_colour_sprite_is_one_avatar():
+    """`segment_frame` splits by colour, so ls20's avatar arrives as two
+    components. Parts that touch are one thing."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y = 5 + i
+        m.observe(
+            1,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y - 1, 5)), (4, (y, 5))),
+        )
+        m.observe(
+            2,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y + 1, 5)), (4, (y + 2, 5))),
+        )
+    assert m.locate(_board((3, (9, 5)), (4, (10, 5)))) == (9, 5, 2, 1)
+
+
+def test_two_of_the_same_thing_is_refused():
+    """Parts that do not touch are two candidates for the same role, and
+    a wrong anchor puts every later prediction in the wrong place."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y = 5 + i
+        m.observe(
+            1,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y - 1, 5)), (4, (y, 5))),
+        )
+        m.observe(
+            2,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y + 1, 5)), (4, (y + 2, 5))),
+        )
+    twins = _board((3, (9, 5)), (4, (10, 5)), (3, (9, 18)), (4, (10, 18)))
+    assert m.locate(twins) is None
+
+
+def test_spending_the_blocked_map_is_off_by_default():
+    """It fires at the right cost -- 124 probes skipped on an ls20 level
+    whose no-op presses number about 97 -- and still loses the level,
+    because neither available key tells a wall from a locked door. The
+    status readout takes three values over a level (the three lives) and
+    the avatar's looks take one (ls20 draws its attributes only in the
+    HUD widget, which `hud_mask` removes)."""
+    assert agent.BLOCKED_SKIP == 0

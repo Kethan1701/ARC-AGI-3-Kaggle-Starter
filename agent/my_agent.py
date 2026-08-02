@@ -2928,6 +2928,42 @@ MOTION_LEARN = _env_int("ARC_MOTION_LEARN", 1)
 MOTION_SAMPLES = _env_int("ARC_MOTION_SAMPLES", 4)
 MOTION_BUDGET = _env_int("ARC_MOTION_BUDGET", 300)
 
+# Re-finding the avatar costs a full segmentation, so losing it must not
+# become a per-action habit. Tracking simply stays off once the budget is
+# gone; everything downstream already treats "we do not know where we
+# are" as the normal case.
+MOTION_ANCHORS = _env_int("ARC_MOTION_ANCHORS", 200)
+
+# A fresh anchor is a guess until an action confirms it. Skipping probes
+# on the strength of an unconfirmed position is how the first version of
+# this cost ls20 the level entirely: one wrong anchor near a respawn and
+# the search declines the moves that would have finished it.
+BLOCKED_CONFIRM = _env_int("ARC_BLOCKED_CONFIRM", 1)
+
+# Skip probes that walk into something that has already refused us.
+#
+# Off, because the map cannot yet be indexed by the thing that decides
+# whether a square is passable. Learning it is free and correct -- ls20
+# finishes level 1 in the same 527 actions with 55 real walls recorded --
+# but spending it needs a key, and both keys available are wrong:
+#
+#   the status readout   takes THREE values over a whole level, measured.
+#                        That is the three lives, not the twenty-four
+#                        attribute combinations.
+#   the avatar's looks   takes ONE. ls20 does not draw shape, colour or
+#                        rotation on the board sprite at all; the only
+#                        display of them is the HUD widget, which is
+#                        exactly what `hud_mask` removes.
+#
+# With either key the goal square -- which refuses the avatar until all
+# three attributes match, and so reads precisely like a wall for most of
+# the level -- gets skipped forever, and ls20 goes from clearing level 1
+# in 527 actions to not clearing it in 1500. The mechanism is sound and
+# the evidence for that is that it fires: 124 probes skipped on a map
+# whose no-op presses number about 97. It is aimed at the right cost. It
+# just cannot tell a wall from a locked door.
+BLOCKED_SKIP = _env_int("ARC_BLOCKED_SKIP", 0)
+
 
 class MotionModel:
     """Which object the player controls, and where each action moves it.
@@ -2964,6 +3000,7 @@ class MotionModel:
         self._moves: dict[int, dict[int, Counter]] = {}
         self._table: dict[int, tuple[int, int]] = {}
         self._avatar: Optional[int] = None
+        self._family: frozenset[int] = frozenset()
         self._dirty = True
         self.samples = 0
         self._near = (0, 0)
@@ -3037,9 +3074,75 @@ class MotionModel:
                 best_score, best = score, (key, table)
         self._near = near
         if best is None:
-            self._avatar, self._table = None, {}
-        else:
-            self._avatar, self._table = best
+            self._avatar, self._table, self._family = None, {}, frozenset()
+            return
+        self._avatar, self._table = best
+        # Every appearance the avatar wears. ls20 changes the player's
+        # shape and colour as it walks over modifier tiles, and a redrawn
+        # sprite hashes differently, so the one hash that won the vote is
+        # not enough to find it again after it crosses one. Anything
+        # whose dominant steps agree with the winner wherever both are
+        # defined is the same thing wearing a different face.
+        family = set()
+        for key, per_action in self._moves.items():
+            agreed = False
+            for action_id, hist in per_action.items():
+                step, count = hist.most_common(1)[0]
+                if count < MOTION_SAMPLES or count * 2 <= sum(hist.values()):
+                    continue
+                if self._table.get(action_id) != step:
+                    agreed = False
+                    break
+                agreed = True
+            if agreed:
+                family.add(key)
+        self._family = frozenset(family)
+
+    def locate(self, view: dict[str, Any]) -> Optional[tuple[int, int, int, int]]:
+        """Where the avatar is in this frame, as (top, left, height, width).
+
+        `segment_frame` splits by colour, so a sprite drawn in two
+        colours arrives as two components -- ls20's avatar is exactly
+        this, a 5x5 cell whose upper two rows and lower three rows are
+        different colours, and both halves move together and so both
+        earn a place in the family. Parts that touch are one object.
+
+        Parts that do NOT touch are two candidates for the same role,
+        and there is no way to say which one we are driving. That is
+        refused rather than guessed: a wrong anchor puts every later
+        prediction in the wrong place, and the blocked map would then be
+        recording walls that are not there.
+        """
+        self._resolve()
+        if not self._family:
+            return None
+        clusters: list[list[int]] = []
+        for node in view.get("nodes", ()):
+            if node["hash"] not in self._family:
+                continue
+            top, left, bottom, right = node["bbox"]
+            merged = [top, left, bottom, right]
+            apart: list[list[int]] = []
+            for other in clusters:
+                touching = (
+                    merged[0] <= other[2] + 1
+                    and other[0] <= merged[2] + 1
+                    and merged[1] <= other[3] + 1
+                    and other[1] <= merged[3] + 1
+                )
+                if touching:
+                    merged = [
+                        min(merged[0], other[0]), min(merged[1], other[1]),
+                        max(merged[2], other[2]), max(merged[3], other[3]),
+                    ]
+                else:
+                    apart.append(other)
+            apart.append(merged)
+            clusters = apart
+        if len(clusters) != 1:
+            return None
+        top, left, bottom, right = clusters[0]
+        return (top, left, bottom - top + 1, right - left + 1)
 
     def _resolve(self) -> None:
         if self._dirty:
@@ -3612,6 +3715,30 @@ class MyAgent(Agent):
         self._motion = MotionModel() if MOTION_LEARN else None
         self._motion_view: Optional[dict[str, Any]] = None
         self._motion_said = False
+        # Where the avatar is, and how big it is, in board coordinates.
+        self._at: Optional[tuple[int, int]] = None
+        self._at_size: tuple[int, int] = (1, 1)
+        self._at_confirmed = 0
+        self._look = 0
+        self._track_flat: Optional[tuple[int, ...]] = None
+        self._anchors = 0
+        # Destinations that have refused us, keyed by what the avatar
+        # looked like when they did. Keying on the cell alone is wrong
+        # and quietly fatal: ls20's goal square rejects the avatar until
+        # all three of its attributes match, so it reads exactly like a
+        # wall for most of the level, and marked permanently blocked it
+        # would be skipped forever and the level never cleared.
+        #
+        # The status readout was the obvious key and is the wrong one --
+        # measured, it takes three values over a whole level, which is
+        # the three lives, not the twenty-four attribute combinations.
+        # What the avatar *looks like* is the attribute state: ls20
+        # changes the player's shape, colour and rotation, and all three
+        # are drawn. So hash the avatar's own cells. It costs the ~25
+        # reads of its bounding box, needs no segmentation, and is exact
+        # where the readout was merely nearby.
+        self._blocked: set[tuple[Any, int, int]] = set()
+        self._skipped_blocked = 0
 
         # --- execution bookkeeping ----------------------------------
         # (node, code) awaiting its outcome, folded in on the next call
@@ -3813,6 +3940,26 @@ class MyAgent(Agent):
                     "%s: motion solved at action %d: %s",
                     self.game_id, self._steps, self._motion.report(),
                 )
+                self._anchor(view)
+                if self._at is not None:
+                    self._look = self._appearance(flat, self._at, width, height)
+
+        # Judge the last action first, then go looking. Doing it the
+        # other way round spends an anchor on a frame `_track` is about
+        # to discard, because the action it is judging is the very one
+        # that lost us -- a reset, or a click, which this model has
+        # nothing to say about.
+        self._track(flat, width, height)
+        if (
+            self._motion is not None
+            and self._at is None
+            and self._anchors < MOTION_ANCHORS
+            and self._motion.settled
+        ):
+            self._anchors += 1
+            self._anchor(segment_frame(grid, self._volatile))
+            if self._at is not None:
+                self._look = self._appearance(flat, self._at, width, height)
 
         if BUDGET_REPORT_EVERY and self._steps % BUDGET_REPORT_EVERY == 0:
             self._report_budget(f"still on level {self._level}")
@@ -4580,8 +4727,10 @@ class MyAgent(Agent):
             self._report_budget(f"left level {self._level} for {levels}")
             if self._motion is not None:
                 logger.info(
-                    "%s: motion model carried into level %d: %s",
+                    "%s: motion model carried into level %d: %s "
+                    "| %d walls known, %d probes skipped",
                     self.game_id, levels, self._motion.report(),
+                    len(self._blocked), self._skipped_blocked,
                 )
             if levels > self._level and pending is not None:
                 # The action we are being shown the result of is the one
@@ -4914,6 +5063,12 @@ class MyAgent(Agent):
                 self._respawn_period = ordered[len(ordered) // 2]
             self._last_respawn = self._steps
             self._respawns += 1
+            # The avatar has just been picked up and put back at the
+            # start. Nothing we tracked about where it was survives that,
+            # and a stale position turns the blocked map into a list of
+            # walls that are not there.
+            self._at = None
+            self._at_confirmed = 0
             if self._respawns == 1 or self._respawns % 10 == 0:
                 logger.info(
                     "%s: respawned at action %d (period %s, %d so far); "
@@ -5126,6 +5281,11 @@ class MyAgent(Agent):
         self._status_boards = {}
         self._status = None
         self._last_respawn = None
+        # Walls are a property of the level, so they go with it. The
+        # motion model deliberately does not.
+        self._blocked.clear()
+        self._at = None
+        self._at_confirmed = 0
         self._total.clear()
         self._cursor.clear()
         self._edges.clear()
@@ -5133,6 +5293,138 @@ class MyAgent(Agent):
         self._deaths.clear()
         self._cache.clear()
         self._plan.clear()
+
+    def _anchor(self, view: dict[str, Any]) -> None:
+        found = self._motion.locate(view) if self._motion else None
+        if found is None:
+            return
+        top, left, height, width = found
+        self._at = (top, left)
+        self._at_size = (height, width)
+        self._at_confirmed = 0
+
+    def _appearance(
+        self,
+        flat: tuple[int, ...],
+        at: tuple[int, int],
+        width: int,
+        height: int,
+    ) -> int:
+        top, left = at
+        rows, cols = self._at_size
+        if top < 0 or left < 0 or top + rows > height or left + cols > width:
+            return 0
+        return hash(
+            tuple(
+                flat[y * width + x]
+                for y in range(top, top + rows)
+                for x in range(left, left + cols)
+            )
+        )
+
+    def _region_changed(
+        self,
+        before: tuple[int, ...],
+        after: tuple[int, ...],
+        at: tuple[int, int],
+        width: int,
+        height: int,
+    ) -> Optional[bool]:
+        """Did anything inside this rectangle change? None means it is
+        not on the board at all, which is its own kind of wall."""
+        top, left = at
+        rows, cols = self._at_size
+        if top < 0 or left < 0 or top + rows > height or left + cols > width:
+            return None
+        volatile = self._volatile
+        for y in range(top, top + rows):
+            base = y * width
+            for x in range(left, left + cols):
+                index = base + x
+                if index not in volatile and before[index] != after[index]:
+                    return True
+        return False
+
+    def _track(self, flat: tuple[int, ...], width: int, height: int) -> None:
+        """Follow the avatar in board coordinates, and note what refuses it.
+
+        Re-segmenting every action is the obvious way to do this and the
+        wrong one -- it is the most expensive thing the agent does. Once
+        the motion model says where an action *should* have moved us,
+        checking costs two small rectangles instead of a flood fill of
+        the board: if neither the square we left nor the square we aimed
+        at changed, we did not go anywhere, and something is in the way.
+
+        Only both-changed is read as success. One-changed means something
+        happened that this model does not describe, and the honest
+        response is to admit we no longer know where we are rather than
+        accumulate drift into a map that later gets trusted.
+        """
+        before, self._track_flat = self._track_flat, flat
+        if self._motion is None or not self._motion.settled:
+            return
+        if before is None or self._at is None or self._pending is None:
+            return
+        if len(before) != len(flat):
+            self._at = None
+            self._at_confirmed = 0
+            return
+        step = self._motion.displacement(self._pending[1] >> (2 * _COORD_BITS))
+        if step is None:
+            # A click, a reset, or an action the model never explained.
+            # It may well have moved us; we simply cannot say.
+            self._at = None
+            self._at_confirmed = 0
+            return
+        destination = (self._at[0] + step[0], self._at[1] + step[1])
+        arrived = self._region_changed(before, flat, destination, width, height)
+        if arrived is None:
+            self._blocked.add((self._look, destination[0], destination[1]))
+            return
+        left_it = self._region_changed(before, flat, self._at, width, height)
+        if not arrived and not left_it:
+            self._at_confirmed += 1
+            self._blocked.add((self._look, destination[0], destination[1]))
+        elif arrived and left_it:
+            self._at_confirmed += 1
+            self._at = destination
+            # Walking onto a square is proof it is not a wall, whatever
+            # we believed while wearing something else.
+            self._blocked.difference_update(
+                {k for k in self._blocked if k[1:] == destination}
+            )
+        else:
+            self._at = None
+            self._at_confirmed = 0
+        if self._at is not None:
+            self._look = self._appearance(flat, self._at, width, height)
+
+    def _skip_blocked(self, node: int, code: int) -> bool:
+        blocked = self._blocked_move(code)
+        if blocked:
+            self._skipped_blocked += 1
+            # We know the outcome without paying for it: walking into a
+            # wall leaves the board where it was.
+            self._edges.setdefault(node, {})[code] = node
+        return blocked
+
+    def _blocked_move(self, code: int) -> bool:
+        """Would this action walk into something that has already refused
+        us, from where we are standing, wearing what we are wearing?"""
+        if not (BLOCKED_SKIP and self._blocked) or self._at is None:
+            return False
+        if self._at_confirmed < BLOCKED_CONFIRM:
+            return False
+        if self._motion is None:
+            return False
+        step = self._motion.displacement(code >> (2 * _COORD_BITS))
+        if step is None:
+            return False
+        return (
+            self._look,
+            self._at[0] + step[0],
+            self._at[1] + step[1],
+        ) in self._blocked
 
     def _candidates(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
@@ -5309,7 +5601,9 @@ class MyAgent(Agent):
             else EMPTY_EDGES
         )
         while index < limit and (
-            self._is_dead(codes[index]) or codes[index] in recorded
+            self._is_dead(codes[index])
+            or codes[index] in recorded
+            or self._skip_blocked(node, codes[index])
         ):
             index += 1
         if index < limit and node in self._total:
