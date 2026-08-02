@@ -831,3 +831,375 @@ def test_re_opening_is_off_by_default():
     _read(a, (1, 1), (7, 7), 0)
     assert _read(a, (2, 1), (8, 8), 10) is False
     assert a._cursor == {1: 3}
+
+
+# ---------------------------------------------------------------------
+# The motion model
+# ---------------------------------------------------------------------
+
+
+def _board(*objects):
+    """A frame with each object drawn as a 1-cell block of its colour.
+
+    Colours are kept distinct so `segment_frame`'s hash separates the
+    objects, which is what the model matches on.
+    """
+    grid = [[0] * 24 for _ in range(24)]
+    for colour, (y, x) in objects:
+        grid[y][x] = colour
+    return agent.segment_frame(tuple(tuple(row) for row in grid))
+
+
+def test_the_avatar_and_its_moves_are_learned():
+    """Four actions, four displacements, one object doing all of it."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y = 5 + i
+        m.observe(1, _board((3, (y, 5))), _board((3, (y - 1, 5))))
+        m.observe(2, _board((3, (y, 5))), _board((3, (y + 1, 5))))
+        m.observe(3, _board((3, (y, 5))), _board((3, (y, 4))))
+        m.observe(4, _board((3, (y, 5))), _board((3, (y, 6))))
+    assert m.settled
+    assert m.displacement(1) == (-1, 0)
+    assert m.displacement(2) == (1, 0)
+    assert m.displacement(3) == (0, -1)
+    assert m.displacement(4) == (0, 1)
+    assert m.avatar is not None
+
+
+def test_a_patrol_is_not_the_avatar():
+    """It moves on every action alike, so its displacement is not a
+    function of what we pressed. One distinct step is the tell."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES * 2):
+        for action in (1, 2, 3, 4):
+            y = 5 + (i % 3)
+            m.observe(action, _board((3, (y, 5))), _board((3, (y, 6))))
+    assert m.avatar is None
+    assert m.displacement(1) is None
+
+
+def test_the_avatar_is_picked_out_from_the_patrol():
+    """Both move on every action. Only one of them answers to us."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y, h = 5 + i, 15 + (i % 2)
+        m.observe(
+            1,
+            _board((3, (y, 5)), (7, (h, 20))),
+            _board((3, (y - 1, 5)), (7, (h, 21))),
+        )
+        m.observe(
+            2,
+            _board((3, (y, 5)), (7, (h, 20))),
+            _board((3, (y + 1, 5)), (7, (h, 21))),
+        )
+    assert m.displacement(1) == (-1, 0)
+    assert m.displacement(2) == (1, 0)
+
+
+def test_a_repeated_shape_is_not_followed():
+    """Two identical objects cannot be told apart across a frame pair,
+    so neither is evidence about anything."""
+    m = agent.MotionModel()
+    for _ in range(agent.MOTION_SAMPLES * 2):
+        m.observe(
+            1,
+            _board((3, (5, 5)), (3, (5, 12))),
+            _board((3, (4, 5)), (3, (4, 12))),
+        )
+        m.observe(
+            2,
+            _board((3, (5, 5)), (3, (5, 12))),
+            _board((3, (6, 5)), (3, (6, 12))),
+        )
+    assert m.avatar is None
+
+
+def test_a_scattered_action_is_refused():
+    """An action whose outcome is a different displacement every time
+    has no dominant answer, and a tallest-of-a-scatter is not one."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES * 3):
+        step = [(-1, 0), (1, 0), (0, 1)][i % 3]
+        m.observe(
+            1,
+            _board((3, (10, 10))),
+            _board((3, (10 + step[0], 10 + step[1]))),
+        )
+    assert m.displacement(1) is None
+
+
+def test_nothing_is_claimed_before_the_evidence():
+    """One sighting of a move is not a rule."""
+    m = agent.MotionModel()
+    m.observe(1, _board((3, (5, 5))), _board((3, (4, 5))))
+    m.observe(2, _board((3, (5, 5))), _board((3, (6, 5))))
+    assert m.displacement(1) is None
+    assert not m.settled
+    assert "unsolved" in m.report()
+
+
+def test_the_model_outlives_the_graph():
+    """The whole point: `_reset_graph` drops every node id at a level
+    boundary, and what the actions do is not keyed on any of them."""
+    a = _status_agent()
+    for name in ("_edges", "_fatal", "_deaths", "_cache"):
+        setattr(a, name, {1: 2})
+    a._blocked = {(0, 4, 5)}
+    a._at = (5, 5)
+    a._at_confirmed = 3
+    a._motion = agent.MotionModel()
+    for _ in range(agent.MOTION_SAMPLES):
+        a._motion.observe(1, _board((3, (5, 5))), _board((3, (4, 5))))
+        a._motion.observe(2, _board((3, (5, 5))), _board((3, (6, 5))))
+    before = a._motion.displacement(1)
+    a._reset_graph()
+    assert a._edges == {}                      # the graph really did go
+    assert a._motion.displacement(1) == before == (-1, 0)
+
+
+def test_learning_the_motion_is_on_and_costs_no_actions():
+    """It reads frames the search was handed anyway. Measured on ls20:
+    level 1 still costs 527 actions over 96 nodes with it running."""
+    assert agent.MOTION_LEARN == 1
+
+
+# ---------------------------------------------------------------------
+# Following the avatar, and what refuses it
+# ---------------------------------------------------------------------
+
+
+def _flat(width, height, cells):
+    board = [0] * (width * height)
+    for (y, x), value in cells.items():
+        board[y * width + x] = value
+    return tuple(board)
+
+
+def _tracker():
+    """An agent that knows what the four actions do and where it is."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._steps = 0
+    a._volatile = frozenset()
+    a._at = (5, 5)
+    a._at_size = (1, 1)
+    a._at_confirmed = 1
+    a._look = 0
+    a._track_flat = None
+    a._anchors = 0
+    a._blocked = set()
+    a._skipped_blocked = 0
+    a._pending = None
+    a._readout_counts = agent.Counter()
+    a._readout_samples = 0
+    a._readout_idx = ()
+    a._motion = agent.MotionModel()
+    for _ in range(agent.MOTION_SAMPLES):
+        for action, (dy, dx) in ((1, (-1, 0)), (2, (1, 0)),
+                                 (3, (0, -1)), (4, (0, 1))):
+            a._motion.observe(
+                action,
+                _board((3, (10, 10))),
+                _board((3, (10 + dy, 10 + dx))),
+            )
+    assert a._motion.settled
+    return a
+
+
+def _walk(a, action, before, after, size=12):
+    a._pending = (0, agent.encode_action(action, None, None))
+    a._track_flat = before
+    a._track(after, size, size)
+
+
+def test_a_move_that_lands_updates_the_position():
+    a = _tracker()
+    _walk(a, 1, _flat(12, 12, {(5, 5): 3}), _flat(12, 12, {(4, 5): 3}))
+    assert a._at == (4, 5)
+    assert not a._blocked
+
+
+def test_a_move_that_goes_nowhere_records_a_wall():
+    """Neither the square we left nor the square we aimed at changed, so
+    we did not go anywhere and something is in the way."""
+    a = _tracker()
+    board = _flat(12, 12, {(5, 5): 3})
+    _walk(a, 1, board, board)
+    assert a._at == (5, 5)
+    assert any(key[1:] == (4, 5) for key in a._blocked)
+
+
+def test_the_edge_of_the_board_is_a_wall():
+    a = _tracker()
+    a._at = (0, 5)
+    board = _flat(12, 12, {(0, 5): 3})
+    _walk(a, 1, board, board)
+    assert any(key[1:] == (-1, 5) for key in a._blocked)
+
+
+def test_walking_onto_a_square_forgets_it_was_a_wall():
+    """A locked door opens. Whatever we believed while wearing something
+    else, standing on the square settles it."""
+    a = _tracker()
+    a._blocked.add((999, 4, 5))
+    _walk(a, 1, _flat(12, 12, {(5, 5): 3}), _flat(12, 12, {(4, 5): 3}))
+    assert a._at == (4, 5)
+    assert not any(key[1:] == (4, 5) for key in a._blocked)
+
+
+def test_half_a_move_loses_the_avatar_rather_than_guessing():
+    """Something happened that this model does not describe. Admitting
+    we no longer know where we are beats accumulating drift into a map
+    that later gets trusted."""
+    a = _tracker()
+    _walk(
+        a, 1,
+        _flat(12, 12, {(5, 5): 3}),
+        _flat(12, 12, {(5, 5): 3, (4, 5): 7}),
+    )
+    assert a._at is None
+    assert a._at_confirmed == 0
+
+
+def test_an_action_with_no_known_effect_loses_the_avatar():
+    """A click or a reset may well have moved us; we cannot say."""
+    a = _tracker()
+    a._pending = (0, agent.encode_action(6, 3, 3))
+    a._track_flat = _flat(12, 12, {(5, 5): 3})
+    a._track(_flat(12, 12, {(5, 5): 3}), 12, 12)
+    assert a._at is None
+
+
+def test_a_two_colour_sprite_is_one_avatar():
+    """`segment_frame` splits by colour, so ls20's avatar arrives as two
+    components. Parts that touch are one thing."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y = 5 + i
+        m.observe(
+            1,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y - 1, 5)), (4, (y, 5))),
+        )
+        m.observe(
+            2,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y + 1, 5)), (4, (y + 2, 5))),
+        )
+    assert m.locate(_board((3, (9, 5)), (4, (10, 5)))) == (9, 5, 2, 1)
+
+
+def test_two_of_the_same_thing_is_refused():
+    """Parts that do not touch are two candidates for the same role, and
+    a wrong anchor puts every later prediction in the wrong place."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y = 5 + i
+        m.observe(
+            1,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y - 1, 5)), (4, (y, 5))),
+        )
+        m.observe(
+            2,
+            _board((3, (y, 5)), (4, (y + 1, 5))),
+            _board((3, (y + 1, 5)), (4, (y + 2, 5))),
+        )
+    twins = _board((3, (9, 5)), (4, (10, 5)), (3, (9, 18)), (4, (10, 18)))
+    assert m.locate(twins) is None
+
+
+def test_spending_the_blocked_map_is_off_by_default():
+    """It fires at the right cost -- 124 probes skipped on an ls20 level
+    whose no-op presses number about 97 -- and still loses the level,
+    because neither available key tells a wall from a locked door. The
+    status readout takes three values over a level (the three lives) and
+    the avatar's looks take one (ls20 draws its attributes only in the
+    HUD widget, which `hud_mask` removes)."""
+    assert agent.BLOCKED_SKIP == 0
+
+
+# ---------------------------------------------------------------------
+# The readout
+# ---------------------------------------------------------------------
+
+
+def _readout_agent(size=(1, 1)):
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._volatile = frozenset()
+    a._at_size = size
+    a._readout_counts = agent.Counter()
+    a._readout_samples = 0
+    a._readout_idx = None
+    return a
+
+
+def test_a_rare_change_away_from_the_avatar_is_the_readout(monkeypatch):
+    """Four reasons a cell changes: we moved through it, a hazard did, a
+    readout updated, or it never changes. Subtract our own footprint and
+    rate separates the rest."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 20)
+    a = _readout_agent()
+    for i in range(20):
+        before = _flat(8, 8, {(0, 0): i % 2})
+        after = {(0, 0): (i + 1) % 2}
+        if i == 5:
+            after[(7, 7)] = 4
+        a._learn_readout(before, _flat(8, 8, after), ((3, 3), (3, 4)), 8, 8)
+    assert a._readout_idx is not None
+    assert 7 * 8 + 7 in a._readout_idx      # updated once: a readout
+    assert 0 not in a._readout_idx          # updated always: a hazard
+    assert 5 * 8 + 5 not in a._readout_idx  # never updated: the board
+
+
+def test_our_own_footprint_is_not_the_readout(monkeypatch):
+    """Moving is not news about what we are."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 10)
+    a = _readout_agent()
+    for _ in range(10):
+        a._learn_readout(
+            _flat(8, 8, {(3, 3): 1}), _flat(8, 8, {(3, 4): 1}),
+            ((3, 3), (3, 4)), 8, 8,
+        )
+    assert a._readout_idx == ()
+
+
+def test_the_masked_hud_is_not_the_readout(monkeypatch):
+    """The step counter ticks every action and is already masked; it
+    would swamp the key it is supposed to sharpen."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 10)
+    a = _readout_agent()
+    a._volatile = frozenset({7 * 8 + 7})
+    for i in range(10):
+        a._learn_readout(
+            _flat(8, 8, {(7, 7): i % 2}),
+            _flat(8, 8, {(7, 7): (i + 1) % 2}),
+            ((3, 3), (3, 4)), 8, 8,
+        )
+    assert a._readout_idx == ()
+
+
+def test_a_readout_the_size_of_the_board_is_refused(monkeypatch):
+    """Hashing it every action would cost more than the probes it saves."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 4)
+    monkeypatch.setattr(agent, "READOUT_CAP", 3)
+    a = _readout_agent()
+    for i in range(4):
+        after = {(y, x): 1 for y in range(5, 8) for x in range(5, 8)} if i == 1 else {}
+        a._learn_readout(_flat(8, 8, {}), _flat(8, 8, after), ((0, 0),), 8, 8)
+    assert a._readout_idx == ()
+
+
+def test_the_readout_is_what_the_blocked_map_is_keyed_on():
+    """Found, not guessed. Driving ls20 directly with its own rotation
+    field as ground truth, exactly 16 cells at rows 55-60 and columns 3-8
+    carry it -- a widget `hud_mask` never touched, because it does not
+    share the step counter's rows. The detector finds a 50-66 cell
+    superset of it, and over-including is the safe direction: it only
+    makes a blocked entry shared less often, where under-including made
+    ls20 stop clearing level 1 at all."""
+    assert agent.READOUT_MAX_RATE > 0
+    assert agent.BLOCKED_SKIP == 0
