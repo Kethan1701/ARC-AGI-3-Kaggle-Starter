@@ -988,10 +988,16 @@ def test_a_weak_model_is_not_nudged_to_plan(monkeypatch):
 def test_the_prompt_no_longer_gates_planning_on_perfection():
     """The bug that cost v16 its whole run: 'verify again until accuracy is
     1.0' is a gate that never opens on a board with any noise in it, and
-    the model obeyed it literally."""
+    the model obeyed it literally.
+
+    The gate is gone in the stronger sense now: searching does not wait on
+    a simulator because it no longer needs one. A model that cannot build
+    a forward model is told to drop it and search the real game, which is
+    the case v19 hit and had no answer for -- `predict` raised on branch
+    after branch and the plan came back empty with nothing saying why."""
     prompt = agent_mod.build_system_prompt([1, 2, 6])
     assert "until accuracy is 1.0" not in prompt
-    assert "Do NOT wait for 1.0" in prompt
+    assert "abandon it -- do not repair it" in prompt
     assert "never calling `plan`" in prompt
 
 
@@ -1325,3 +1331,48 @@ def test_drift_is_measured_against_the_harness_own_readings(monkeypatch):
     assert a._verify_best == 0.0
     assert first == 1.0 and a._verify_live < 1.0
     assert "Checked for you" in a._llm_note
+
+
+def test_the_prompt_makes_writing_the_search_the_job():
+    """Ported from the solver the 1.21-1.86 leaderboard cluster runs
+    (Tufa Labs' TAAF, public and MIT licensed). The division of labour is
+    the whole difference: they hand the model structured state and one
+    `action()` and let it program the search; we wrote the search and
+    asked the model to feed it a simulator. Writing a correct forward
+    model of an unknown game is strictly harder than writing a search
+    that calls the real game, and v19 paid for that -- its blocker was
+    `predict raised on N branches`."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "WRITE THE SEARCH" in prompt
+    assert "This is the job" in prompt
+    # The algorithms their prompt names, because a model told only to
+    # "search" writes a loop over actions instead.
+    for algorithm in ("breadth-first search", "flood fill", "beam search"):
+        assert algorithm in prompt, algorithm
+    # Writing a simulator is now the exception, not the route.
+    assert "OPTIONAL SHORTCUT" in prompt
+
+
+def test_the_prompt_names_the_importable_modules():
+    """The sandbox allows a fixed subset. A model that assumes numpy
+    spends a tool call finding out."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    for module in ("heapq", "collections", "itertools", "functools"):
+        assert module in prompt, module
+
+
+def test_the_prompt_warns_about_the_timer_bar():
+    """`hud_mask` fixes the search's state key; it does nothing for the
+    model, which still receives the strip as a row of tiny objects."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "THE BAR AT THE EDGE IS NOT THE GAME" in prompt
+    assert "did not change" in prompt
+
+
+def test_objects_are_the_primary_view_not_the_raw_grid():
+    """TAAF withholds the numeric grid outright. `plan()` and `tour()`
+    still read it here, so it stays available -- but the prompt no longer
+    presents it as an equal way to look at the board."""
+    prompt = agent_mod.build_system_prompt([1, 2, 6])
+    assert "work from the OBJECTS" in prompt
+    assert "never to scan the whole board" in prompt
