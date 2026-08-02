@@ -2940,6 +2940,34 @@ MOTION_ANCHORS = _env_int("ARC_MOTION_ANCHORS", 200)
 # the search declines the moves that would have finished it.
 BLOCKED_CONFIRM = _env_int("ARC_BLOCKED_CONFIRM", 1)
 
+# The readout: cells that change, but not because we moved, and not often.
+#
+# The blocked map needs a key for "what the avatar currently is", because
+# whether a square is passable is not a property of the square. Two
+# guesses at that key measured wrong -- the status band reads the three
+# lives, and ls20 does not draw its attributes on the board sprite at all
+# -- so this one was found rather than guessed. Driving ls20 directly
+# with its own shape/colour/rotation fields as ground truth, the cells
+# whose value is a function of rotation are exactly sixteen of them, at
+# rows 55-60 and columns 3-8: a small, compact widget, and one that
+# `hud_mask` never touched because it does not share the step counter's
+# rows.
+#
+# What generalises is not the coordinates but how they stand out. A cell
+# changes for one of four reasons: the avatar moved through it, a hazard
+# patrolled through it, a readout updated, or it never changes at all.
+# Subtract the avatar's own footprint -- which needs the tracking the
+# previous commit built -- and rate is enough to separate the rest. A
+# hazard moves most actions; a readout updates only when something about
+# us changes; the board does not move.
+#
+# The filter is deliberately generous. Including extra cells only makes a
+# blocked entry shared less often; excluding the ones that matter is what
+# made ls20 stop clearing level 1 at all. Over-include.
+READOUT_WARMUP = _env_int("ARC_READOUT_WARMUP", 250)
+READOUT_MAX_RATE = _env_float("ARC_READOUT_MAX_RATE", 0.15)
+READOUT_CAP = _env_int("ARC_READOUT_CAP", 400)
+
 # Skip probes that walk into something that has already refused us.
 #
 # Off, because the map cannot yet be indexed by the thing that decides
@@ -3720,6 +3748,9 @@ class MyAgent(Agent):
         self._at_size: tuple[int, int] = (1, 1)
         self._at_confirmed = 0
         self._look = 0
+        self._readout_counts: Counter = Counter()
+        self._readout_samples = 0
+        self._readout_idx: Optional[tuple[int, ...]] = None
         self._track_flat: Optional[tuple[int, ...]] = None
         self._anchors = 0
         # Destinations that have refused us, keyed by what the avatar
@@ -5310,16 +5341,54 @@ class MyAgent(Agent):
         width: int,
         height: int,
     ) -> int:
-        top, left = at
-        rows, cols = self._at_size
-        if top < 0 or left < 0 or top + rows > height or left + cols > width:
+        """What we currently are, as far as the board will say.
+
+        Not where we are: the avatar's own cells are deliberately not in
+        here. This is the readout, so that a square refused while we were
+        one thing says nothing about the same square while we are
+        another.
+        """
+        if not self._readout_idx:
             return 0
-        return hash(
-            tuple(
-                flat[y * width + x]
-                for y in range(top, top + rows)
-                for x in range(left, left + cols)
-            )
+        return hash(tuple(map(flat.__getitem__, self._readout_idx)))
+
+    def _learn_readout(
+        self,
+        before: tuple[int, ...],
+        after: tuple[int, ...],
+        boxes: tuple[tuple[int, int], ...],
+        width: int,
+        height: int,
+    ) -> None:
+        """Count changes that our own movement does not account for."""
+        if self._readout_idx is not None:
+            return
+        rows, cols = self._at_size
+        skip = set()
+        for top, left in boxes:
+            for y in range(max(0, top), min(height, top + rows)):
+                base = y * width
+                for x in range(max(0, left), min(width, left + cols)):
+                    skip.add(base + x)
+        volatile = self._volatile
+        counts = self._readout_counts
+        for index, (was, now) in enumerate(zip(before, after)):
+            if was != now and index not in skip and index not in volatile:
+                counts[index] += 1
+        self._readout_samples += 1
+        if self._readout_samples < READOUT_WARMUP:
+            return
+        cutoff = READOUT_MAX_RATE * self._readout_samples
+        found = tuple(
+            sorted(i for i, n in counts.items() if 0 < n <= cutoff)
+        )
+        # A "readout" the size of the board is not a readout, and hashing
+        # it every action would cost more than the probes it saves.
+        self._readout_idx = found if len(found) <= READOUT_CAP else ()
+        self._readout_counts = Counter()
+        logger.info(
+            "%s: readout is %d cells after %d samples",
+            self.game_id, len(self._readout_idx), self._readout_samples,
         )
 
     def _region_changed(
@@ -5378,6 +5447,9 @@ class MyAgent(Agent):
             return
         destination = (self._at[0] + step[0], self._at[1] + step[1])
         arrived = self._region_changed(before, flat, destination, width, height)
+        self._learn_readout(
+            before, flat, (self._at, destination), width, height
+        )
         if arrived is None:
             self._blocked.add((self._look, destination[0], destination[1]))
             return

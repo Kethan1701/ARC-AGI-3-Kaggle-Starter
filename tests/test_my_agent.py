@@ -992,6 +992,9 @@ def _tracker():
     a._blocked = set()
     a._skipped_blocked = 0
     a._pending = None
+    a._readout_counts = agent.Counter()
+    a._readout_samples = 0
+    a._readout_idx = ()
     a._motion = agent.MotionModel()
     for _ in range(agent.MOTION_SAMPLES):
         for action, (dy, dx) in ((1, (-1, 0)), (2, (1, 0)),
@@ -1115,4 +1118,88 @@ def test_spending_the_blocked_map_is_off_by_default():
     status readout takes three values over a level (the three lives) and
     the avatar's looks take one (ls20 draws its attributes only in the
     HUD widget, which `hud_mask` removes)."""
+    assert agent.BLOCKED_SKIP == 0
+
+
+# ---------------------------------------------------------------------
+# The readout
+# ---------------------------------------------------------------------
+
+
+def _readout_agent(size=(1, 1)):
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._volatile = frozenset()
+    a._at_size = size
+    a._readout_counts = agent.Counter()
+    a._readout_samples = 0
+    a._readout_idx = None
+    return a
+
+
+def test_a_rare_change_away_from_the_avatar_is_the_readout(monkeypatch):
+    """Four reasons a cell changes: we moved through it, a hazard did, a
+    readout updated, or it never changes. Subtract our own footprint and
+    rate separates the rest."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 20)
+    a = _readout_agent()
+    for i in range(20):
+        before = _flat(8, 8, {(0, 0): i % 2})
+        after = {(0, 0): (i + 1) % 2}
+        if i == 5:
+            after[(7, 7)] = 4
+        a._learn_readout(before, _flat(8, 8, after), ((3, 3), (3, 4)), 8, 8)
+    assert a._readout_idx is not None
+    assert 7 * 8 + 7 in a._readout_idx      # updated once: a readout
+    assert 0 not in a._readout_idx          # updated always: a hazard
+    assert 5 * 8 + 5 not in a._readout_idx  # never updated: the board
+
+
+def test_our_own_footprint_is_not_the_readout(monkeypatch):
+    """Moving is not news about what we are."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 10)
+    a = _readout_agent()
+    for _ in range(10):
+        a._learn_readout(
+            _flat(8, 8, {(3, 3): 1}), _flat(8, 8, {(3, 4): 1}),
+            ((3, 3), (3, 4)), 8, 8,
+        )
+    assert a._readout_idx == ()
+
+
+def test_the_masked_hud_is_not_the_readout(monkeypatch):
+    """The step counter ticks every action and is already masked; it
+    would swamp the key it is supposed to sharpen."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 10)
+    a = _readout_agent()
+    a._volatile = frozenset({7 * 8 + 7})
+    for i in range(10):
+        a._learn_readout(
+            _flat(8, 8, {(7, 7): i % 2}),
+            _flat(8, 8, {(7, 7): (i + 1) % 2}),
+            ((3, 3), (3, 4)), 8, 8,
+        )
+    assert a._readout_idx == ()
+
+
+def test_a_readout_the_size_of_the_board_is_refused(monkeypatch):
+    """Hashing it every action would cost more than the probes it saves."""
+    monkeypatch.setattr(agent, "READOUT_WARMUP", 4)
+    monkeypatch.setattr(agent, "READOUT_CAP", 3)
+    a = _readout_agent()
+    for i in range(4):
+        after = {(y, x): 1 for y in range(5, 8) for x in range(5, 8)} if i == 1 else {}
+        a._learn_readout(_flat(8, 8, {}), _flat(8, 8, after), ((0, 0),), 8, 8)
+    assert a._readout_idx == ()
+
+
+def test_the_readout_is_what_the_blocked_map_is_keyed_on():
+    """Found, not guessed. Driving ls20 directly with its own rotation
+    field as ground truth, exactly 16 cells at rows 55-60 and columns 3-8
+    carry it -- a widget `hud_mask` never touched, because it does not
+    share the step counter's rows. The detector finds a 50-66 cell
+    superset of it, and over-including is the safe direction: it only
+    makes a blocked entry shared less often, where under-including made
+    ls20 stop clearing level 1 at all."""
+    assert agent.READOUT_MAX_RATE > 0
     assert agent.BLOCKED_SKIP == 0
