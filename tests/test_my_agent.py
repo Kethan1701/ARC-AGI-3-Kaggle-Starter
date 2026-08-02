@@ -831,3 +831,132 @@ def test_re_opening_is_off_by_default():
     _read(a, (1, 1), (7, 7), 0)
     assert _read(a, (2, 1), (8, 8), 10) is False
     assert a._cursor == {1: 3}
+
+
+# ---------------------------------------------------------------------
+# The motion model
+# ---------------------------------------------------------------------
+
+
+def _board(*objects):
+    """A frame with each object drawn as a 1-cell block of its colour.
+
+    Colours are kept distinct so `segment_frame`'s hash separates the
+    objects, which is what the model matches on.
+    """
+    grid = [[0] * 24 for _ in range(24)]
+    for colour, (y, x) in objects:
+        grid[y][x] = colour
+    return agent.segment_frame(tuple(tuple(row) for row in grid))
+
+
+def test_the_avatar_and_its_moves_are_learned():
+    """Four actions, four displacements, one object doing all of it."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y = 5 + i
+        m.observe(1, _board((3, (y, 5))), _board((3, (y - 1, 5))))
+        m.observe(2, _board((3, (y, 5))), _board((3, (y + 1, 5))))
+        m.observe(3, _board((3, (y, 5))), _board((3, (y, 4))))
+        m.observe(4, _board((3, (y, 5))), _board((3, (y, 6))))
+    assert m.settled
+    assert m.displacement(1) == (-1, 0)
+    assert m.displacement(2) == (1, 0)
+    assert m.displacement(3) == (0, -1)
+    assert m.displacement(4) == (0, 1)
+    assert m.avatar is not None
+
+
+def test_a_patrol_is_not_the_avatar():
+    """It moves on every action alike, so its displacement is not a
+    function of what we pressed. One distinct step is the tell."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES * 2):
+        for action in (1, 2, 3, 4):
+            y = 5 + (i % 3)
+            m.observe(action, _board((3, (y, 5))), _board((3, (y, 6))))
+    assert m.avatar is None
+    assert m.displacement(1) is None
+
+
+def test_the_avatar_is_picked_out_from_the_patrol():
+    """Both move on every action. Only one of them answers to us."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES):
+        y, h = 5 + i, 15 + (i % 2)
+        m.observe(
+            1,
+            _board((3, (y, 5)), (7, (h, 20))),
+            _board((3, (y - 1, 5)), (7, (h, 21))),
+        )
+        m.observe(
+            2,
+            _board((3, (y, 5)), (7, (h, 20))),
+            _board((3, (y + 1, 5)), (7, (h, 21))),
+        )
+    assert m.displacement(1) == (-1, 0)
+    assert m.displacement(2) == (1, 0)
+
+
+def test_a_repeated_shape_is_not_followed():
+    """Two identical objects cannot be told apart across a frame pair,
+    so neither is evidence about anything."""
+    m = agent.MotionModel()
+    for _ in range(agent.MOTION_SAMPLES * 2):
+        m.observe(
+            1,
+            _board((3, (5, 5)), (3, (5, 12))),
+            _board((3, (4, 5)), (3, (4, 12))),
+        )
+        m.observe(
+            2,
+            _board((3, (5, 5)), (3, (5, 12))),
+            _board((3, (6, 5)), (3, (6, 12))),
+        )
+    assert m.avatar is None
+
+
+def test_a_scattered_action_is_refused():
+    """An action whose outcome is a different displacement every time
+    has no dominant answer, and a tallest-of-a-scatter is not one."""
+    m = agent.MotionModel()
+    for i in range(agent.MOTION_SAMPLES * 3):
+        step = [(-1, 0), (1, 0), (0, 1)][i % 3]
+        m.observe(
+            1,
+            _board((3, (10, 10))),
+            _board((3, (10 + step[0], 10 + step[1]))),
+        )
+    assert m.displacement(1) is None
+
+
+def test_nothing_is_claimed_before_the_evidence():
+    """One sighting of a move is not a rule."""
+    m = agent.MotionModel()
+    m.observe(1, _board((3, (5, 5))), _board((3, (4, 5))))
+    m.observe(2, _board((3, (5, 5))), _board((3, (6, 5))))
+    assert m.displacement(1) is None
+    assert not m.settled
+    assert "unsolved" in m.report()
+
+
+def test_the_model_outlives_the_graph():
+    """The whole point: `_reset_graph` drops every node id at a level
+    boundary, and what the actions do is not keyed on any of them."""
+    a = _status_agent()
+    for name in ("_edges", "_fatal", "_deaths", "_cache"):
+        setattr(a, name, {1: 2})
+    a._motion = agent.MotionModel()
+    for _ in range(agent.MOTION_SAMPLES):
+        a._motion.observe(1, _board((3, (5, 5))), _board((3, (4, 5))))
+        a._motion.observe(2, _board((3, (5, 5))), _board((3, (6, 5))))
+    before = a._motion.displacement(1)
+    a._reset_graph()
+    assert a._edges == {}                      # the graph really did go
+    assert a._motion.displacement(1) == before == (-1, 0)
+
+
+def test_learning_the_motion_is_on_and_costs_no_actions():
+    """It reads frames the search was handed anyway. Measured on ls20:
+    level 1 still costs 527 actions over 96 nodes with it running."""
+    assert agent.MOTION_LEARN == 1

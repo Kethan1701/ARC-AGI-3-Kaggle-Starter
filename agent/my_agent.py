@@ -2917,6 +2917,148 @@ def candidate_actions(
 
 
 # ---------------------------------------------------------------------
+# What the actions actually do
+# ---------------------------------------------------------------------
+
+# Learning this costs no actions: it reads frames the search was handed
+# anyway. It is budgeted only because `segment_frame` is the most
+# expensive thing in the agent, and there is no point paying for it once
+# the answer has stopped changing.
+MOTION_LEARN = _env_int("ARC_MOTION_LEARN", 1)
+MOTION_SAMPLES = _env_int("ARC_MOTION_SAMPLES", 4)
+MOTION_BUDGET = _env_int("ARC_MOTION_BUDGET", 300)
+
+
+class MotionModel:
+    """Which object the player controls, and where each action moves it.
+
+    The search's memory is a graph of opaque frame hashes, which is why
+    `_reset_graph` has to throw all of it away at every level boundary:
+    the ids stop meaning anything the moment the board changes. This is
+    the part of what a game teaches that does NOT expire. "ACTION1 moves
+    me up one cell" is true on level 1 and still true on level 7.
+
+    ls20's own level table is the argument for bothering. Levels 1, 2
+    and 3 are the same puzzle with a different target rotation, and
+    levels 1 to 4 start the avatar in the same shape; the search
+    currently re-derives the whole thing from nothing, every time, and
+    in this run reaches level 2 on one game out of nine.
+
+    Objects are matched across a frame pair by `segment_frame`'s hash,
+    which is normalised to the bounding box and so is invariant under
+    exactly the translation being measured. Only hashes appearing once
+    in both frames are used; a repeated shape cannot be followed without
+    guessing which copy is which.
+
+    Several things move at once on a game with hazards, so a
+    displacement is not credited to the avatar merely for happening.
+    Every candidate keeps a per-action histogram, and the avatar is the
+    one whose displacement is a *function of the action* -- consistent
+    within an action, and different between actions. A sprite that
+    patrols one square per tick moves identically whatever we pressed,
+    scores one distinct displacement, and is rejected.
+    """
+
+    def __init__(self) -> None:
+        # object hash -> action id -> displacement -> times seen
+        self._moves: dict[int, dict[int, Counter]] = {}
+        self._table: dict[int, tuple[int, int]] = {}
+        self._avatar: Optional[int] = None
+        self._dirty = True
+        self.samples = 0
+
+    @staticmethod
+    def _unique(view: dict[str, Any]) -> dict[int, tuple[int, int]]:
+        """Hash -> top-left corner, for shapes appearing exactly once."""
+        seen: dict[int, Any] = {}
+        for node in view.get("nodes", ()):
+            key = node["hash"]
+            if key in seen:
+                seen[key] = None          # ambiguous from here on
+            else:
+                top, left, _, _ = node["bbox"]
+                seen[key] = (top, left)
+        return {k: v for k, v in seen.items() if v is not None}
+
+    def observe(
+        self,
+        action_id: int,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> None:
+        if not before or not after:
+            return
+        first = self._unique(before)
+        second = self._unique(after)
+        for key, start in first.items():
+            end = second.get(key)
+            if end is None or end == start:
+                continue
+            step = (end[0] - start[0], end[1] - start[1])
+            self._moves.setdefault(key, {}).setdefault(
+                action_id, Counter()
+            )[step] += 1
+            self._dirty = True
+        self.samples += 1
+
+    def _solve(self) -> None:
+        self._dirty = False
+        best: Optional[tuple[int, dict[int, tuple[int, int]]]] = None
+        best_score = (0, 0)
+        for key, per_action in self._moves.items():
+            table: dict[int, tuple[int, int]] = {}
+            for action_id, hist in per_action.items():
+                step, count = hist.most_common(1)[0]
+                # A clear winner, not merely the tallest of a scatter:
+                # anything the action does not reliably cause shows up
+                # as a near-tie and is refused.
+                if count < MOTION_SAMPLES or count * 2 <= sum(hist.values()):
+                    continue
+                table[action_id] = step
+            distinct = len(set(table.values()))
+            if distinct < 2:
+                # Moves the same way whatever we pressed, so it is not
+                # responding to us.
+                continue
+            score = (distinct, len(table))
+            if score > best_score:
+                best_score, best = score, (key, table)
+        if best is None:
+            self._avatar, self._table = None, {}
+        else:
+            self._avatar, self._table = best
+
+    def _resolve(self) -> None:
+        if self._dirty:
+            self._solve()
+
+    @property
+    def avatar(self) -> Optional[int]:
+        self._resolve()
+        return self._avatar
+
+    @property
+    def settled(self) -> bool:
+        """Enough of the action set explained to stop paying to look."""
+        self._resolve()
+        return len(self._table) >= 4
+
+    def displacement(self, action_id: int) -> Optional[tuple[int, int]]:
+        self._resolve()
+        return self._table.get(action_id)
+
+    def report(self) -> str:
+        self._resolve()
+        if not self._table:
+            return f"unsolved after {self.samples} frame pairs"
+        moves = " ".join(
+            f"ACTION{a}=({dy:+d},{dx:+d})"
+            for a, (dy, dx) in sorted(self._table.items())
+        )
+        return f"avatar {self._avatar:08x} {moves} ({self.samples} pairs)"
+
+
+# ---------------------------------------------------------------------
 # The model policy
 # ---------------------------------------------------------------------
 _HEX = "0123456789abcdefghijklmnopqrstuv"
@@ -3447,6 +3589,11 @@ class MyAgent(Agent):
         # Warmup frames kept only until the mask is decided (see
         # MASK_COLLAPSE_GUARD), then dropped.
         self._mask_frames: list[bytes] = []
+        # Deliberately NOT cleared by `_reset_graph`: outliving the level
+        # boundary is the entire point of it.
+        self._motion = MotionModel() if MOTION_LEARN else None
+        self._motion_view: Optional[dict[str, Any]] = None
+        self._motion_said = False
 
         # --- execution bookkeeping ----------------------------------
         # (node, code) awaiting its outcome, folded in on the next call
@@ -3624,6 +3771,30 @@ class MyAgent(Agent):
             self._level_start_node = node
             self._level_start_board = self._board_key(flat)
         self._check_status(node)
+
+        # Watch what the last action did to the board. This has to run
+        # before `_observe`, which consumes `_pending`, and it stops as
+        # soon as the answer is known -- or as soon as it is clear that
+        # paying more for it will not produce one.
+        if (
+            self._motion is not None
+            and self._steps <= MOTION_BUDGET
+            and not self._motion.settled
+        ):
+            view = segment_frame(grid, self._volatile)
+            if self._pending is not None and self._motion_view is not None:
+                self._motion.observe(
+                    self._pending[1] >> (2 * _COORD_BITS),
+                    self._motion_view,
+                    view,
+                )
+            self._motion_view = view
+            if self._motion.settled and not self._motion_said:
+                self._motion_said = True
+                logger.info(
+                    "%s: motion solved at action %d: %s",
+                    self.game_id, self._steps, self._motion.report(),
+                )
 
         if BUDGET_REPORT_EVERY and self._steps % BUDGET_REPORT_EVERY == 0:
             self._report_budget(f"still on level {self._level}")
@@ -4389,6 +4560,11 @@ class MyAgent(Agent):
 
         if levels != self._level:
             self._report_budget(f"left level {self._level} for {levels}")
+            if self._motion is not None:
+                logger.info(
+                    "%s: motion model carried into level %d: %s",
+                    self.game_id, levels, self._motion.report(),
+                )
             if levels > self._level and pending is not None:
                 # The action we are being shown the result of is the one
                 # that beat the level, so it is the last step of the route.
