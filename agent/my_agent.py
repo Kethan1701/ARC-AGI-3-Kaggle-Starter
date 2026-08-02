@@ -2966,6 +2966,7 @@ class MotionModel:
         self._avatar: Optional[int] = None
         self._dirty = True
         self.samples = 0
+        self._near = (0, 0)
 
     @staticmethod
     def _unique(view: dict[str, Any]) -> dict[int, tuple[int, int]]:
@@ -3005,6 +3006,16 @@ class MotionModel:
         self._dirty = False
         best: Optional[tuple[int, dict[int, tuple[int, int]]]] = None
         best_score = (0, 0)
+        # How close the runner-up came, so a failure can say which kind
+        # it is. A candidate explaining several actions with ONE distinct
+        # step is something moving on a timer, not something answering to
+        # us. A candidate explaining none has no dominant outcome at all,
+        # which means either the avatar is being re-drawn between frames
+        # -- a changing shape hashes differently and cannot be followed
+        # -- or the displacement is not constant, as it is not for a slide
+        # that runs until it hits a wall. The two want different fixes and
+        # guessing between them wastes a run.
+        near = (0, 0)
         for key, per_action in self._moves.items():
             table: dict[int, tuple[int, int]] = {}
             for action_id, hist in per_action.items():
@@ -3016,6 +3027,7 @@ class MotionModel:
                     continue
                 table[action_id] = step
             distinct = len(set(table.values()))
+            near = max(near, (len(table), distinct))
             if distinct < 2:
                 # Moves the same way whatever we pressed, so it is not
                 # responding to us.
@@ -3023,6 +3035,7 @@ class MotionModel:
             score = (distinct, len(table))
             if score > best_score:
                 best_score, best = score, (key, table)
+        self._near = near
         if best is None:
             self._avatar, self._table = None, {}
         else:
@@ -3050,7 +3063,12 @@ class MotionModel:
     def report(self) -> str:
         self._resolve()
         if not self._table:
-            return f"unsolved after {self.samples} frame pairs"
+            actions, distinct = self._near
+            return (
+                f"unsolved after {self.samples} pairs over "
+                f"{len(self._moves)} movers; best explains {actions} "
+                f"actions with {distinct} distinct steps"
+            )
         moves = " ".join(
             f"ACTION{a}=({dy:+d},{dx:+d})"
             for a, (dy, dx) in sorted(self._table.items())
