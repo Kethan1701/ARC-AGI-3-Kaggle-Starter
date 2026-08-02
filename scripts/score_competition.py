@@ -147,6 +147,29 @@ def main() -> None:
 
     import requests
 
+    # `arc_agi.remote_wrapper` posts every action with a hard 10-second read
+    # timeout. That is fine against the real service and wrong here: this
+    # harness runs one Flask app serving 25 agent threads on one dev box, so
+    # under load the timeout fires, the framework gives up on the game, and
+    # the run loses it silently. Measured on the last full run -- 18 timeouts,
+    # with sb26 dead after 2 actions, lf52 after 44 and g50t after 50, which
+    # is the whole of the 0.1299 -> 0.1296 difference and not a behaviour
+    # change at all.
+    #
+    # The metric is the thing every decision here is made on, so it must not
+    # depend on how busy the machine was. Raise the ceiling rather than make
+    # the agent cheaper to suit a test rig it will never run on.
+    action_timeout = float(os.environ.get("ARC_ACTION_TIMEOUT", "180"))
+    _post = requests.Session.post
+
+    def _patient_post(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        given = kwargs.get("timeout")
+        if given is not None:
+            kwargs["timeout"] = max(given, action_timeout)
+        return _post(self, *args, **kwargs)
+
+    requests.Session.post = _patient_post  # type: ignore[method-assign]
+
     r = requests.get(
         f"{root_url}/api/games", headers={"X-API-Key": API_KEY}, timeout=10
     )
