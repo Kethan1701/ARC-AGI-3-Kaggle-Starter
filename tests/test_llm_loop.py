@@ -100,6 +100,54 @@ def test_the_payload_declares_the_python_tool_and_qwen_sampling():
     assert payload["top_p"] == agent.LLM_TOP_P
 
 
+def test_one_reply_is_capped_so_a_runaway_cannot_eat_the_run():
+    """`max_tokens` was missing from the payload entirely until v23.
+
+    With `preserve_thinking` on and no cap, a single reply could run to
+    whatever `--max-model-len` left over. At v22's measured ~8 tok/s per
+    game that is a game's whole hour inside one generation.
+    """
+    post = _Scripted([_assistant(content="ok")])
+    agent.run_tool_conversation([], {}, post=post)
+    assert post.payloads[0]["max_tokens"] == agent.LLM_MAX_TOKENS
+
+
+def test_the_cap_is_overridable_per_call():
+    post = _Scripted([_assistant(content="ok")])
+    agent.run_tool_conversation([], {}, post=post, max_tokens=64)
+    assert post.payloads[0]["max_tokens"] == 64
+
+
+def test_a_reply_cut_off_at_the_cap_is_not_reported_as_a_finished_thought():
+    """`length` and a real stop look identical in a turn report unless they
+    are named apart -- and a cap that silently ends turns looks like a
+    throughput win while quietly costing the run."""
+    reply = _assistant(content="I was still thinking when")
+    reply["choices"][0]["finish_reason"] = "length"
+    post = _Scripted([reply])
+    out = agent.run_tool_conversation([], {}, post=post)
+    assert out["stop"] == "truncated"
+    assert out["content"] == "I was still thinking when"
+
+
+def test_a_reply_that_simply_finished_is_still_content():
+    reply = _assistant(content="done")
+    reply["choices"][0]["finish_reason"] = "stop"
+    post = _Scripted([reply])
+    assert agent.run_tool_conversation([], {}, post=post)["stop"] == "content"
+
+
+def test_a_truncated_reply_that_still_carried_a_tool_call_is_not_ended_early():
+    """Truncation only ends the turn when there is nothing to run. A reply
+    that got its tool call out before the cap is ordinary work."""
+    reply = _assistant(tool_calls=[_call("c1", "print(7)")])
+    reply["choices"][0]["finish_reason"] = "length"
+    post = _Scripted([reply, _assistant(content="seven")])
+    out = agent.run_tool_conversation([], {}, post=post)
+    assert out["stop"] == "content"
+    assert out["tool_calls"] == 1
+
+
 def test_the_model_can_act_from_inside_its_own_code():
     """The point of the whole port: a computed sequence executed in one turn,
     not one action per round trip."""

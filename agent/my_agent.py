@@ -1228,6 +1228,18 @@ LLM_MODEL = os.getenv("ARC_LLM_MODEL", "vrfai/Qwen3.6-27B-FP8")
 LLM_TEMPERATURE = _env_float("ARC_LLM_TEMPERATURE", 0.6)
 LLM_TOP_P = _env_float("ARC_LLM_TOP_P", 0.95)
 LLM_TOP_K = _env_int("ARC_LLM_TOP_K", 20)
+# A ceiling on ONE response, which the payload did not have at all until
+# now. With `preserve_thinking` on and no cap, a single reply could run to
+# whatever `--max-model-len` left over -- tens of thousands of tokens --
+# and at v22's measured rate that is not a hypothetical cost.
+#
+# v22's arithmetic: ~200 tok/s aggregate over 25 games is ~8 tok/s each,
+# so ~7200 generated tokens per turn across ~12 tool calls, ~600 tokens a
+# call, ~75s a call, ~900s a turn against a 661s observed median. Decode
+# is the whole budget. 2048 sits well above the ~600 a call actually
+# uses, so it does not truncate ordinary work -- it only stops the runaway
+# that spends a game's entire hour inside one reply.
+LLM_MAX_TOKENS = _env_int("ARC_LLM_MAX_TOKENS", 2048)
 # Measured on the Blackwell card: a turn averaged 62.5s wall clock across
 # several generations, and one request still ran past a 120s deadline --
 # a thinking model with a grown transcript is simply slow sometimes. 300
@@ -1413,6 +1425,7 @@ def run_tool_conversation(
     temperature: float = LLM_TEMPERATURE,
     top_p: float = LLM_TOP_P,
     top_k: int = LLM_TOP_K,
+    max_tokens: int = LLM_MAX_TOKENS,
     stop_check: Any = None,
     label: str = "llm",
 ) -> dict[str, Any]:
@@ -1446,6 +1459,7 @@ def run_tool_conversation(
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
+            "max_tokens": max_tokens,
         }
         reply = send(payload)
         choices = reply.get("choices") or []
@@ -1456,8 +1470,21 @@ def run_tool_conversation(
 
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
+            # `length` means the reply hit `max_tokens` rather than finishing,
+            # so the turn is ending on a sentence the model was still writing
+            # -- not because it decided it was done. Those two look identical
+            # in a turn report unless they are named apart, and a cap that
+            # silently ends turns is exactly the kind of change that looks
+            # like a throughput win while quietly costing the run.
+            truncated = choices[0].get("finish_reason") == "length"
+            if truncated:
+                logger.warning(
+                    "%s: reply hit the %d-token cap with no tool call; "
+                    "the turn ends mid-thought",
+                    label, max_tokens,
+                )
             return {
-                "stop": "content",
+                "stop": "truncated" if truncated else "content",
                 "tool_calls": calls_made,
                 "content": message.get("content") or "",
             }
