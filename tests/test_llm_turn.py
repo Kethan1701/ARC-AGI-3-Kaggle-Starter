@@ -101,6 +101,7 @@ def _turn_agent(env):
     a._convert_raw_frame_data = lambda raw: raw
     a._llm_dead = False
     a._llm_failures = 0
+    a._llm_timeouts = 0
     a._llm_ns = {}
     a._llm_messages = []
     a._llm_history = []
@@ -120,6 +121,9 @@ def _turn_agent(env):
     a._turn_actions = 0
     a._turn_frame = None
     a._turn_level = 0
+    a._turn_labels = []
+    a._last_turn_labels = []
+    a._repeat_turns = 0
     a._last_view = None
     a._noop = False
     a._volatile = frozenset()
@@ -318,6 +322,65 @@ def test_one_slow_generation_does_not_write_off_a_working_server(monkeypatch):
     assert env.sent == [(1, None, None)]
 
 
+def test_a_busy_server_is_not_a_dead_one(monkeypatch):
+    """v25: 25 games share one vLLM server, 23 requests in flight on
+    average. A timeout there means the queue is deep, not that anything
+    broke -- but `cn04` hit three in a row, tripped the dead-server rule,
+    and played the rest of its run on the search alone: 28 actions, last
+    of 25 games."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+
+    def slow(_payload):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(agent_mod, "chat_completion", slow)
+    grid = agent_mod.grid_of(env.current)
+
+    assert agent_mod.LLM_MAX_TIMEOUTS > agent_mod.LLM_MAX_FAILURES, (
+        "a timeout has to be cheaper than a refused connection or this "
+        "test is measuring nothing"
+    )
+    for i in range(1, agent_mod.LLM_MAX_TIMEOUTS):
+        assert a._llm_turn(grid, env.current) is False
+        assert a._llm_dead is False, f"retired after {i} timeout(s)"
+
+    assert a._llm_turn(grid, env.current) is False
+    assert a._llm_dead is True, "a server that only ever times out is gone"
+
+
+def test_timeouts_and_transport_failures_are_counted_apart(monkeypatch):
+    """Otherwise alternating one of each retires the model on a server
+    that is merely busy and occasionally unlucky."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    a._llm_timeouts = agent_mod.LLM_MAX_TIMEOUTS - 1
+
+    monkeypatch.setattr(
+        agent_mod, "chat_completion",
+        lambda _p: (_ for _ in ()).throw(OSError("connection refused")),
+    )
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._llm_failures == 1, "a refused connection is not a timeout"
+    assert a._llm_timeouts == agent_mod.LLM_MAX_TIMEOUTS - 1
+    assert a._llm_dead is False
+
+
+def test_a_timeout_wrapped_in_a_urlerror_is_still_a_timeout():
+    """`urlopen` raises a bare TimeoutError once connected and a URLError
+    wrapping one if it timed out connecting. Reading the second spelling
+    as a dead server is exactly the bug being fixed."""
+    import urllib.error
+
+    assert agent_mod._is_timeout(TimeoutError("timed out"))
+    assert agent_mod._is_timeout(urllib.error.URLError(TimeoutError("x")))
+    assert not agent_mod._is_timeout(OSError("connection refused"))
+    assert not agent_mod._is_timeout(
+        urllib.error.HTTPError("u", 400, "Bad Request", {}, None)
+    )
+
+
 def test_a_recovered_turn_clears_the_failure_count(monkeypatch):
     """Otherwise three slow generations spread across a whole game would
     retire a server that worked fine in between."""
@@ -414,6 +477,111 @@ def test_the_turn_action_limit_holds(monkeypatch):
 
     assert len(env.sent) == 3
     assert a._turn_actions == 3
+
+
+# --- the lp85 loop -----------------------------------------------------
+#
+# v25, game lp85: nineteen consecutive turns, each one tool call emitting
+# the identical sixty-action batch, level frozen at 1. It had cleared
+# level 1 at action 13 and then spent 1238 more going nowhere. On a
+# (baseline/actions)^2 metric that is not idling, it is the most
+# expensive thing the agent did all run -- and no note ever fired,
+# because every existing nudge is about `predict` and none of them
+# tripped.
+
+
+def _play(a, env, monkeypatch, code):
+    _script(monkeypatch, [_reply(code=code), _reply(content="ok")])
+    return a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+
+def test_replaying_the_previous_turn_move_for_move_is_called_out(monkeypatch):
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+
+    _play(a, env, monkeypatch, "action(['ACTION1', 'ACTION2'])")
+    assert a._repeat_turns == 0, "the first turn has nothing to repeat"
+    assert "STOP" not in a._llm_note
+
+    _play(a, env, monkeypatch, "action(['ACTION1', 'ACTION2'])")
+    assert a._repeat_turns == 1
+    assert "STOP" in a._llm_note
+    assert "SQUARED" in a._llm_note, "say why it is expensive, not just that"
+
+
+def test_a_persistent_repeat_throws_the_transcript_away(monkeypatch):
+    """The note is tried first. If the model repeats anyway, what is
+    generating the repeat is the transcript of it agreeing with itself,
+    and only dropping that breaks the cycle."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    code = "action(['ACTION1', 'ACTION2'])"
+
+    _play(a, env, monkeypatch, code)
+    _play(a, env, monkeypatch, code)
+    assert len(a._llm_messages) > 1, "one repeat is a note, not a reset"
+
+    _play(a, env, monkeypatch, code)
+    assert len(a._llm_messages) == 1, "back to the system prompt alone"
+    assert "STOP" in a._llm_note, "the note survives the reset"
+    assert a._repeat_turns == 0, "the cycle is broken, start counting again"
+
+
+def test_a_different_batch_is_not_a_repeat(monkeypatch):
+    """Exact match on purpose. A model executing a long plan it actually
+    found must not be told it is looping."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+
+    _play(a, env, monkeypatch, "action(['ACTION1', 'ACTION2'])")
+    _play(a, env, monkeypatch, "action(['ACTION2', 'ACTION1'])")
+
+    assert a._repeat_turns == 0, "same actions, different order, is progress"
+    assert "STOP" not in a._llm_note
+
+
+def test_the_same_batch_that_cleared_a_level_is_not_a_repeat(monkeypatch):
+    """Replaying a sequence that just advanced the game is the one case
+    where doing the same thing twice is exactly right."""
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(), levels=1)] * 8)
+    a = _turn_agent(env)
+    code = "action(['ACTION1', 'ACTION2'])"
+
+    _play(a, env, monkeypatch, code)
+    _play(a, env, monkeypatch, code)
+
+    assert a._repeat_turns == 0
+    assert "STOP" not in a._llm_note
+
+
+def test_a_repeat_does_not_swallow_the_diagnostic_that_explains_it(
+    monkeypatch,
+):
+    """The first cut made the repeat warning the top branch of the note
+    chain, and it silently suppressed the drift note -- which is the half
+    that says WHY replaying the batch is not working. Both, or the model
+    is told to stop without being told what to do instead."""
+    a, _ = _drifting_agent(
+        monkeypatch, "result = action(['ACTION1', 'ACTION1'])\n"
+    )
+    assert a._repeat_turns == 1, "turn 2 replayed turn 1 move for move"
+    assert a._llm_note.startswith("STOP."), "the repeat leads"
+    assert "Checked for you" in a._llm_note, "and the drift note survives"
+
+
+def test_a_turn_that_played_nothing_is_not_a_repeat(monkeypatch):
+    """Two turns that both only reasoned have identical (empty) action
+    lists, and that is what the no-action nudge is for, not this one."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+
+    _script(monkeypatch, [_reply(content="thinking")])
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+    _script(monkeypatch, [_reply(content="thinking")])
+    a._llm_turn(agent_mod.grid_of(env.current), env.current)
+
+    assert a._repeat_turns == 0
+    assert "action()" in a._llm_note, "the no-action nudge still owns this"
 
 
 def test_the_action_counter_tracks_every_step_the_model_took(monkeypatch):
