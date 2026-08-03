@@ -287,18 +287,69 @@ def test_phase_a_plays_a_real_game_not_a_synthetic_one():
     plumbing = _plumbing(module)
     assert "environment_files" in plumbing, "no real games wired in"
     assert "score_competition.py" in plumbing
+    # Named games must reach the command line. An empty SMOKE_GAMES makes
+    # this vacuous on purpose -- that case means "every game", and is
+    # pinned by test_the_rehearsal_runs_at_the_concurrency_it_ships_at.
     for game in module.SMOKE_GAMES:
         assert game in plumbing, game
 
 
-def test_each_rehearsed_game_gets_its_own_deadline():
-    """The agent computes its deadline once at import, so two games in one
-    process means the first spends the whole budget. v18 did exactly that:
-    3806 seconds, one game, and twenty-four that never started."""
+def test_the_rehearsal_plays_its_games_concurrently():
+    """The rehearsal must exercise the code path that ships.
+
+    `agents.swarm.Swarm` starts one thread per game and joins them, so the
+    submission runs 25 vLLM streams at once. The rehearsal used to loop one
+    subprocess per game instead, which is a batch size of one -- and batch
+    size of one is exactly what made v24 unreadable: `Running: 1 reqs, GPU
+    KV cache usage: 7.1%`, 39 tok/s of single-stream decode, from which a
+    per-game action rate was read and then wrongly divided into the 9h
+    budget as though the real run queued its games too.
+
+    One `score_competition.py` invocation hands every game to Swarm at
+    once. A loop is the regression to guard against.
+    """
     module = _load_build_notebook()
     plumbing = _plumbing(module)
-    assert "for game in" in plumbing, "games must be played one process each"
-    assert len(module.SMOKE_GAMES) > 1
+    assert "for game in" not in plumbing, (
+        "a per-game loop serialises the rehearsal and measures a batch "
+        "size the submission never runs at"
+    )
+    assert plumbing.count("score_competition.py") == 1, (
+        "every game goes to one Swarm, in one process"
+    )
+
+
+def test_the_rehearsal_runs_at_the_concurrency_it_ships_at():
+    """Empty SMOKE_GAMES means no --game filter, which means all 25.
+
+    Naming a subset still works, but the default has to be the real batch
+    size: KV-cache pressure and request queueing only appear once the
+    batch is full, and learning that on a submission slot is the expensive
+    way to learn it.
+    """
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert module.SMOKE_GAMES == [], "the default rehearsal plays every game"
+    assert "if smoke_games:" in plumbing, "the filter must stay optional"
+    assert "'--game'" in plumbing, "naming a subset must still be possible"
+
+
+def test_the_rehearsal_budget_is_shared_not_per_game():
+    """Concurrent games share one wall clock, as they do in the real run.
+
+    Under the old serial loop the budget was spent once per game, so the
+    rehearsal cost SMOKE_SECONDS x len(SMOKE_GAMES). Now it is spent once
+    in total -- and with the games overlapped, that is the same GPU time
+    v24 used for two games spread across all of them.
+    """
+    module = _load_build_notebook()
+    plumbing = _plumbing(module)
+    assert plumbing.count("ARC_RUN_BUDGET_SECONDS") == 1
+    assert module.SMOKE_SECONDS >= 3600, (
+        "~320s of the budget is vLLM startup and one contended turn can "
+        "run for hundreds of seconds; a short budget reports warmup as a "
+        "throughput measurement"
+    )
 
 
 def test_the_vllm_install_stays_out_of_the_notebook_outputs():
