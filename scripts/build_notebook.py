@@ -113,17 +113,33 @@ VLLM_TARGET = "/tmp/vllm-site-packages"
 SERVER_WAIT_SECONDS = 900
 
 # --- the Phase A rehearsal --------------------------------------------------
-# One game, played for real. ls20 is the pick because its per-level
-# baselines are known ([22, 123, 73, 84, 96, 192, 186]) and it is
-# movement-driven, so "did the model make progress" is legible in the
-# actions/baseline column rather than needing interpretation.
-# ls20 is first for continuity: v16, v17 and v18 all played it, so its
-# numbers are directly comparable and every diagnosis so far came from it.
-# vc33 is the contrast -- a 7-action level-1 baseline against ls20's 22 --
-# which asks a different question. ls20 tests whether the pipeline can find
-# a goal at all; vc33 tests whether it can be CHEAP, and cheap is the only
-# thing the quadratic actually pays for.
-SMOKE_GAMES = ["ls20", "vc33"]
+# EMPTY MEANS EVERY GAME, and empty is the point.
+#
+# This was ["ls20", "vc33"], run one subprocess at a time. Two games in
+# sequence is a batch size of one, and a batch size of one is the single
+# thing about the rehearsal that does not resemble the submission: the
+# real run plays all 25 concurrently in one process (`agents.swarm`).
+#
+# v24 is what that costs. It reported 12.4 s/action on ls20 and halted on
+# the time budget, and the vLLM log says why: `Running: 1 reqs, Waiting: 0
+# reqs, GPU KV cache usage: 7.1%`, 39 tok/s. That is one stream on an idle
+# GPU. Every per-game rate this project has measured under the LLM has
+# been measured at that batch size, and none of them transfer.
+#
+# Naming games here still works and still filters. It is left empty so the
+# rehearsal answers the only question that decides whether the LLM path is
+# viable at all: at TWENTY-FIVE concurrent streams, how many actions per
+# game per second does the GPU actually deliver? That number scales
+# straight to the 9h budget. No smaller rehearsal can produce it, because
+# KV-cache pressure and request queueing do not appear until the batch is
+# full -- 7.1% per stream says ~14 fit before vLLM starts preempting, and
+# whether that thrashes is worth learning in Phase A rather than on a
+# submission slot.
+#
+# ls20 and vc33 are still in the set, so their v24 numbers stay directly
+# comparable -- now as a batch-1 vs batch-25 contrast rather than a
+# repeat measurement.
+SMOKE_GAMES: list[str] = []
 
 # This was 300, and 300 invalidated three GPU runs.
 #
@@ -152,12 +168,17 @@ SMOKE_STEPS = 1200
 # finish converging. It costs nothing in the real run: there the 25 games
 # are played concurrently in one process, so an hour per game is normal
 # rather than 25 hours of work.
-# Now PER GAME, not for the whole rehearsal. Two games at half an hour
-# each costs the same wall clock as v18's single hour and samples twice as
-# much. Half an hour bought v18 roughly three turns, which is enough to
-# see the pipeline reach the planning stage but not enough to watch it
-# converge -- that is the deliberate trade for a second game.
-SMOKE_SECONDS = 1800
+# SHARED across every game again, because the games now run at the same
+# time instead of one after another. Under the old serial loop this was
+# per-game and the rehearsal cost 2 x 1800s; one shared hour costs the
+# same GPU time as v24 did and covers 25 games instead of 2.
+#
+# An hour is also the shortest budget that can answer the throughput
+# question honestly. ~320s of it is vLLM server startup, and a single turn
+# under contention may run several hundred seconds, so a 1800s budget
+# risks games that finish startup, take one turn and report a rate made
+# entirely of warmup.
+SMOKE_SECONDS = 3600
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
@@ -554,25 +575,48 @@ def build() -> dict:
                 # SMOKE_STEPS in build_notebook.py for why that distinction
                 # cost three runs.
                 #
-                # One subprocess PER GAME, because the agent computes its
-                # deadline once at import: a single process playing two
-                # games serially gives the whole budget to the first, which
-                # is what v18 did -- 3806 seconds, one game, and 24 games
-                # that never started.
-                rcs = []
-                for game in {SMOKE_GAMES!r}:
-                    env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
-                    print(f'=== rehearsing {{game}} '
-                          f'({SMOKE_SECONDS}s budget) ===', flush=True)
-                    rcs.append(subprocess.call(
-                        [sys.executable, '/tmp/score_competition.py',
-                         '--game', game, '--max-steps', str({SMOKE_STEPS})],
-                        env=env))
+                # ONE process, ALL games, played CONCURRENTLY -- because that
+                # is what the real run does. `agents.swarm.Swarm` builds one
+                # agent per game, starts a thread for each and joins them, so
+                # a single invocation is the shipped code path rather than an
+                # approximation of it.
+                #
+                # This used to be a loop of one subprocess per game, run
+                # serially. That is the only configuration in which the vLLM
+                # server ever sees a single request at a time, and it is the
+                # configuration v24 measured: `Running: 1 reqs, Waiting: 0
+                # reqs, GPU KV cache usage: 7.1%` at 39 tok/s, which is
+                # single-stream decode on a GPU that was ~93% idle. A
+                # per-game action rate read off that run and then divided
+                # into the 9h budget double-counts the serialisation: the
+                # real run OVERLAPS its games instead of queueing them, so
+                # every game gets the whole wall clock, not 9h/25 of it.
+                #
+                # The serial loop was justified by "the agent computes its
+                # deadline once at import, so one process playing two games
+                # gives the whole budget to the first". That is true of games
+                # played in SEQUENCE and false of games played in PARALLEL,
+                # which is what Swarm does -- they share the deadline and run
+                # inside it together, exactly as the submission will.
+                #
+                # An empty SMOKE_GAMES means every game the gateway offers.
+                # That is deliberate: 25-way concurrency is the batch size we
+                # actually ship at, and any smaller rehearsal measures a
+                # throughput we will never see.
+                smoke_games = {SMOKE_GAMES!r}
+                cmd = [sys.executable, '/tmp/score_competition.py',
+                       '--max-steps', str({SMOKE_STEPS})]
+                if smoke_games:
+                    cmd += ['--game', ','.join(smoke_games)]
+                env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
+                print(f'=== rehearsing {{smoke_games or "ALL games"}} '
+                      f'concurrently ({SMOKE_SECONDS}s shared budget) ===',
+                      flush=True)
+                rc = subprocess.call(cmd, env=env)
 
                 # A non-zero exit is reported, not raised. This cell must not
                 # be able to fail the commit -- the run still has to produce
                 # a submission.parquet below.
-                rc = max(rcs) if rcs else 0
                 print('SMOKE OK' if rc == 0 else
                       f'SMOKE FAILED (rc={{rc}}) -- this agent would error on '
                       f'the leaderboard. Fix before submitting.')
