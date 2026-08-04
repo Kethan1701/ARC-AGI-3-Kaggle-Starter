@@ -112,28 +112,38 @@ VLLM_TARGET = "/tmp/vllm-site-packages"
 # silently demotes the whole run to the search.
 SERVER_WAIT_SECONDS = 900
 
-# Prefix caching is OFF, and that is the opposite of the obvious setting.
+# Prefix caching is ON. v23 turned it off as an experiment, and the
+# experiment said put it back.
 #
-# v22 shipped it on and the server log explains what that bought:
+# The case for turning it off rested on two lines from v22's server log:
 #
-#     config.py:441] Mamba cache mode is set to 'align' for
-#       Qwen3_5ForConditionalGeneration by default WHEN PREFIX CACHING IS ENABLED
+#     config.py:441] Mamba cache mode is set to 'align' ...
+#       by default when prefix caching is enabled
 #     config.py:281] Setting attention block size to 784 tokens to ensure
 #       that attention page size is >= mamba page size
 #
-# On a Mamba hybrid, asking for prefix caching forces the attention block
-# size to 784 tokens so the attention page can cover a mamba page. Paged
-# attention kernels are tuned for blocks of 16-128; 784 is far outside
-# that. And the hit rate it bought was ~0% -- 60 of 384 throughput samples
-# read exactly 0.0%, the bulk sat under 5%, because 25 games hold the KV
-# cache at 96% occupancy and nothing survives long enough to be reused.
+# read as: prefix caching forces a 784-token attention block (paged
+# attention is tuned for 16-128), and buys a ~0% hit rate in return.
 #
-# So it is all cost and no benefit: a large attention penalty plus block
-# granularity so coarse a prefix has to match 784 tokens exactly to hit.
-# Turning it off should restore the default block size. That is the whole
-# hypothesis and v23 exists to measure it -- read the two config.py lines
-# above out of the next vllm-server.log before believing it worked.
-ENABLE_PREFIX_CACHING = False
+# v23 ran with it off, and both halves of that were wrong:
+#
+#   * The block size is still 784. The config.py:281 line is identical in
+#     the v23 log, with no config.py:441 line above it. 784 is what this
+#     Mamba hybrid needs for an attention page to cover a mamba page; it
+#     is not something prefix caching caused, and switching prefix caching
+#     off does not buy it back.
+#   * The hit rate was never ~0%. That came from counting the samples that
+#     read exactly 0.0% and not the rest: over 384 samples the mean was
+#     31% and the p75 78%. Real reuse, thrown away.
+#
+# What the experiment cost, steady state at Running >= 20 reqs:
+#
+#     median generation   v22 277.6 tok/s -> v23 247.8 tok/s   (-11%)
+#     total generated     v22 1.04M       -> v23 905k
+#     total game actions  v22 2238        -> v23 1732
+#
+# So: on. And read a throughput number out of the log before changing it.
+ENABLE_PREFIX_CACHING = True
 
 # Rendered into the server argv. An empty string leaves the surrounding
 # list untouched -- writing a bare `#` comment here instead would swallow

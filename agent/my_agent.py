@@ -1228,18 +1228,32 @@ LLM_MODEL = os.getenv("ARC_LLM_MODEL", "vrfai/Qwen3.6-27B-FP8")
 LLM_TEMPERATURE = _env_float("ARC_LLM_TEMPERATURE", 0.6)
 LLM_TOP_P = _env_float("ARC_LLM_TOP_P", 0.95)
 LLM_TOP_K = _env_int("ARC_LLM_TOP_K", 20)
-# A ceiling on ONE response, which the payload did not have at all until
-# now. With `preserve_thinking` on and no cap, a single reply could run to
-# whatever `--max-model-len` left over -- tens of thousands of tokens --
-# and at v22's measured rate that is not a hypothetical cost.
+# A ceiling on ONE response. 0 means no ceiling, which is what ships,
+# because v23 measured what a ceiling actually costs here.
 #
-# v22's arithmetic: ~200 tok/s aggregate over 25 games is ~8 tok/s each,
-# so ~7200 generated tokens per turn across ~12 tool calls, ~600 tokens a
-# call, ~75s a call, ~900s a turn against a 661s observed median. Decode
-# is the whole budget. 2048 sits well above the ~600 a call actually
-# uses, so it does not truncate ordinary work -- it only stops the runaway
-# that spends a game's entire hour inside one reply.
-LLM_MAX_TOKENS = _env_int("ARC_LLM_MAX_TOKENS", 2048)
+# v23 set this to 2048 on the following reasoning: v22 generated ~200
+# tok/s aggregate over 25 games, so ~7200 tokens per turn across ~12 tool
+# calls is ~600 tokens a call, and 2048 sits comfortably above that.
+#
+# Every step of that is arithmetic on an aggregate, and the aggregate hid
+# the distribution. What v23 actually did, over 236 turns:
+#
+#     stop reason   truncated 178 | max-tool-calls 37 | halted 21
+#     tool calls per turn   median 0
+#     actions per turn      median 0
+#
+# 75% of turns hit the cap having emitted no tool call at all -- every one
+# of the 25 games, tr87 and g50t on all 15 and all 14 of theirs. The
+# model's reasoning preamble alone exceeds 2048 tokens on this task, so
+# the cap does not trim a runaway tail; it severs the reply before the
+# call it was reasoning towards. Turns got 2.9x shorter (637s -> 221s
+# median) and 2.4x more numerous, and total actions still fell 2238 ->
+# 1732, which is the signature of a turn that ends without doing anything.
+#
+# The plumbing and the `truncated` stop reason stay, so a future cap can
+# be measured rather than reasoned about -- but a cap needs the reply
+# length distribution first, and nothing here has measured it.
+LLM_MAX_TOKENS = _env_int("ARC_LLM_MAX_TOKENS", 0)
 # Measured on the Blackwell card: a turn averaged 62.5s wall clock across
 # several generations, and one request still ran past a 120s deadline --
 # a thinking model with a grown transcript is simply slow sometimes. 300
@@ -1459,8 +1473,12 @@ def run_tool_conversation(
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
-            "max_tokens": max_tokens,
         }
+        # Omitted rather than sent as 0: the server would read a 0 as a
+        # request for zero tokens, not as "no limit". Absent means the
+        # server's own default, which is what v22 shipped and measured.
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
         reply = send(payload)
         choices = reply.get("choices") or []
         if not choices:
