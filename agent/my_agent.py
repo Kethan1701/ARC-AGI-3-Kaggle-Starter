@@ -1228,18 +1228,52 @@ LLM_MODEL = os.getenv("ARC_LLM_MODEL", "vrfai/Qwen3.6-27B-FP8")
 LLM_TEMPERATURE = _env_float("ARC_LLM_TEMPERATURE", 0.6)
 LLM_TOP_P = _env_float("ARC_LLM_TOP_P", 0.95)
 LLM_TOP_K = _env_int("ARC_LLM_TOP_K", 20)
+# A ceiling on ONE response, which the payload did not have at all until
+# now. With `preserve_thinking` on and no cap, a single reply could run to
+# whatever `--max-model-len` left over -- tens of thousands of tokens --
+# and at v22's measured rate that is not a hypothetical cost.
+#
+# v22's arithmetic: ~200 tok/s aggregate over 25 games is ~8 tok/s each,
+# so ~7200 generated tokens per turn across ~12 tool calls, ~600 tokens a
+# call, ~75s a call, ~900s a turn against a 661s observed median. Decode
+# is the whole budget. 2048 sits well above the ~600 a call actually
+# uses, so it does not truncate ordinary work -- it only stops the runaway
+# that spends a game's entire hour inside one reply.
+LLM_MAX_TOKENS = _env_int("ARC_LLM_MAX_TOKENS", 2048)
 # Measured on the Blackwell card: a turn averaged 62.5s wall clock across
 # several generations, and one request still ran past a 120s deadline --
 # a thinking model with a grown transcript is simply slow sometimes. 300
 # is chosen to make the timeout mean "something is wrong" rather than
 # "this one was long", which is what it has to mean for the failure count
 # below to be worth anything.
-LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 300.0)
+#
+# 300 was measured at batch 1, on a GPU with nothing else on it. The
+# submission runs 25 games through one server: v25 had 23 requests in
+# flight on average, and a request that would have been served in 60s
+# alone now queues behind two dozen others. 31 timeouts landed in one
+# hour, and each one wasted the whole 300s AND threw the generation away.
+# 900 is the same rule -- "something is wrong", not "this one was long" --
+# re-measured at the concurrency we actually ship at.
+LLM_REQUEST_TIMEOUT = _env_float("ARC_LLM_REQUEST_TIMEOUT", 900.0)
 
 # Consecutive failed model calls before the search takes over the game.
 # Not 1: see `_llm_turn`. A dead server trips this immediately and pays
 # the retries once; a single slow generation costs one search step.
 LLM_MAX_FAILURES = _env_int("ARC_LLM_MAX_FAILURES", 3)
+# Consecutive TIMEOUTS before the same thing happens. Deliberately much
+# larger, because a timeout means something different from every other
+# transport failure: a refused connection says the server is gone, a
+# timeout says the queue is deep. In v25 `cn04` hit three timeouts in
+# three consecutive actions, had its model retired permanently, and
+# finished the run last -- 28 actions, one turn -- while the server it
+# was written off for went on serving 24 other games. Three strikes is
+# the right rule for a dead server and the wrong one for a busy one, so
+# the two are counted apart.
+LLM_MAX_TIMEOUTS = _env_int("ARC_LLM_MAX_TIMEOUTS", 12)
+# Consecutive identical turns before the transcript is thrown away. See
+# `_llm_turn`: 1 is a note, 2 says the note did not land and the model is
+# now agreeing with its own history, which only a reset breaks.
+LLM_REPEAT_RESET = _env_int("ARC_LLM_REPEAT_RESET", 2)
 # How many python calls the model may make per observe-plan-act turn.
 #
 # Was 12, on TAAF's principle that the model should not ration tool calls.
@@ -1292,6 +1326,23 @@ PYTHON_TOOL_SCHEMA = {
         },
     },
 }
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """Did this failure mean "too slow" rather than "not there"?
+
+    The distinction decides whether a game keeps its model (see
+    `_llm_turn`), so it is worth being exact about. `urlopen(timeout=)`
+    raises a bare `TimeoutError` -- which is what v25's 31 timeouts
+    surfaced as -- but a timeout during connect arrives wrapped in a
+    `URLError`, and that spelling must not be read as a dead server.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        return isinstance(reason, TimeoutError)
+    return False
 
 
 def chat_completion(
@@ -1374,6 +1425,7 @@ def run_tool_conversation(
     temperature: float = LLM_TEMPERATURE,
     top_p: float = LLM_TOP_P,
     top_k: int = LLM_TOP_K,
+    max_tokens: int = LLM_MAX_TOKENS,
     stop_check: Any = None,
     label: str = "llm",
 ) -> dict[str, Any]:
@@ -1407,6 +1459,7 @@ def run_tool_conversation(
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
+            "max_tokens": max_tokens,
         }
         reply = send(payload)
         choices = reply.get("choices") or []
@@ -1417,8 +1470,21 @@ def run_tool_conversation(
 
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
+            # `length` means the reply hit `max_tokens` rather than finishing,
+            # so the turn is ending on a sentence the model was still writing
+            # -- not because it decided it was done. Those two look identical
+            # in a turn report unless they are named apart, and a cap that
+            # silently ends turns is exactly the kind of change that looks
+            # like a throughput win while quietly costing the run.
+            truncated = choices[0].get("finish_reason") == "length"
+            if truncated:
+                logger.warning(
+                    "%s: reply hit the %d-token cap with no tool call; "
+                    "the turn ends mid-thought",
+                    label, max_tokens,
+                )
             return {
-                "stop": "content",
+                "stop": "truncated" if truncated else "content",
                 "tool_calls": calls_made,
                 "content": message.get("content") or "",
             }
@@ -3825,6 +3891,9 @@ class MyAgent(Agent):
         self._llm_dead = not LLM_ENABLED
         # Consecutive transport failures; reset by any successful turn.
         self._llm_failures = 0
+        # Consecutive timeouts, counted apart because they mean a busy
+        # server rather than an absent one. See LLM_MAX_TIMEOUTS.
+        self._llm_timeouts = 0
         # The model's own workspace, persisted for the whole game. See
         # `_llm_turn` -- rebuilding this per turn made a forward model
         # impossible to keep, and keeping one is the entire strategy.
@@ -3874,6 +3943,17 @@ class MyAgent(Agent):
         self._turn_actions = 0
         self._turn_frame: Optional[FrameData] = None
         self._turn_level = 0
+        # Exactly which actions this turn played, and the previous turn's,
+        # so a turn that replays its predecessor move for move can be seen.
+        # v25's `lp85` spent nineteen consecutive turns emitting the same
+        # sixty-action batch, one tool call each, level frozen -- 1140
+        # actions after clearing level 1 at action 13. On a metric that
+        # scores (baseline/actions)^2 that loop is not merely idle, it is
+        # the single most expensive thing the agent did all run, and
+        # nothing in the turn report distinguished it from progress.
+        self._turn_labels: list[str] = []
+        self._last_turn_labels: list[str] = []
+        self._repeat_turns = 0
         # The segmentation as of the previous action, handed over as
         # `previous_frame` so a diff is one subtraction away.
         self._last_view: Optional[dict[str, Any]] = None
@@ -4228,6 +4308,7 @@ class MyAgent(Agent):
             self._turn_frame = frame
             ran += 1
             self._turn_actions += 1
+            self._turn_labels.append(label)
             self._steps += 1
             # `Agent.main()` bills one per loop iteration and this turn
             # takes many, so without this MAX_ACTIONS would stop meaning
@@ -4524,6 +4605,7 @@ class MyAgent(Agent):
         started = time.monotonic()
 
         self._turn_actions = 0
+        self._turn_labels = []
         self._turn_frame = latest_frame
         self._turn_level = latest_frame.levels_completed
 
@@ -4603,12 +4685,26 @@ class MyAgent(Agent):
             # trips the limit immediately and costs a bounded number of
             # retries once, not per action; a single slow generation costs
             # one search step and is forgiven.
-            self._llm_failures += 1
-            retiring = self._llm_failures >= LLM_MAX_FAILURES
+            #
+            # Counted in two buckets, because v25 showed the same argument
+            # applies once more one level down. Under 25-way concurrency a
+            # timeout is the ordinary signature of a deep queue, not of a
+            # broken server, and three of them in a row retired `cn04`'s
+            # model for the rest of its run. A timeout therefore gets its
+            # own, much longer rope; anything else -- a refused connection,
+            # an HTTP 400 -- still gets three.
+            timed_out = _is_timeout(exc)
+            if timed_out:
+                self._llm_timeouts += 1
+                seen, limit = self._llm_timeouts, LLM_MAX_TIMEOUTS
+            else:
+                self._llm_failures += 1
+                seen, limit = self._llm_failures, LLM_MAX_FAILURES
+            retiring = seen >= limit
             logger.warning(
-                "%s: model call failed at action %d (%s: %s) [%d/%d]%s",
+                "%s: model call failed at action %d (%s: %s) [%s %d/%d]%s",
                 self.game_id, self._steps, type(exc).__name__, exc,
-                self._llm_failures, LLM_MAX_FAILURES,
+                "timeout" if timed_out else "transport", seen, limit,
                 "; retiring it, the search plays the rest of this game"
                 if retiring else "; falling back for this step only",
             )
@@ -4621,7 +4717,32 @@ class MyAgent(Agent):
             return False
 
         self._llm_failures = 0
+        self._llm_timeouts = 0
         self._llm_turns += 1
+
+        # Did this turn just replay the last one?
+        #
+        # Exact match, deliberately. A looser rule -- "hit the action cap
+        # again with one tool call and no level change" -- would also have
+        # caught lp85, and would also catch a model correctly executing a
+        # long plan it found. Replaying the identical sequence and
+        # expecting a different board is the one case that cannot be
+        # progress, so that is the case this fires on.
+        # `_turn_level` is the level as of the START of this turn and
+        # `_turn_frame` is where the turn left off, so this compares end
+        # against start. Comparing against `latest_frame` would compare the
+        # start against itself and always look stuck.
+        ended_on = (
+            self._turn_frame.levels_completed
+            if self._turn_frame is not None else self._turn_level
+        )
+        repeated = bool(
+            self._turn_labels
+            and self._turn_labels == self._last_turn_labels
+            and ended_on == self._turn_level
+        )
+        self._repeat_turns = self._repeat_turns + 1 if repeated else 0
+        self._last_turn_labels = list(self._turn_labels)
 
         # One line per turn. The first Blackwell run reported "136 actions"
         # and nothing else, which says the loop works but not whether the
@@ -4642,6 +4763,47 @@ class MyAgent(Agent):
             self._plans_found, self._plan_calls,
             self._tour_calls, self._goal_misses, self._exhaustions,
         )
+
+        # The repeat warning is a PREFIX, not a rung on the ladder below.
+        #
+        # It started as the top branch of that chain, which turned out to
+        # be wrong in a way two existing tests caught immediately: a model
+        # that replays a batch because its `predict` has gone stale needs
+        # to hear both things, and suppressing the drift note in favour of
+        # "you are repeating" throws away the half that says why. lp85 is
+        # still covered -- it had no drift signal at all, every verify
+        # counter sat at zero, so there the prefix is the whole note.
+        repeat_note = ""
+        if self._repeat_turns:
+            logger.warning(
+                "%s: turn %d replayed the previous turn's %d actions "
+                "exactly, still on level %d [%d in a row]%s",
+                self.game_id, self._llm_turns, len(self._turn_labels),
+                self._turn_level, self._repeat_turns,
+                "; resetting the transcript"
+                if self._repeat_turns >= LLM_REPEAT_RESET else "",
+            )
+            repeat_note = (
+                f"STOP. Your last turn played exactly the same "
+                f"{len(self._turn_labels)} actions as the turn before it, "
+                f"in the same order, and the level did not change. Playing "
+                f"them a third time cannot produce a different result. You "
+                f"are being scored on (baseline/actions) SQUARED, so those "
+                f"{len(self._turn_labels)} wasted actions cost you more "
+                f"than the whole level is worth. Do not call action() at "
+                f"the start of this turn. Look at the board image first, "
+                f"say what is actually different from what you expected, "
+                f"and test ONE new hypothesis with a short batch."
+            )
+            if self._repeat_turns >= LLM_REPEAT_RESET:
+                # The note alone did not land. The transcript is now
+                # several identical turns of the model agreeing with
+                # itself, which is the thing generating the repeat, so it
+                # goes -- the note and a fresh board survive in the next
+                # turn's prompt, which is all that is worth keeping.
+                self._llm_messages = self._llm_messages[:1]
+                self._last_turn_labels = []
+                self._repeat_turns = 0
 
         if self._exhaustions:
             # The v18 failure, and the deepest of the three: a model here
@@ -4707,6 +4869,9 @@ class MyAgent(Agent):
                 "Your last turn ended without calling action(). A move has "
                 "to be played, so one was chosen for you. Act this turn."
             )
+
+        if repeat_note:
+            self._llm_note = f"{repeat_note} {self._llm_note}".strip()
         return self._turn_actions > 0
 
     def _convert_raw_frame_data(self, raw: Any) -> FrameData:
