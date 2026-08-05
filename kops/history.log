@@ -1,0 +1,3 @@
+2026-08-03T00:00:00Z  (pre-kops)  v22: server + threaded (not concurrent) fix baseline -- official score 0.5326, clears>=1 9/25
+2026-08-04T00:00:00Z  d10312d  v23: prefix caching OFF + max_tokens=2048 cap, testing both as throughput wins -- official score 0.7230, clears>=1 6/25 (fewer clears, fewer total actions: both changes reverted after measurement, see arc-agi-3-kaggle-gpu-infra memory)
+2026-08-04T00:00:00Z  fbbb6bb  v24: revert of v23 (prefix caching back ON, no max_tokens cap) -- pushed to re-measure v22's exact config and gauge run-to-run variance in the v22<->v23 score gap

@@ -100,16 +100,24 @@ def test_the_payload_declares_the_python_tool_and_qwen_sampling():
     assert payload["top_p"] == agent.LLM_TOP_P
 
 
-def test_one_reply_is_capped_so_a_runaway_cannot_eat_the_run():
-    """`max_tokens` was missing from the payload entirely until v23.
-
-    With `preserve_thinking` on and no cap, a single reply could run to
-    whatever `--max-model-len` left over. At v22's measured ~8 tok/s per
-    game that is a game's whole hour inside one generation.
-    """
+def test_no_cap_ships_by_default_because_a_cap_cost_75_percent_of_turns():
+    """v23 shipped a 2048-token cap and 178 of its 236 turns hit it having
+    emitted no tool call at all. The reasoning preamble alone is longer than
+    that, so the cap severed replies before the call they were building
+    towards. Uncapped is the measured-good setting; the knob stays for a
+    future experiment that has the reply-length distribution first."""
     post = _Scripted([_assistant(content="ok")])
     agent.run_tool_conversation([], {}, post=post)
-    assert post.payloads[0]["max_tokens"] == agent.LLM_MAX_TOKENS
+    assert agent.LLM_MAX_TOKENS == 0
+    assert "max_tokens" not in post.payloads[0]
+
+
+def test_a_zero_cap_is_omitted_rather_than_sent_as_zero():
+    """A literal 0 on the wire reads as 'generate zero tokens', not as
+    'no limit' -- the difference between uncapped and mute."""
+    post = _Scripted([_assistant(content="ok")])
+    agent.run_tool_conversation([], {}, post=post, max_tokens=0)
+    assert "max_tokens" not in post.payloads[0]
 
 
 def test_the_cap_is_overridable_per_call():

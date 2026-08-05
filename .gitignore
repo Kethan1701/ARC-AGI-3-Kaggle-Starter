@@ -16,6 +16,11 @@ logs.log
 notebooks/submission.ipynb
 reference/
 
+# Pulled kernel run output (kops/pull.sh) -- run artefacts, not source.
+# kops/history.log is NOT here: it's the durable record of what shipped
+# when, and belongs in git.
+kaggle_runs/
+
 # OS / editors
 .DS_Store
 .idea/
