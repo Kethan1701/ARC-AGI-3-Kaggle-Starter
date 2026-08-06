@@ -86,6 +86,18 @@ def run() -> bool:
         # on. Losing the hysteresis silently reintroduces that. See
         # arc-agi-3-kaggle-gpu-infra memory.
         ("eviction holds its cut point with hysteresis", "LLM_EVICT_SLACK" in agent),
+        # v27 (2026-08-06): vLLM's own startup log said its CUDA-graph pool
+        # reservation was conservative by ~0.12GiB and named this exact pair
+        # of settings to recover it into the KV cache. Losing either half
+        # silently forfeits free KV-cache headroom on a card that's already
+        # spending 73% of samples above 80% KV usage (log analysis, see
+        # arc-agi-3-kaggle-gpu-infra memory).
+        (
+            "CUDA-graph memory profiler estimate is on",
+            "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in srv
+            or "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in agent,
+        ),
+        ("gpu-memory-utilization raised to 0.93 alongside it", "'0.93'," in srv),
     ]
 
     ok = True

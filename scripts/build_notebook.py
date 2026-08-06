@@ -410,6 +410,19 @@ def build() -> dict:
                 env['VLLM_NO_USAGE_STATS'] = '1'
                 env['HF_HUB_OFFLINE'] = '1'
                 env['TRANSFORMERS_OFFLINE'] = '1'
+                # v27 (2026-08-06): vLLM's own startup log measured its CUDA-graph
+                # pool reservation as conservative by ~0.12GiB (0.95 estimated vs
+                # 0.83 actual) and suggested this exact pairing -- exact-mode
+                # profiling of the graph pool plus +0.01 headroom below -- to
+                # recover that GiB into the KV cache instead of leaving it idle.
+                # Log analysis (v22, no GPU spend) confirmed KV-cache pressure,
+                # not client-side prefix instability, as the dominant cause of
+                # the ~0% median prefix-hit rate: hit rate is 72-82% median at
+                # 30-79% KV usage but collapses to 0-4% median at 80-99% usage,
+                # and 73% of samples sat in that high-pressure band. This won't
+                # fix that structurally, but it's free and vLLM-suggested. See
+                # arc-agi-3-kaggle-gpu-infra memory for the full analysis.
+                env['VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS'] = '1'
 
                 log = open('/kaggle/working/vllm-server.log', 'wb')
                 proc = subprocess.Popen([
@@ -429,7 +442,7 @@ def build() -> dict:
                     '--default-chat-template-kwargs',
                     json.dumps({{'preserve_thinking': True}}),
                     '--max-model-len', '65536',
-                    '--gpu-memory-utilization', '0.92',
+                    '--gpu-memory-utilization', '0.93',
                 ], env=env, stdout=log, stderr=subprocess.STDOUT)
 
                 deadline = time.time() + {SERVER_WAIT_SECONDS}
