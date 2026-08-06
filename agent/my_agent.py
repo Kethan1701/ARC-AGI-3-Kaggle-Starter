@@ -1404,7 +1404,9 @@ def render_tool_result(outcome: dict[str, Any], *, limit: int = TOOL_OUTPUT_CHAR
 
 
 def evict_turns(
-    messages: list[dict[str, Any]], keep_turns: int
+    messages: list[dict[str, Any]],
+    keep_turns: int,
+    slack: int | None = None,
 ) -> list[dict[str, Any]]:
     """Drop middle history, keeping the system prompt and the last turns.
 
@@ -1413,8 +1415,23 @@ def evict_turns(
     turn are always kept -- the first turn carries the game framing, and a
     model that loses it starts reasoning about a board with no idea what the
     game is. `keep_turns <= 0` means keep everything.
+
+    Trims in hysteresis, not on every call: the cut point only moves once
+    the transcript has grown `slack` turns past `keep_turns`, and then it
+    jumps straight back down to `keep_turns` rather than creeping forward
+    by however much this turn added. Without this, `tail_start` is a fresh
+    `len(messages) - keep_turns * 2` every single call, so the surviving
+    prefix's first byte moves every turn once a game runs long enough to
+    evict at all -- no two consecutive turns ever share a prefix, and no
+    server-side prefix cache can help no matter how good it is. See the
+    LLM_EVICT_SLACK comment for the measurement that found this.
     """
     if keep_turns <= 0 or len(messages) <= 2:
+        return messages
+    if slack is None:
+        slack = LLM_EVICT_SLACK
+    trigger = 2 + (keep_turns + max(slack, 0)) * 2
+    if len(messages) <= trigger:
         return messages
     head = [m for m in messages[:2]]
     tail_start = max(2, len(messages) - keep_turns * 2)
@@ -1587,6 +1604,24 @@ LLM_HISTORY = _env_int("ARC_LLM_HISTORY", 16)
 # so something has to go; what survives is the framing plus the recent
 # past. See `evict_turns`.
 LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
+
+# Extra turns of slack before eviction actually trims anything, measured
+# 2026-08-06 against v22/v24 (identical code, both runs): the cut point
+# used to be recomputed fresh every turn -- `tail_start` grows with
+# `len(messages)` -- so the surviving prefix's first byte moved on every
+# single turn once a game passed LLM_EVICT_TURNS. No two consecutive
+# turns ever sent the same prefix, so nothing before the newest turn's
+# tail could ever be a cache hit no matter how good the server's reuse
+# is: `Prefix cache hit rate` read median 0.0% in both runs despite
+# `--enable-prefix-caching`, and lp85's turn right after reaching level 1
+# (more accumulated history to re-walk) took 2338s for ONE action before
+# the game halted on the shared 3600s rehearsal clock -- see
+# arc-agi-3-kaggle-gpu-infra memory. Holding the cut point steady for
+# `LLM_EVICT_SLACK` turns and then trimming back to LLM_EVICT_TURNS in
+# one jump means most turns reuse the exact prefix the turn before it
+# already sent, at the cost of carrying a slightly longer transcript
+# (up to LLM_EVICT_TURNS + LLM_EVICT_SLACK turns) in between jumps.
+LLM_EVICT_SLACK = _env_int("ARC_LLM_EVICT_SLACK", 2)
 
 # Objects rendered into the prompt text. The full segmentation is always
 # in the namespace for the model's own code to walk; this caps only what
