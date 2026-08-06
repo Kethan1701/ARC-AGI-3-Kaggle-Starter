@@ -1404,17 +1404,39 @@ def render_tool_result(outcome: dict[str, Any], *, limit: int = TOOL_OUTPUT_CHAR
 
 
 def evict_turns(
-    messages: list[dict[str, Any]], keep_turns: int
+    messages: list[dict[str, Any]],
+    keep_turns: int,
+    slack: int | None = None,
 ) -> list[dict[str, Any]]:
     """Drop middle history, keeping the system prompt and the last turns.
 
-    Context is 32768 tokens and a single segmentation dump can be thousands
-    of them, so old turns have to go. The system prompt and the FIRST user
-    turn are always kept -- the first turn carries the game framing, and a
-    model that loses it starts reasoning about a board with no idea what the
-    game is. `keep_turns <= 0` means keep everything.
+    Context is 65536 tokens (`max_model_len` in the vLLM startup args --
+    an older version of this comment said 32768, which was never measured
+    against the server and was just wrong) and a single segmentation dump
+    can be thousands of them, so old turns have to go. The system prompt
+    and the FIRST user turn are always kept -- the first turn carries the
+    game framing, and a model that loses it starts reasoning about a board
+    with no idea what the game is. `keep_turns <= 0` means keep everything.
+
+    Can trim in hysteresis (`slack > 0`): the cut point only moves once the
+    transcript has grown `slack` turns past `keep_turns`, instead of
+    creeping forward by however much this turn added. The idea (v25,
+    2026-08-06) was that a steady cut point lets consecutive turns share an
+    identical prefix, which the server-side prefix cache could then reuse.
+    Measured and NOT confirmed: v25's hit rate didn't move, and v26 (same
+    slack, a longer rehearsal) hit six `HTTP 400: Input length exceeds
+    model's maximum context length` rejections that v22/v24 (slack effectively
+    0) mostly didn't -- holding a longer transcript between jumps tips some
+    turns just over 65536. LLM_EVICT_SLACK now defaults to 0 for that
+    reason; see its comment and arc-agi-3-kaggle-gpu-infra memory before
+    raising it again.
     """
     if keep_turns <= 0 or len(messages) <= 2:
+        return messages
+    if slack is None:
+        slack = LLM_EVICT_SLACK
+    trigger = 2 + (keep_turns + max(slack, 0)) * 2
+    if len(messages) <= trigger:
         return messages
     head = [m for m in messages[:2]]
     tail_start = max(2, len(messages) - keep_turns * 2)
@@ -1587,6 +1609,31 @@ LLM_HISTORY = _env_int("ARC_LLM_HISTORY", 16)
 # so something has to go; what survives is the framing plus the recent
 # past. See `evict_turns`.
 LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
+
+# Extra turns of slack before eviction actually trims anything.
+#
+# The theory (2026-08-06, v25): the cut point used to be recomputed fresh
+# every turn -- `tail_start` grows with `len(messages)` -- so the
+# surviving prefix's first byte moved on every single turn once a game
+# passed LLM_EVICT_TURNS, and no two consecutive turns ever sent the same
+# prefix. Holding the cut point steady for a few turns and then trimming
+# in one jump should have let most turns reuse the prior turn's prefix.
+#
+# It didn't work, and it has a real cost. v25 (slack=2) measured prefix
+# hit rate median 2.1% against v22's 4.0% and v24's 0.0% -- flat, not the
+# hoped-for jump, so the theory's own target metric never moved. Worse,
+# v26 (slack=2, 2x rehearsal budget) hit SIX separate `HTTP Error 400`
+# rejections from vLLM, all `Input length exceeds model's maximum context
+# length (65536)` by 1-183 tokens -- carrying a longer transcript between
+# jumps tips some turns just over the real limit (not 32768 as an older
+# comment here claimed; verified from vllm-server.log's own startup args,
+# `max_model_len: 65536`). v22 saw one such error, v24 zero, v25 three:
+# the count tracks the slack, not chance. Given the benefit never
+# measured and the cost did, default is back to 0 (== the original
+# every-turn trim, safe by construction: it never lets the transcript run
+# long enough to approach 65536). See arc-agi-3-kaggle-gpu-infra memory
+# for the full v25/v26 numbers before changing this again.
+LLM_EVICT_SLACK = _env_int("ARC_LLM_EVICT_SLACK", 0)
 
 # Objects rendered into the prompt text. The full segmentation is always
 # in the namespace for the model's own code to walk; this caps only what

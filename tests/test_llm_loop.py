@@ -310,3 +310,36 @@ def test_eviction_is_a_no_op_when_disabled_or_short():
     assert agent.evict_turns(messages, 0) is messages
     short = messages[:2]
     assert agent.evict_turns(short, 5) is short
+
+
+def test_eviction_holds_the_cut_point_steady_within_slack():
+    """The point of the slack: a transcript that has grown past keep_turns
+    but not past keep_turns + slack must come back untouched (same object),
+    so the next request's prefix is byte-identical to this one's -- that is
+    what lets the server's prefix cache actually hit. Trimming on every
+    call, as the old unconditional `tail_start` did, moved the surviving
+    prefix's first byte every single turn and nothing before the tail could
+    ever be a repeat."""
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "first"}]
+    for i in range(4):
+        messages.append({"role": "assistant", "content": f"a{i}"})
+        messages.append({"role": "user", "content": f"u{i}"})
+    # keep_turns=2, slack=2 -> trigger at 2 + (2+2)*2 = 10 messages; this
+    # transcript has exactly 2 + 8 = 10, one turn (2 messages) past
+    # keep_turns but still at the trigger, not past it.
+    kept = agent.evict_turns(messages, 2, slack=2)
+    assert kept is messages
+
+
+def test_eviction_jumps_back_to_keep_turns_once_slack_is_exhausted():
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "first"}]
+    for i in range(10):
+        messages.append({"role": "assistant", "content": f"a{i}"})
+        messages.append({"role": "user", "content": f"u{i}"})
+    kept = agent.evict_turns(messages, 2, slack=2)
+    assert kept is not messages
+    assert kept[0]["content"] == "sys"
+    assert kept[1]["content"] == "first"
+    assert kept[-1]["content"] == "u9"
+    # Trimmed straight back down to keep_turns, not to keep_turns + slack.
+    assert len(kept) == 2 + 2 * 2

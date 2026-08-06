@@ -216,7 +216,19 @@ SMOKE_STEPS = 1200
 # under contention may run several hundred seconds, so a 1800s budget
 # risks games that finish startup, take one turn and report a rate made
 # entirely of warmup.
-SMOKE_SECONDS = 3600
+#
+# Raised 3600 -> 7200 (2026-08-06, v26) to test whether `clears>=2: 0/25`
+# -- true in every rehearsal run so far (v22, v24, v25) -- is a real
+# ceiling or just this clock. It's probably the clock: v24's own
+# transcript shows lp85 and sb26 both reaching level 1 cheaply, then their
+# very next turn (2338s and 3291s respectively, the most accumulated
+# history either game had yet) got cut off mid-turn by `stopping on
+# global time budget`, not by an action or tool-call cap. The real
+# submission runs at RUN_BUDGET_SECONDS = 7.5 * 3600 -- 7.5x this. 7200 is
+# a first, moderate step (2x cost, not 7.5x) to see whether either game
+# pushes past its previous halt point before committing to the full-cost
+# test. See arc-agi-3-kaggle-gpu-infra memory.
+SMOKE_SECONDS = 7200
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
@@ -398,6 +410,19 @@ def build() -> dict:
                 env['VLLM_NO_USAGE_STATS'] = '1'
                 env['HF_HUB_OFFLINE'] = '1'
                 env['TRANSFORMERS_OFFLINE'] = '1'
+                # v27 (2026-08-06): vLLM's own startup log measured its CUDA-graph
+                # pool reservation as conservative by ~0.12GiB (0.95 estimated vs
+                # 0.83 actual) and suggested this exact pairing -- exact-mode
+                # profiling of the graph pool plus +0.01 headroom below -- to
+                # recover that GiB into the KV cache instead of leaving it idle.
+                # Log analysis (v22, no GPU spend) confirmed KV-cache pressure,
+                # not client-side prefix instability, as the dominant cause of
+                # the ~0% median prefix-hit rate: hit rate is 72-82% median at
+                # 30-79% KV usage but collapses to 0-4% median at 80-99% usage,
+                # and 73% of samples sat in that high-pressure band. This won't
+                # fix that structurally, but it's free and vLLM-suggested. See
+                # arc-agi-3-kaggle-gpu-infra memory for the full analysis.
+                env['VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS'] = '1'
 
                 log = open('/kaggle/working/vllm-server.log', 'wb')
                 proc = subprocess.Popen([
@@ -417,7 +442,7 @@ def build() -> dict:
                     '--default-chat-template-kwargs',
                     json.dumps({{'preserve_thinking': True}}),
                     '--max-model-len', '65536',
-                    '--gpu-memory-utilization', '0.92',
+                    '--gpu-memory-utilization', '0.93',
                 ], env=env, stdout=log, stderr=subprocess.STDOUT)
 
                 deadline = time.time() + {SERVER_WAIT_SECONDS}

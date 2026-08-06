@@ -1,3 +1,8 @@
 2026-08-03T00:00:00Z  (pre-kops)  v22: server + threaded (not concurrent) fix baseline -- official score 0.5326, clears>=1 9/25
 2026-08-04T00:00:00Z  d10312d  v23: prefix caching OFF + max_tokens=2048 cap, testing both as throughput wins -- official score 0.7230, clears>=1 6/25 (fewer clears, fewer total actions: both changes reverted after measurement, see arc-agi-3-kaggle-gpu-infra memory)
 2026-08-04T00:00:00Z  fbbb6bb  v24: revert of v23 (prefix caching back ON, no max_tokens cap) -- pushed to re-measure v22's exact config and gauge run-to-run variance in the v22<->v23 score gap
+2026-08-06T08:10:24Z  7595343  v25: eviction hysteresis (LLM_EVICT_SLACK=2), testing whether the prefix cache actually hits and turns after level-1 stop churning through the sliding window
+2026-08-06T09:25:05Z  7595343  v25: eviction hysteresis result -- official score 0.3286, clears>=1 6/25, prefix hit % median 2.1 (v22 4.0, v24 0.0) -- hit rate did NOT move meaningfully; hypothesis not confirmed, see arc-agi-3-kaggle-gpu-infra memory
+2026-08-06T09:30:42Z  b3d34d2  v26: SMOKE_SECONDS 3600->7200, testing whether clears>=2:0/25 is a real ceiling or the 1hr rehearsal clock cutting lp85/sb26 off right after level 1
+2026-08-06T12:39:27Z  b3d34d2  v26: 2x rehearsal budget (7200s) result -- score 0.3197, clears>=1 8/25, clears>=2 STILL 0/25 despite lp85 clearing level 1 in 18 actions with most of the budget unused; found the real blocker instead: 6x HTTP 400 context-overflow (input>65536) errors, up from 1/0 in v22/v24 -- traced to LLM_EVICT_SLACK, reverted in e2c2a6b
+2026-08-06T12:39:28Z  e2c2a6b  revert: LLM_EVICT_SLACK default 2->0 -- no measured cache-hit benefit (v25), measured context-overflow cost (v26). Back to the original every-turn trim.
