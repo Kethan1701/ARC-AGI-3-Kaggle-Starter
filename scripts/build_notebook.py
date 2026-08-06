@@ -575,6 +575,17 @@ def build() -> dict:
             # and the agent plays the search. That is the entire fallback, and
             # it is one line of shell on purpose: there is no state to get
             # wrong and nothing to misreport.
+            #
+            # Deliberately NOT wave_runner.py: `arc_agi.api.ScorecardManager`
+            # rejects a second `open_scorecard()` in competition mode with a
+            # 409 ("cannot open multiple scorecards in competition mode"),
+            # and the flag it checks (`scorecard_openned`) is never reset --
+            # confirmed by reading arc_agi/api.py and reproducing the 409
+            # against a local rehearsal harness. Every wave after the first
+            # would score zero. See arc-agi-3-kaggle-gpu-infra memory before
+            # attempting concurrency-reduction again; it needs a single
+            # shared scorecard across all games, which the official
+            # unmodified `main.py`/`Swarm` has no way to do.
             !cd /kaggle/working/ARC-AGI-3-Agents && MPLBACKEND=agg \\
                 __POLICY_ENV__bash -c '[ -f /tmp/llm.env ] && . /tmp/llm.env; \\
                 exec python main.py --agent myagent'
@@ -643,6 +654,14 @@ def build() -> dict:
                 # agent per game, starts a thread for each and joins them, so
                 # a single invocation is the shipped code path rather than an
                 # approximation of it.
+                #
+                # (2026-08-06: a wave-based, reduced-concurrency variant was
+                # built and reverted the same day -- `arc_agi.api`'s
+                # ScorecardManager allows exactly one scorecard per
+                # competition-mode session, ever, so no amount of
+                # orchestration can split a run into sequential batches
+                # without reimplementing Swarm's internals. See
+                # arc-agi-3-kaggle-gpu-infra memory.)
                 #
                 # This used to be a loop of one subprocess per game, run
                 # serially. That is the only configuration in which the vLLM

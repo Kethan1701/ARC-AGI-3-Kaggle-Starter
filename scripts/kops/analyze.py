@@ -54,16 +54,64 @@ def _lines(path: Path) -> list[str]:
 
 
 def scorecard(label: str) -> dict | None:
+    """Every "--- FINAL SCORECARD REPORT ---" in the log, decoded and
+    merged into one aggregate.
+
+    Normally there's exactly one (one Swarm.main() call -> one scorecard),
+    duplicated 3x by the interleaved-log-lines issue this file's docstring
+    already warns about -- dedup by `card_id` handles that case for free.
+    Since 2026-08-06 (wave-based concurrency, scripts/wave_runner.py) a
+    single run can legitimately produce several DISTINCT scorecards, one
+    per wave, each covering a disjoint set of games -- taking only the
+    first (the old behaviour) would silently under-report every wave
+    after the first, exactly the kind of wrong-number bug this file
+    exists to catch. `score` is recomputed as the mean of every merged
+    environment's score, which is the same formula the framework itself
+    uses (verified against a real single-scorecard report, v27:
+    card['score'] == mean(e['score'] for e in envs) to full float
+    precision) -- just applied after concatenation instead of before.
+    """
     path = RUNS_DIR / label / GAME_LOG
     if not path.exists():
         return None
     blob = "\n".join(_lines(path))
-    i = blob.find("--- FINAL SCORECARD REPORT ---")
-    if i < 0:
+    cards_by_id: dict[str, dict] = {}
+    marker = "--- FINAL SCORECARD REPORT ---"
+    i = 0
+    while True:
+        i = blob.find(marker, i)
+        if i < 0:
+            break
+        i += len(marker)  # always advance past this marker, decode or not --
+        # an interleaved/partial duplicate (25 threads writing the same log
+        # concurrently can split one JSON dump across other games' lines)
+        # must not stop later, VALID occurrences from being found too.
+        j = blob.find("{", i)
+        if j < 0:
+            continue
+        try:
+            card, _ = json.JSONDecoder().raw_decode(blob[j:])
+        except json.JSONDecodeError:
+            continue
+        cards_by_id[card.get("card_id", j)] = card
+
+    if not cards_by_id:
         return None
-    j = blob.find("{", i)
-    card, _ = json.JSONDecoder().raw_decode(blob[j:])
-    return card
+    cards = list(cards_by_id.values())
+    if len(cards) == 1:
+        return cards[0]
+
+    envs = [e for c in cards for e in c["environments"]]
+    merged = dict(cards[0])
+    merged["environments"] = envs
+    merged["score"] = sum(e["score"] for e in envs) / len(envs) if envs else 0.0
+    merged["total_environments"] = len(envs)
+    merged["total_environments_completed"] = sum(
+        1 for e in envs if e["levels_completed"] >= 1
+    )
+    merged["total_levels_completed"] = sum(e["levels_completed"] for e in envs)
+    merged["total_actions"] = sum(e["actions"] for e in envs)
+    return merged
 
 
 def print_scorecard(label: str, card: dict) -> None:

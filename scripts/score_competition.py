@@ -15,6 +15,15 @@ What `competition_mode=True` changes (both verified against the real API):
      is exactly the condition `arcengine.base_game.handle_reset` uses to pick
      `full_reset()`, so the "double RESET opens a fresh scored run" trick is
      specifically defeated -- and costs you an action for nothing.
+  3. Exactly one scorecard per session, ever. `arc_agi.api`'s
+     `ScorecardManager` rejects a second `open_scorecard()` with a 409
+     ("cannot open multiple scorecards in competition mode") and never
+     resets the flag that blocks it -- confirmed 2026-08-06 while building
+     (and reverting) a wave-based, reduced-concurrency Swarm loop here. Any
+     future attempt at running games in sequential batches needs a single
+     shared scorecard across the whole run, which means bypassing `Swarm`
+     entirely rather than calling it more than once. See
+     arc-agi-3-kaggle-gpu-infra memory before trying again.
 
 Net effect: exploration is not free. Every action spent searching is an action
 charged against the level you are searching, and there is no second pass to
