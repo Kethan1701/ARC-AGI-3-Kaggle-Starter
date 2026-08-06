@@ -216,7 +216,19 @@ SMOKE_STEPS = 1200
 # under contention may run several hundred seconds, so a 1800s budget
 # risks games that finish startup, take one turn and report a rate made
 # entirely of warmup.
-SMOKE_SECONDS = 3600
+#
+# Raised 3600 -> 7200 (2026-08-06, v26) to test whether `clears>=2: 0/25`
+# -- true in every rehearsal run so far (v22, v24, v25) -- is a real
+# ceiling or just this clock. It's probably the clock: v24's own
+# transcript shows lp85 and sb26 both reaching level 1 cheaply, then their
+# very next turn (2338s and 3291s respectively, the most accumulated
+# history either game had yet) got cut off mid-turn by `stopping on
+# global time budget`, not by an action or tool-call cap. The real
+# submission runs at RUN_BUDGET_SECONDS = 7.5 * 3600 -- 7.5x this. 7200 is
+# a first, moderate step (2x cost, not 7.5x) to see whether either game
+# pushes past its previous halt point before committing to the full-cost
+# test. See arc-agi-3-kaggle-gpu-infra memory.
+SMOKE_SECONDS = 7200
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
