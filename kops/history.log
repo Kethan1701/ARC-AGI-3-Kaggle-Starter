@@ -1,3 +1,5 @@
 2026-08-03T00:00:00Z  (pre-kops)  v22: server + threaded (not concurrent) fix baseline -- official score 0.5326, clears>=1 9/25
 2026-08-04T00:00:00Z  d10312d  v23: prefix caching OFF + max_tokens=2048 cap, testing both as throughput wins -- official score 0.7230, clears>=1 6/25 (fewer clears, fewer total actions: both changes reverted after measurement, see arc-agi-3-kaggle-gpu-infra memory)
 2026-08-04T00:00:00Z  fbbb6bb  v24: revert of v23 (prefix caching back ON, no max_tokens cap) -- pushed to re-measure v22's exact config and gauge run-to-run variance in the v22<->v23 score gap
+2026-08-06T08:10:24Z  7595343  v25: eviction hysteresis (LLM_EVICT_SLACK=2), testing whether the prefix cache actually hits and turns after level-1 stop churning through the sliding window
+2026-08-06T09:25:05Z  7595343  v25: eviction hysteresis result -- official score 0.3286, clears>=1 6/25, prefix hit % median 2.1 (v22 4.0, v24 0.0) -- hit rate did NOT move meaningfully; hypothesis not confirmed, see arc-agi-3-kaggle-gpu-infra memory
