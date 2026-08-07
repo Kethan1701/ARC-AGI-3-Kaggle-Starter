@@ -1336,7 +1336,23 @@ LLM_REPEAT_RESET = _env_int("ARC_LLM_REPEAT_RESET", 2)
 # GPU run can measure whether that cost shows up before considering
 # anything bigger. Judge on clears>=1, clears>=2, cap-hit fraction, AND
 # the KV-bucket hit-rate curve against v27 -- not score alone.
-LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 16)
+#
+# v29 GPU result (2026-08-06): that cost showed up, and it wasn't offset.
+# Same-mechanism, apples-to-apples signal: in the 80-99% KV-usage band,
+# v29 put MORE of its samples there (82% vs v27's 76%) and got a LOWER
+# hit rate once there (3.4% vs 4.7%) -- raising the cap measurably made
+# the exact pressure v27 had just relieved worse again. Game outcomes
+# were a wash at best: clears>=1 fell 11->10 (lost tn36/re86/s5i5, gained
+# sp80/cn04), total actions fell 5158->3729 and total turns 175->117
+# (longer turns -> fewer of them fit the fixed run budget), and the
+# cap-hit fraction barely moved (40.6%->41.9%) -- most turns still
+# exhaust whatever cap they're given, so the extra headroom bought
+# little. The local score rose (0.67->0.88) only because 2 games
+# deepened to level 2, which the quadratic formula rewards heavily; per
+# arc-agi-3-open-threads, level-1 breadth is what the score target
+# actually needs, and that's what fell. Reverted to 12. See
+# arc-agi-3-kaggle-gpu-infra memory before raising this again.
+LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
 
 PYTHON_TOOL_SCHEMA = {
     "type": "function",
