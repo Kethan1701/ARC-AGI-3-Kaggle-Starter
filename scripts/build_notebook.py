@@ -443,6 +443,29 @@ def build() -> dict:
                     json.dumps({{'preserve_thinking': True}}),
                     '--max-model-len', '65536',
                     '--gpu-memory-utilization', '0.93',
+                    # v30 (2026-08-07): the v27 memory-profiler fix and the
+                    # (reverted) wave-based-concurrency and tool-call-cap
+                    # attempts all tried to shrink demand on the KV pool.
+                    # This instead grows supply. v27's own startup log shows
+                    # `kv_cache_dtype=auto`, which for this fp8-quantized
+                    # model resolves to the model's compute dtype
+                    # (`dtype=torch.bfloat16`) -- 2 bytes/token -- not fp8.
+                    # Setting it explicitly halves KV memory per token,
+                    # roughly doubling how many tokens the same 93%-utilized
+                    # pool can hold, which should relieve the 76-82%-of-
+                    # samples-stuck-in-the-80-99%-usage-band finding at its
+                    # root (see arc-agi-3-kaggle-gpu-infra memory) instead of
+                    # trimming what's competing for it. v27's own `Waiting:`
+                    # telemetry was ~0 almost always (no admission queue
+                    # backpressure -- ruled out oversubscription-of-max-
+                    # concurrency as the mechanism first), so this targets
+                    # block occupancy/reuse, not scheduling. Known trade-off:
+                    # fp8 KV cache is a lossy quantization of attention
+                    # state, a small accuracy cost that hasn't been paid
+                    # anywhere else in this pipeline yet -- worth watching
+                    # tool-parse/action-validity rates, not just throughput,
+                    # on this run.
+                    '--kv-cache-dtype', 'fp8',
                 ], env=env, stdout=log, stderr=subprocess.STDOUT)
 
                 deadline = time.time() + {SERVER_WAIT_SECONDS}

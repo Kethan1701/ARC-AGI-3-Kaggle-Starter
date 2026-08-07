@@ -98,6 +98,13 @@ def run() -> bool:
             or "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in agent,
         ),
         ("gpu-memory-utilization raised to 0.93 alongside it", "'0.93'," in srv),
+        # v30 (2026-08-07): `kv_cache_dtype=auto` resolves to bf16 (the
+        # model's compute dtype) for this fp8-quantized model, not fp8 --
+        # confirmed by reading v27's own engine-init log line. Losing this
+        # flag silently drops back to bf16 KV cache (2x the memory per
+        # token) with no error, undoing the whole point of the change. See
+        # arc-agi-3-kaggle-gpu-infra memory.
+        ("KV cache stored as fp8, not the model's bf16 compute dtype", "'--kv-cache-dtype', 'fp8'" in srv),
         # 2026-08-06: a wave-based, reduced-concurrency Swarm loop was
         # built and reverted the same day -- competition mode allows
         # exactly one scorecard per session, ever (arc_agi.api's
