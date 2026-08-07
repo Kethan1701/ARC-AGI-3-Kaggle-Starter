@@ -98,6 +98,21 @@ def run() -> bool:
             or "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in agent,
         ),
         ("gpu-memory-utilization raised to 0.93 alongside it", "'0.93'," in srv),
+        # 2026-08-06: a wave-based, reduced-concurrency Swarm loop was
+        # built and reverted the same day -- competition mode allows
+        # exactly one scorecard per session, ever (arc_agi.api's
+        # ScorecardManager never resets the flag that blocks a second
+        # open), confirmed by reading the source and reproducing the 409
+        # locally. The real run cell must keep calling `main.py` directly;
+        # a regression back to a wave_runner.py invocation without first
+        # solving the single-shared-scorecard problem would silently score
+        # zero on every game after the first. See arc-agi-3-kaggle-gpu-infra
+        # memory before attempting this again.
+        (
+            "the real run cell execs main.py directly (no wave_runner.py)",
+            "exec python main.py --agent myagent"
+            in _first(cells, "KAGGLE_IS_COMPETITION_RERUN"),
+        ),
     ]
 
     ok = True

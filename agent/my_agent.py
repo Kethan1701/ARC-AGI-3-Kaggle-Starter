@@ -1315,6 +1315,43 @@ LLM_REPEAT_RESET = _env_int("ARC_LLM_REPEAT_RESET", 2)
 # set below what the work needs buys overhead rather than thinking. If v17
 # still ends every turn at 12 AND accuracy has stopped climbing, then it is
 # the loop and this should come back down rather than up.
+#
+# v29 (2026-08-06): revisited, deliberately deferred until now so it
+# wouldn't be conflated with the KV-cache-pressure work (v25-v27). v27
+# shows 71/175 turns (40.6%) still ending at 12, softer than the "every
+# single turn" that justified the 6->12 move, but not nothing -- and
+# reading the highest-action cap-hit turns directly (lf52 52 actions/12
+# calls, bp35 51/12, wa30 47/12, all still level 0, none showing the
+# "0 transitions, repeated identically" signature that flagged v15's loop)
+# looks like genuine varied work, not a loop, the same kind of evidence
+# that raised this to 12 last time.
+#
+# The NEW consideration the 6->12 decision never had: this session's
+# KV-cache-pressure analysis (see arc-agi-3-kaggle-gpu-infra memory) found
+# 73-82% of server samples already sitting in the 80-99% KV-usage band,
+# where prefix-cache hit rate collapses. A longer cap means longer turns
+# means heavier individual requests, which could push MORE samples into
+# that band -- a real cost this change might have that the last one
+# didn't. 16 (a ~33% step, not a jump to 24) is deliberately moderate so a
+# GPU run can measure whether that cost shows up before considering
+# anything bigger. Judge on clears>=1, clears>=2, cap-hit fraction, AND
+# the KV-bucket hit-rate curve against v27 -- not score alone.
+#
+# v29 GPU result (2026-08-06): that cost showed up, and it wasn't offset.
+# Same-mechanism, apples-to-apples signal: in the 80-99% KV-usage band,
+# v29 put MORE of its samples there (82% vs v27's 76%) and got a LOWER
+# hit rate once there (3.4% vs 4.7%) -- raising the cap measurably made
+# the exact pressure v27 had just relieved worse again. Game outcomes
+# were a wash at best: clears>=1 fell 11->10 (lost tn36/re86/s5i5, gained
+# sp80/cn04), total actions fell 5158->3729 and total turns 175->117
+# (longer turns -> fewer of them fit the fixed run budget), and the
+# cap-hit fraction barely moved (40.6%->41.9%) -- most turns still
+# exhaust whatever cap they're given, so the extra headroom bought
+# little. The local score rose (0.67->0.88) only because 2 games
+# deepened to level 2, which the quadratic formula rewards heavily; per
+# arc-agi-3-open-threads, level-1 breadth is what the score target
+# actually needs, and that's what fell. Reverted to 12. See
+# arc-agi-3-kaggle-gpu-infra memory before raising this again.
 LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
 
 PYTHON_TOOL_SCHEMA = {
