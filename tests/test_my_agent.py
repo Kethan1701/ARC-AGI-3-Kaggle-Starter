@@ -244,6 +244,11 @@ def _blank_agent():
     # Warmup frames the collapse guard judges candidate masks against. Empty
     # means "no evidence", and the guard abstains rather than vetoing.
     a._mask_frames = []
+    # Checkpoint state for MASK_STRICT_SCALE (see its comment in my_agent.py).
+    a._mask_defer_until = 0
+    a._mask_defer_count = 0
+    a._mask_best_size = None
+    a._mask_best_mask = frozenset()
     return a
 
 
@@ -286,6 +291,7 @@ def test_the_early_mask_never_fires_later_than_the_baseline_rule(monkeypatch):
     """It may only move the decision earlier. If the unanimous rule never
     converges, the statistical rule at VOLATILE_WARMUP must still fire on
     exactly the sample it always would."""
+    monkeypatch.setattr(agent, "MASK_STRICT_SCALE", 0)  # not under test here
     width = height = 32
     frames = _ticking(width, height, 40)
 
@@ -341,6 +347,44 @@ def test_the_ladder_only_ever_relaxes():
     assert list(agent.MASK_LADDER) == sorted(agent.MASK_LADDER, reverse=True)
 
 
+def test_mask_strict_scale_ships_on():
+    """Measured across all 25 dev games: cd82 0.40 -> 1.17 (191 -> 111
+    level-1 actions), 23 games byte-identical, aggregate 0.0761 -> 0.1070."""
+    assert agent.MASK_STRICT_SCALE == 1
+
+
+def test_a_small_candidate_still_adopts_immediately():
+    """MASK_STRICT_SCALE must not touch a candidate already below
+    MASK_SMALL_FRACTION -- the checkpoint machinery exists for the large,
+    suspicious case only. MASK_SPAN is off by default, so a single
+    ticking cell masks its whole row and column, not just itself; a
+    64x64 grid keeps that comfortably under both MASK_SMALL_FRACTION
+    (5%) and MASK_CAP_FRACTION (35%) at ~3.1%."""
+    width = height = 64
+    fired = _feed(_blank_agent(), _ticking(width, height, 30, digits=1),
+                  width, height)
+    assert fired == agent.VOLATILE_WARMUP
+
+
+def test_a_large_candidate_is_deferred_not_adopted():
+    """The mechanism this ships: a candidate above MASK_SMALL_FRACTION does
+    not freeze on the first VOLATILE_WARMUP-sample evaluation. Doubling
+    from VOLATILE_WARMUP means the next checkpoint is 2x it; feeding only
+    up to the first checkpoint must come back with no verdict yet. Two
+    ticking columns in a 10x10 grid mask ~28% (row + 2 columns, span off
+    by default) -- above MASK_SMALL_FRACTION (5%) but under
+    MASK_CAP_FRACTION (35%), so this is the deferral path and not the
+    pre-existing cap-refusal one."""
+    width = height = 10
+    frames = _ticking(width, height, agent.VOLATILE_WARMUP + 2, digits=2)
+    a = _blank_agent()
+    fired = _feed(a, frames, width, height)
+    assert fired is None, "a large candidate must not adopt on one look"
+    assert a._mask_defer_until == agent.VOLATILE_WARMUP * 2
+    assert a._mask_defer_count == 1
+    assert not a._mask_frozen
+
+
 def test_a_half_rate_hud_is_missed_by_the_strict_rule(monkeypatch):
     """The premise of the fallback, so it is pinned separately from it.
 
@@ -359,6 +403,7 @@ def test_the_fallback_catches_a_half_rate_hud(monkeypatch):
     entirely at 0.9, leaving every frame a distinct node."""
     monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
     monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3))
+    monkeypatch.setattr(agent, "MASK_STRICT_SCALE", 0)  # not under test here
     width = height = 32
     frames = _half_rate(width, height, agent.VOLATILE_WARMUP + 2)
     a = _blank_agent()
@@ -391,6 +436,7 @@ def test_taking_the_loosest_rung_masks_at_least_as_much(monkeypatch):
     only ever to one MASK_CAP_FRACTION has already approved."""
     monkeypatch.setattr(agent, "MASK_FALLBACK", 1)
     monkeypatch.setattr(agent, "MASK_LADDER", (0.7, 0.5, 0.3))
+    monkeypatch.setattr(agent, "MASK_STRICT_SCALE", 0)  # not under test here
     width = height = 32
     frames = _two_rate(width, height, agent.VOLATILE_WARMUP + 2)
 
@@ -595,6 +641,7 @@ def test_the_fallback_cannot_touch_a_game_that_already_masks(monkeypatch):
     already clears VOLATILE_THRESHOLD must get bit-for-bit the same mask,
     because relaxing the threshold for those games was measured and broke
     them (sp80 78 -> 211 actions)."""
+    monkeypatch.setattr(agent, "MASK_STRICT_SCALE", 0)  # not under test here
     width = height = 32
     frames = _ticking(width, height, agent.VOLATILE_WARMUP + 2)
 
