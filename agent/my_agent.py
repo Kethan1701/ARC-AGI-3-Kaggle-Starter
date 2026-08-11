@@ -755,8 +755,31 @@ MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 # ar25 moves from "never leaves level 0" to a very expensive clear
 # (invisible at 2 decimals). The real win is cd82, whose HUD candidate
 # was landing in the same size band as cn04's: level 1 goes 191 -> 111
-# actions, game score 0.40 -> 1.17. ON by default.
-MASK_STRICT_SCALE = _env_int("ARC_MASK_STRICT_SCALE", 1)
+# actions, game score 0.40 -> 1.17.
+#
+# GPU-VALIDATED AND REJECTED (2026-08-11, two independent real
+# LLM-driven runs, v31 and v32, single-variable against the v27
+# baseline): the clean local win did not transfer. clears>=1 went
+# 11/25 (v27) -> 8/25 (v31) -> 8/25 (v32) -- a stable regression, not
+# noise, even though the two GPU runs otherwise disagree wildly with
+# each other on individual game scores (v31 0.6031, v32 0.4620; tu93
+# alone swings 4.841 -> 0.125 between the two identical-config runs,
+# sb26 0.735 -> 0.028) -- this pipeline's run-to-run variance is large
+# enough that score alone is not a usable signal here, but the clear
+# COUNT held steady at 8 both times, and two specific games -- tn36
+# (3.571 -> 0.00 in both) and lf52 (0.146 -> 0.00 in both) -- lose
+# their level-1 clear in BOTH runs. cn04 itself, the game this was
+# built for, clears in v31 (0.417, LLM run finds it despite search-only
+# not) but NOT in v32 (0.00) -- does not reproduce. Root cause: on the
+# real LLM-driven path, changing mask-adoption timing changes which
+# candidate actions the LLM sees at each turn, and that cascades into
+# different trajectories far more than the local search-only sweep
+# predicted (23/25 games were byte-identical locally). Reverted to OFF
+# by default; the checkpoint machinery stays available behind
+# ARC_MASK_STRICT_SCALE=1 for further investigation, but is not a
+# default-path win. See arc-agi-3-open-threads and
+# arc-agi-3-kaggle-gpu-infra memories for the full v31/v32 breakdown.
+MASK_STRICT_SCALE = _env_int("ARC_MASK_STRICT_SCALE", 0)
 MASK_STRICT_SCALE_DOUBLINGS = _env_int("ARC_MASK_STRICT_SCALE_DOUBLINGS", 5)
 
 # sp80 (2026-08-11): `_mask_frozen` is set once, in `__init__`, and never

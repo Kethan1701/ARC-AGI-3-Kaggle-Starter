@@ -347,34 +347,45 @@ def test_the_ladder_only_ever_relaxes():
     assert list(agent.MASK_LADDER) == sorted(agent.MASK_LADDER, reverse=True)
 
 
-def test_mask_strict_scale_ships_on():
-    """Measured across all 25 dev games: cd82 0.40 -> 1.17 (191 -> 111
-    level-1 actions), 23 games byte-identical, aggregate 0.0761 -> 0.1070."""
-    assert agent.MASK_STRICT_SCALE == 1
+def test_mask_strict_scale_ships_off():
+    """Clean local win (25-game sweep: aggregate 0.0761 -> 0.1070, cd82
+    0.40 -> 1.17), but GPU-VALIDATED AND REJECTED on the real LLM-driven
+    pipeline: two independent runs (v31, v32) both show clears>=1
+    11/25 -> 8/25 against the v27 baseline, with tn36 and lf52 losing
+    their level-1 clear in BOTH runs despite the two runs otherwise
+    disagreeing wildly with each other (this pipeline's run-to-run
+    variance is large; the clear COUNT holding steady at 8 both times is
+    what makes this signal, not noise). See arc-agi-3-open-threads
+    memory. The mechanism stays available behind ARC_MASK_STRICT_SCALE=1
+    for further investigation; it is just not a default-path win."""
+    assert agent.MASK_STRICT_SCALE == 0
 
 
-def test_a_small_candidate_still_adopts_immediately():
+def test_a_small_candidate_still_adopts_immediately(monkeypatch):
     """MASK_STRICT_SCALE must not touch a candidate already below
     MASK_SMALL_FRACTION -- the checkpoint machinery exists for the large,
     suspicious case only. MASK_SPAN is off by default, so a single
     ticking cell masks its whole row and column, not just itself; a
     64x64 grid keeps that comfortably under both MASK_SMALL_FRACTION
     (5%) and MASK_CAP_FRACTION (35%) at ~3.1%."""
+    monkeypatch.setattr(agent, "MASK_STRICT_SCALE", 1)
     width = height = 64
     fired = _feed(_blank_agent(), _ticking(width, height, 30, digits=1),
                   width, height)
     assert fired == agent.VOLATILE_WARMUP
 
 
-def test_a_large_candidate_is_deferred_not_adopted():
-    """The mechanism this ships: a candidate above MASK_SMALL_FRACTION does
-    not freeze on the first VOLATILE_WARMUP-sample evaluation. Doubling
-    from VOLATILE_WARMUP means the next checkpoint is 2x it; feeding only
-    up to the first checkpoint must come back with no verdict yet. Two
-    ticking columns in a 10x10 grid mask ~28% (row + 2 columns, span off
-    by default) -- above MASK_SMALL_FRACTION (5%) but under
-    MASK_CAP_FRACTION (35%), so this is the deferral path and not the
-    pre-existing cap-refusal one."""
+def test_a_large_candidate_is_deferred_not_adopted(monkeypatch):
+    """The mechanism this ships (off by default -- see
+    test_mask_strict_scale_ships_off): a candidate above
+    MASK_SMALL_FRACTION does not freeze on the first VOLATILE_WARMUP-
+    sample evaluation. Doubling from VOLATILE_WARMUP means the next
+    checkpoint is 2x it; feeding only up to the first checkpoint must
+    come back with no verdict yet. Two ticking columns in a 10x10 grid
+    mask ~28% (row + 2 columns, span off by default) -- above
+    MASK_SMALL_FRACTION (5%) but under MASK_CAP_FRACTION (35%), so this
+    is the deferral path and not the pre-existing cap-refusal one."""
+    monkeypatch.setattr(agent, "MASK_STRICT_SCALE", 1)
     width = height = 10
     frames = _ticking(width, height, agent.VOLATILE_WARMUP + 2, digits=2)
     a = _blank_agent()
