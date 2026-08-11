@@ -444,6 +444,25 @@ def build() -> dict:
                     '--max-model-len', '65536',
                     '--gpu-memory-utilization', '0.93',
                 ], env=env, stdout=log, stderr=subprocess.STDOUT)
+                # v30 (2026-08-07): `--kv-cache-dtype fp8` was tried here to
+                # halve per-token KV memory (kv_cache_dtype=auto resolves to
+                # this fp8-quantized model's bf16 compute dtype, not fp8),
+                # aimed at the 76-82%-of-samples-in-the-80-99%-KV-usage-band
+                # finding. It crashed the engine on GPU: fp8 KV cache needs a
+                # flashinfer attention kernel variant
+                # (batch_prefill_with_kv_cache_dtype_..._dtype_kv_e4m3_...)
+                # that isn't in the prebuilt wheelhouse, so vLLM JIT-compiles
+                # it via Ninja at first use -- and that build's link step
+                # failed (`ld returned 1 exit status`) in this offline
+                # container. "Engine core initialization failed" killed the
+                # whole server, and the run silently fell back to the
+                # search-only agent for all 25 games (exactly 1201 actions
+                # each, zero server throughput, zero LLM turns) -- not a
+                # degraded LLM run, no LLM at all. Do NOT re-add this flag
+                # without first confirming the wheelhouse ships a
+                # precompiled fp8 KV-cache kernel (or bundling one), or it
+                # silently wastes the entire GPU run again. See
+                # arc-agi-3-kaggle-gpu-infra memory for the full log trace.
 
                 deadline = time.time() + {SERVER_WAIT_SECONDS}
                 while time.time() < deadline:
