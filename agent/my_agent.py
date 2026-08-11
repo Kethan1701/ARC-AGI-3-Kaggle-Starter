@@ -693,6 +693,121 @@ MASK_MIN_DISTINCT = _env_int("ARC_MASK_MIN_DISTINCT", 2)
 # collapse unrelated states together.
 MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 
+# cn04 (2026-08-11): the strict VOLATILE_THRESHOLD rule gets exactly one
+# evaluation, fired the instant `self._samples` reaches VOLATILE_WARMUP,
+# and whatever it returns is adopted immediately -- `_mask_is_credible`
+# is only ever consulted by the MASK_FALLBACK ladder, never by this path
+# (see its own comment). On cn04 that one shot lands during an ~25-action
+# intro/settling period where real playfield content is ticking on
+# almost every transition: at samples=25 the rule finds a 906-cell
+# candidate (22% of the frame) and adopts it as if it were a permanent
+# HUD, which deletes signal the search needs for the rest of the game --
+# 0.00, never clears level 1 within 5000 actions. Size and collapse
+# can't tell this apart from a real large HUD (cn04's masked frames stay
+# 22/25 mutually distinct, so `_mask_is_credible` would wave it through
+# too, per its own docstring: collapse alone is not the tell). What does
+# work: more evidence. At VOLATILE_WARMUP=400 (forced via env, not this
+# knob) the strict rule finds nothing -- the transient has been diluted
+# below threshold by then -- and correctly falls through to the guarded
+# ladder, which picks a 192-cell mask at 0.70 and clears level 1 in 1033
+# actions instead of never.
+#
+# MASK_STRICT_SCALE, when on, does not change what the strict rule does
+# with a small candidate (below MASK_SMALL_FRACTION -- tn36 and sb26's
+# real, small, immediately-correct masks are untouched by construction).
+# A candidate ABOVE that fraction gets a second look -- but a *single*
+# fixed extra wait was measured and rejected here first: scaling the
+# extra samples by candidate size landed cn04 at 577 total samples, and
+# at 577 the same 906-cell candidate comes back (via the fallback
+# ladder at 0.50 this time, not the strict rule, but the same wrong
+# mask). Only at 400 does it actually find nothing and fall through to
+# a correct 192-cell mask at 0.70 (see history via `git log -p` on this
+# comment if the exact numbers below ever need re-deriving). That is
+# the same non-monotone warmup behaviour already on record for sp80
+# (see arc-agi-3-open-threads memory) -- there is no single "enough
+# evidence" sample count to compute in closed form.
+#
+# So instead of one guess, checkpoint geometrically -- VOLATILE_WARMUP,
+# then double each time a checkpoint still finds something above
+# MASK_SMALL_FRACTION -- and track the smallest candidate seen at any
+# checkpoint. 25 -> 50 -> 100 -> 200 -> 400 -> 800 crosses cn04's 400
+# sweet spot without having to know it in advance. Up to
+# MASK_STRICT_SCALE_DOUBLINGS checkpoints (default 5, i.e. up to 800
+# for the default VOLATILE_WARMUP=25); after the last one, commit to
+# whichever checkpoint's candidate was smallest, not necessarily the
+# final one -- the non-monotonicity means the last checkpoint is not
+# reliably the best one.
+#
+# Risk: while deferred, `_learn_mask` keeps returning False, so masking
+# has not started yet and every ticking cell stays in the node key for
+# that whole extra window -- a real, large, IMMEDIATELY-correct HUD
+# would explode its own node count during a wait it no longer needs.
+#
+# MEASURED (2026-08-11, full 25-game sweep, max-steps 5000): aggregate
+# 0.0761 -> 0.1070 (+41%), and 23 of 25 games are byte-identical to
+# baseline -- the risk above did not materialize anywhere in the dev
+# set. cn04, the game this was aimed at, is unmoved (still 0.00; it
+# does converge on the correct 192-cell mask, at action 101, but the
+# earlier graph-restart changes which nodes the search stumbles into
+# afterward and it does not find the exit within 5000 actions this
+# time -- the same trajectory-luck effect EARLY_MASK already
+# documented, just working against this game instead of for it).
+# ar25 moves from "never leaves level 0" to a very expensive clear
+# (invisible at 2 decimals). The real win is cd82, whose HUD candidate
+# was landing in the same size band as cn04's: level 1 goes 191 -> 111
+# actions, game score 0.40 -> 1.17. ON by default.
+MASK_STRICT_SCALE = _env_int("ARC_MASK_STRICT_SCALE", 1)
+MASK_STRICT_SCALE_DOUBLINGS = _env_int("ARC_MASK_STRICT_SCALE_DOUBLINGS", 5)
+
+# sp80 (2026-08-11): `_mask_frozen` is set once, in `__init__`, and never
+# reset anywhere -- `_learn_mask` returns False unconditionally for the
+# rest of the game once a mask is adopted (see its top-of-function
+# guard). So the mask learned during level 1's warmup is reused, as-is,
+# for every later level too, no matter what that level's board actually
+# looks like. Traced on sp80: level 1 (baseline 39) adopts a 64-cell
+# mask at action 26 and clears in 78. Level 2 (baseline 58) clears in
+# 3253 with that same mask, mapping 2195 nodes -- already inefficient,
+# but it closes. Level 3 (baseline 25) never clears at all: given 20000
+# actions total it spends 16670+ on it without ever completing, and
+# none of the recovery paths fire in that whole stretch -- no "clicks
+# are dead" widening, no "reachable map exhausted; re-exploring". That
+# absence is the tell: the search is not stuck, it is minting a new
+# node on nearly every action, which is what an un-masked ticking cell
+# looks like (the same signature as cd82's pre-fallback-ladder bug).
+# The mask that fixed levels 1 and 2 says nothing about whether level
+# 3 introduces a new moving element the original ~25-800-action warmup
+# never saw, because that warmup never ran during level 3 to find out.
+#
+# MASK_RELEARN_PER_LEVEL re-arms `_learn_mask` (unfreezes it and clears
+# its counters -- NOT `_kept`/`_volatile`, so the old mask keeps being
+# used, unchanged, right up until fresh evidence actually replaces it)
+# at every level-up, alongside the existing per-level graph drop. A
+# level whose board matches the original mask re-converges on the same
+# mask at the same relative cost as the original warmup did and loses
+# nothing; a level that needs a different one gets the chance to find
+# it instead of exploding silently for the rest of the run.
+#
+# Cost: every level pays its own warmup charge again (see VOLATILE_
+# WARMUP's comment -- "everything sampled before the mask is adopted is
+# charged to the level and then thrown away"), where today only level 1
+# does.
+#
+# MEASURED AND REJECTED (2026-08-11, sp80): `_reset_graph` -- called by
+# `_rearm_mask_learning`'s caller whenever the level-relearned mask
+# actually changes -- clears `_fatal`/`_deaths`, the proven-lethal
+# memory, along with the rest of the graph. sp80 barely respawns at all
+# normally (once, in its whole 20000-action trace). With this on, level
+# 2 relearns a mask, resets, and then respawns roughly every 28 actions,
+# 480+ times in a row -- it re-discovers and re-forgets the same fatal
+# move on every cycle. Level 2 goes 3253 -> 11226 actions and level 3
+# still never clears; net neutral-to-negative for sp80, and this is
+# exactly the kind of level (frequent forced respawns) the fix was
+# supposed to help. The diagnosis this flag targets is real (see its
+# own comment) but the fix needs to preserve fatal/death memory across
+# an in-level remask, not wipe it via a full graph reset. OFF by
+# default; not shipped.
+MASK_RELEARN_PER_LEVEL = _env_int("ARC_MASK_RELEARN_PER_LEVEL", 0)
+
 # The status band is what shares a row or column with the HUD without
 # ticking itself (see `status_band`). Capped for the same reason the mask
 # is: past a certain size the "band" is just the board, and re-opening
@@ -3975,6 +4090,15 @@ class MyAgent(Agent):
         # Warmup frames kept only until the mask is decided (see
         # MASK_COLLAPSE_GUARD), then dropped.
         self._mask_frames: list[bytes] = []
+        # Checkpoint state for MASK_STRICT_SCALE. `_mask_defer_until` is
+        # the next checkpoint's sample target, 0 meaning no deferral in
+        # progress yet; `_mask_defer_count` how many checkpoints have
+        # fired; `_mask_best_size`/`_mask_best_mask` track the smallest
+        # candidate seen across all checkpoints so far.
+        self._mask_defer_until = 0
+        self._mask_defer_count = 0
+        self._mask_best_size: Optional[int] = None
+        self._mask_best_mask: frozenset[int] = frozenset()
         # Deliberately NOT cleared by `_reset_graph`: outliving the level
         # boundary is the entire point of it.
         self._motion = MotionModel() if MOTION_LEARN else None
@@ -5125,6 +5249,8 @@ class MyAgent(Agent):
             # learned about it is dead weight. Dropping it keeps memory
             # proportional to the level being played, not the whole run.
             self._reset_graph()
+            if MASK_RELEARN_PER_LEVEL:
+                self._rearm_mask_learning()
 
         if pending is None:
             return
@@ -5478,7 +5604,15 @@ class MyAgent(Agent):
         # are small integers -- which is ~4KB a frame instead of ~115KB as a
         # tuple of Python ints, and this list is dropped the moment the mask
         # is decided.
-        if MASK_COLLAPSE_GUARD and len(self._mask_frames) < VOLATILE_WARMUP:
+        #
+        # Once a deferral is in progress (see MASK_STRICT_SCALE), the cap
+        # extends to the deferred sample count instead of stopping at
+        # VOLATILE_WARMUP: the second look's widget-span trimming needs
+        # frames from *after* the transient it exists to see past, not
+        # just the original VOLATILE_WARMUP frames that produced the
+        # oversized candidate in the first place.
+        frame_cap = self._mask_defer_until or VOLATILE_WARMUP
+        if MASK_COLLAPSE_GUARD and len(self._mask_frames) < frame_cap:
             try:
                 self._mask_frames.append(bytes(flat))
             except (ValueError, TypeError):
@@ -5553,7 +5687,20 @@ class MyAgent(Agent):
             )
             return True
 
-        self._mask_frozen = True
+        # MASK_STRICT_SCALE: give a candidate above MASK_SMALL_FRACTION
+        # more looks, geometrically, instead of adopting it off this
+        # single VOLATILE_WARMUP-sample evaluation. See its own comment
+        # for the cn04 case this targets, why a single fixed extra wait
+        # was tried and rejected first, and the risk this trades for.
+        # The gate below has to apply to the *final* candidate -- strict
+        # rule or ladder fallback, whichever wins -- not just the strict
+        # one: cn04's first checkpoint clears the strict rule (nothing
+        # found) but the ladder it then falls through to still finds a
+        # bad large mask on the same thin evidence.
+        if MASK_STRICT_SCALE and self._mask_defer_until:
+            if self._samples < self._mask_defer_until:
+                return False
+
         volatile = hud_mask(
             counts, self._row_changes, self._col_changes,
             self._samples, width, height, frames=self._mask_frames,
@@ -5601,6 +5748,43 @@ class MyAgent(Agent):
                     self.game_id, VOLATILE_THRESHOLD, chosen_at, len(chosen),
                 )
                 volatile = chosen
+
+        if MASK_STRICT_SCALE:
+            total = width * height
+            small = not volatile or (
+                total > 0 and len(volatile) <= MASK_SMALL_FRACTION * total
+            )
+            if not small:
+                if (
+                    self._mask_best_size is None
+                    or len(volatile) < self._mask_best_size
+                ):
+                    self._mask_best_size = len(volatile)
+                    self._mask_best_mask = volatile
+                self._mask_defer_count += 1
+                if self._mask_defer_count <= MASK_STRICT_SCALE_DOUBLINGS:
+                    self._mask_defer_until = self._samples * 2
+                    logger.info(
+                        "%s: still finds a %d-cell candidate (%.0f%% of "
+                        "frame) at %d samples (checkpoint %d/%d); "
+                        "deferring to %d",
+                        self.game_id, len(volatile),
+                        100.0 * len(volatile) / total if total else 0.0,
+                        self._samples, self._mask_defer_count,
+                        MASK_STRICT_SCALE_DOUBLINGS, self._mask_defer_until,
+                    )
+                    return False
+                # Out of checkpoints. Commit to the smallest ever seen,
+                # even if it is still large -- not necessarily this one.
+                volatile = self._mask_best_mask
+                logger.info(
+                    "%s: exhausted %d checkpoints at %d samples; "
+                    "committing to the smallest candidate seen (%d cells)",
+                    self.game_id, MASK_STRICT_SCALE_DOUBLINGS,
+                    self._samples, len(volatile),
+                )
+
+        self._mask_frozen = True
 
         if volatile:
             # Deliberately not `volatile`. Under the whole-line rule the
@@ -5665,6 +5849,28 @@ class MyAgent(Agent):
         self._deaths.clear()
         self._cache.clear()
         self._plan.clear()
+
+    def _rearm_mask_learning(self) -> None:
+        """Re-open `_learn_mask` for a fresh look, see MASK_RELEARN_PER_LEVEL.
+
+        Deliberately does not touch `_kept`/`_volatile`/`_status_idx`: the
+        mask already in effect keeps being used, unchanged, until fresh
+        evidence actually replaces it. This only clears the counters that
+        decide whether it gets replaced.
+        """
+        self._prev_flat = None
+        self._cell_changes = []
+        self._row_changes = []
+        self._col_changes = []
+        self._samples = 0
+        self._mask_frozen = False
+        self._early_candidate = frozenset()
+        self._early_stable = 0
+        self._mask_frames = []
+        self._mask_defer_until = 0
+        self._mask_defer_count = 0
+        self._mask_best_size = None
+        self._mask_best_mask = frozenset()
 
     def _anchor(self, view: dict[str, Any]) -> None:
         found = self._motion.locate(view) if self._motion else None
