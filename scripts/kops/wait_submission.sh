@@ -19,8 +19,12 @@ source ./lib.sh
 
 last=""
 while true; do
-    row=$("$KAGGLE" competitions submissions -c "$COMPETITION" --csv 2>&1 | tr -d '\r' | sed -n '2p')
-    status=$(echo "$row" | cut -d, -f5)
+    # Tolerate a transient kaggle-CLI/network failure instead of dying --
+    # a bare `$(cmd)` under `set -e` takes the whole script down with it
+    # on any nonzero exit, which is the likely cause of a prior watcher's
+    # unexplained exit code 4. Fall back to empty output and retry instead.
+    row=$("$KAGGLE" competitions submissions -c "$COMPETITION" --csv 2>&1 | tr -d '\r' | sed -n '2p' || true)
+    status=$(echo "$row" | cut -d, -f5 || true)
     if [ "$status" != "$last" ]; then
         echo "$(date -u +%H:%M:%S)  $row"
         last="$status"
