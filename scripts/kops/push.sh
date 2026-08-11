@@ -23,10 +23,15 @@ echo "=== is a submission in flight? ==="
 SUBS=$("$KAGGLE" competitions submissions -c "$COMPETITION" --csv 2>&1 | tr -d '\r')
 echo "$SUBS" | cut -d, -f1,3,5 | head -4
 if echo "$SUBS" | grep -q PENDING; then
-    echo "!!! a submission is PENDING -- refusing to push (Phase A quota is separate, but a push mid-Phase-B invites confusion about which run scored what)." >&2
-    exit 1
+    if [ "${ARC_ALLOW_PENDING_PUSH:-0}" = "1" ]; then
+        echo "!!! a submission is PENDING, but ARC_ALLOW_PENDING_PUSH=1 -- pushing anyway (explicit per-run override, Phase A quota is independent of the Phase B slot)." >&2
+    else
+        echo "!!! a submission is PENDING -- refusing to push (Phase A quota is separate, but a push mid-Phase-B invites confusion about which run scored what). Set ARC_ALLOW_PENDING_PUSH=1 to override for this run." >&2
+        exit 1
+    fi
+else
+    echo "nothing pending."
 fi
-echo "nothing pending."
 
 echo; echo "=== build ==="
 "$PY" scripts/build_notebook.py
