@@ -482,6 +482,49 @@ LIVENESS_MIN_CLICKS = _env_int("ARC_LIVENESS_MIN_CLICKS", 40)
 # and tn36 (43%) are far above it; ft09 (0.4%) and lp85 (2%) far below.
 LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
 
+# lp85 level 2 (2026-08-07): LIVENESS_WIDEN fixed level 1 (502 -> 234
+# actions) but level 2 still burns ~4800 actions to map 31 nodes, 71% of
+# them "probe-untried". Root cause: `_is_dead` is keyed by action *type*
+# (all clicks share one counter), not by coordinate, and is permanently
+# unable to fire again the moment even one click succeeds anywhere -- so a
+# newly discovered node has no memory of which specific coordinates other
+# nodes already found dead, and re-probes close to its full candidate list
+# every time. "clicks are dead (1/140 live)" repeats at every widen, which
+# is the tell that widening breadth was not the bottleneck here.
+#
+# This does not remove any candidate -- unlike a hard dead-coordinate
+# skip, which risks suppressing a click that is only live once a
+# precondition state is reached elsewhere (see r11l/vc33 in
+# arc-agi-3-open-threads memory: click liveness there is genuinely
+# state-dependent, not global). It only moves codes that have moved the
+# board at least once *anywhere in this game* to the front of a brand-new
+# node's candidate list, in their existing relative order; everything
+# else is still reachable at exactly the cost it always was. Correctness
+# is untouched by construction -- this can only change how soon a
+# genuinely-live code gets tried, never whether it does.
+#
+# OFF by default until measured on the full dev set, matching every other
+# knob in this file (MOMENTUM_LIMIT looked just as safe on paper and was
+# an 8.6x regression on sp80 -- see its comment above).
+#
+# MEASURED (2026-08-11, full 25-game sweep, max-steps 5000):
+# aggregate 0.0761 -> 0.0863 (+13%), but the move is not a clean win --
+# ar25 0.00->1.61 and lp85 0.01->0.18 (the intended fix, level 1
+# 234->67 actions) are almost exactly cancelled by sp80 1.19->0.00, a
+# *total* loss of that game's score. r11l 0.18->0.07, cd82 0.40->0.19,
+# lf52 0.02->0.01 (loses its level-3 clear), and ls20 0.01->0.00 also
+# regress; tr87 keeps the same score bucket but behaviorally stops
+# clearing level 1 at all (2538 actions -> exhausts 5001). The other 17
+# games are unchanged. sp80 and r11l regressing is exactly the
+# state-dependent-click-liveness risk flagged above -- prioritizing
+# codes that were live *somewhere else in the game* delays a click that
+# is only live now, in this state, and hadn't fired yet anywhere. Same
+# shape as the MOMENTUM_LIMIT lesson: flattering in aggregate, a
+# category loss on the one game that carried the most score. Left OFF
+# by default; not shipped. See arc-agi-3-open-threads memory for the
+# full per-game table and the next candidate.
+LIVE_CODE_PRIORITY = _env_int("ARC_LIVE_CODE_PRIORITY", 0)
+
 # 15 of the 25 dev games never clear level 1 at all, and the diagnostic
 # splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
 # action, so the reachable map never closes and the search degenerates into
@@ -3893,6 +3936,9 @@ class MyAgent(Agent):
         self._momentum = 0                        # consecutive repeats so far
         self._act_tried: Counter[int] = Counter()    # action id -> probes
         self._act_changed: Counter[int] = Counter()  # action id -> state changes
+        # Full codes (action id + x/y for a click) that have moved the board
+        # at least once, anywhere in the game so far. See LIVE_CODE_PRIORITY.
+        self._code_live: set[int] = set()
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
@@ -5157,6 +5203,7 @@ class MyAgent(Agent):
         self._act_tried[action_id] += 1
         if node != prev_node:
             self._act_changed[action_id] += 1
+            self._code_live.add(code)
 
         # Split the level's spend by action class. ~112 of the ~117 codes a
         # node offers are ACTION6 clicks, so if clicks dominate the bill and
@@ -5803,6 +5850,20 @@ class MyAgent(Agent):
         codes = candidate_actions(
             grid, latest_frame.available_actions, node=node, ignore=self._volatile
         )
+
+        # See LIVE_CODE_PRIORITY. A stable partition, not a re-sort: codes
+        # that have moved the board before move to the front in their
+        # existing relative order, everything else keeps its existing
+        # relative order behind them. Nothing is dropped, so a node whose
+        # only live code is one `candidate_actions` ranked last is reached
+        # in 1 probe here instead of up to `breadth`, and a node where none
+        # of the previously-live codes apply pays nothing beyond the
+        # membership check.
+        if LIVE_CODE_PRIORITY and self._code_live:
+            live_here = [c for c in codes if c in self._code_live]
+            if live_here:
+                rest = [c for c in codes if c not in self._code_live]
+                codes = live_here + rest
 
         if len(self._cache) >= CANDIDATE_CACHE_LIMIT:
             self._cache.clear()
