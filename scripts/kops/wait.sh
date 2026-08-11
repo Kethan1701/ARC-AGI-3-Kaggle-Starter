@@ -20,7 +20,17 @@ source ./lib.sh
 
 last=""
 while true; do
-    status=$("$KAGGLE" kernels status "$KERNEL_ID" 2>&1 | tr -d '\r')
+    # Tolerate a transient kaggle-CLI/network failure instead of dying --
+    # a bare `$(cmd)` under `set -e` takes the whole script down with it
+    # on any nonzero exit. This is what killed a v33-watch instance of
+    # this exact script (silently, after a single RUNNING line, exit 1)
+    # even though the kernel itself was still genuinely running -- fall
+    # back to empty output and retry instead of exiting.
+    status=$("$KAGGLE" kernels status "$KERNEL_ID" 2>&1 | tr -d '\r' || true)
+    if [ -z "$status" ]; then
+        sleep 60
+        continue
+    fi
     if [ "$status" != "$last" ]; then
         echo "$(date -u +%H:%M:%S)  $status"
         last="$status"
