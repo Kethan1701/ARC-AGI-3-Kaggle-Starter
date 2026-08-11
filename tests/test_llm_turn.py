@@ -51,6 +51,10 @@ def _grid(fill: int = 0, mark: tuple[int, int, int] | None = None):
     return rows
 
 
+def _flat(rows):
+    return tuple(agent_mod.chain.from_iterable(tuple(tuple(r) for r in rows)))
+
+
 def _frame(rows, *, levels=0, state=GameState.NOT_FINISHED, available=(1, 2, 6)):
     return FrameData(
         game_id="tst",
@@ -1544,3 +1548,160 @@ def test_objects_are_the_primary_view_not_the_raw_grid():
     prompt = agent_mod.build_system_prompt([1, 2, 6])
     assert "work from the OBJECTS" in prompt
     assert "never to scan the whole board" in prompt
+
+
+# --- LLM_PER_ACTION_MASK -------------------------------------------------
+
+
+def test_learn_mask_runs_once_per_real_action_not_once_per_turn(monkeypatch):
+    """The whole point (see LLM_PER_ACTION_MASK's comment): without this
+    flag `_learn_mask` only ever sees a turn's worth of change at once,
+    because it is normally called once from `choose_action`, which the
+    model's own turn calls into exactly once no matter how many real
+    actions it plays. Pin that turning the flag on calls it once per real
+    action instead."""
+    monkeypatch.setattr(agent_mod, "LLM_PER_ACTION_MASK", 1)
+    env = _FakeEnv(
+        _frame(_grid()), [_frame(_grid()), _frame(_grid()), _frame(_grid())]
+    )
+    a = _turn_agent(env)
+    a._turn_frame = env.current
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        a, "_learn_mask", lambda flat, w, h: calls.append((w, h)) or False
+    )
+
+    a._llm_act(["ACTION1", "ACTION1", "ACTION1"])
+
+    assert len(calls) == 3, "not called once per real action"
+    assert all(wh == (8, 8) for wh in calls)
+
+
+def test_learn_mask_is_not_called_per_action_when_the_flag_is_off(monkeypatch):
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid()), _frame(_grid())])
+    a = _turn_agent(env)
+    a._turn_frame = env.current
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        a, "_learn_mask", lambda flat, w, h: calls.append((w, h)) or False
+    )
+
+    a._llm_act(["ACTION1", "ACTION1"])
+
+    assert calls == [], "LLM_PER_ACTION_MASK defaults off"
+
+
+def test_mid_turn_mask_adoption_resets_the_graph_immediately(monkeypatch):
+    """The same reset `choose_action` performs on adoption must happen
+    right here, mid-turn -- nothing about the model's own turn logic
+    depends on the search graph (see the "model's steps are not recorded
+    as graph edges" note near `_pending`), so there is nothing to
+    interrupt; the turn keeps playing against a freshly rekeyed graph."""
+    monkeypatch.setattr(agent_mod, "LLM_PER_ACTION_MASK", 1)
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid()), _frame(_grid())])
+    a = _turn_agent(env)
+    a._turn_frame = env.current
+    a._blocked = {("look", 1, 1)}
+    a._at = (1, 1)
+    a._at_confirmed = 3
+    a._total = {1: 1}
+    a._cursor = {1: 1}
+    a._edges = {1: {2: 3}}
+    a._fatal = {(1, 2)}
+    a._deaths = {(1, 2): 1}
+    a._cache = {1: [2]}
+    a._plan = deque([1, 2])
+    a._level_start_node = 1
+    a._level_start_board = 1
+    a._board_idx = 0
+    a._status_boards = {1: 2}
+    a._status = 2
+    a._last_respawn = 5
+    a._pending = (1, 2)
+    a._sol_start = 1
+    a._sol_edges = {1: {2: 3}}
+    verdicts = [False, True]
+    monkeypatch.setattr(a, "_learn_mask", lambda flat, w, h: verdicts.pop(0))
+
+    a._llm_act(["ACTION1", "ACTION1"])
+
+    assert a._total == {}
+    assert a._edges == {}
+    assert a._cache == {}
+    assert a._blocked == set()
+    assert a._at is None
+    assert a._pending is None
+    assert a._sol_start is None
+    assert a._sol_edges == {}
+    # The turn was not interrupted: both scripted actions still played.
+    assert len(env.sent) == 2
+
+
+# --- LLM_SEED_EDGES -------------------------------------------------------
+
+
+def test_llm_seed_edges_populates_the_graph_from_real_transitions(monkeypatch):
+    """The whole point (see LLM_SEED_EDGES's comment): `_edges` -- normally
+    untouched while the model drives -- gets exactly what `_observe` would
+    have recorded had a search-driven action taken this step."""
+    monkeypatch.setattr(agent_mod, "LLM_SEED_EDGES", 1)
+    before_rows = _grid()
+    after_rows = _grid(mark=(0, 0, 5))
+    env = _FakeEnv(_frame(before_rows), [_frame(after_rows)])
+    a = _turn_agent(env)
+    a._turn_frame = env.current
+    a._kept = None
+    a._edges = {}
+    a._fatal = set()
+    a._deaths = {}
+
+    a._llm_act(["ACTION1"])
+
+    before_node = a._node_key(_flat(before_rows))
+    after_node = a._node_key(_flat(after_rows))
+    code = agent_mod.encode_action(1, None, None)
+    assert a._edges == {before_node: {code: after_node}}
+
+
+def test_llm_seed_edges_is_off_by_default(monkeypatch):
+    env = _FakeEnv(_frame(_grid()), [_frame(_grid(mark=(0, 0, 5)))])
+    a = _turn_agent(env)
+    a._turn_frame = env.current
+    a._kept = None
+    a._edges = {}
+    a._fatal = set()
+    a._deaths = {}
+
+    a._llm_act(["ACTION1"])
+
+    assert a._edges == {}
+
+
+def test_llm_seed_edges_marks_a_move_fatal_after_death_tolerance(monkeypatch):
+    """Mirrors `_observe`'s own DEATH_TOLERANCE logic exactly, so a move
+    that has already killed the model is remembered as lethal the moment
+    the search fallback takes over -- not re-discovered by dying again."""
+    monkeypatch.setattr(agent_mod, "LLM_SEED_EDGES", 1)
+    before_rows = _grid()
+    death_frame = _frame(before_rows, state=GameState.GAME_OVER)
+    env = _FakeEnv(_frame(before_rows))
+    a = _turn_agent(env)
+    a._kept = None
+    a._edges = {}
+    a._fatal = set()
+    a._deaths = {}
+    code = agent_mod.encode_action(1, None, None)
+    before_node = a._node_key(_flat(before_rows))
+    # A live edge for this move exists before the fatal verdict lands --
+    # the tolerance logic must be able to retract it, not just refuse to
+    # add a new one.
+    a._edges[before_node] = {code: before_node}
+
+    for _ in range(agent_mod.DEATH_TOLERANCE):
+        env.current = _frame(before_rows)
+        env.results = [death_frame]
+        a._turn_frame = env.current
+        a._llm_act(["ACTION1"])
+
+    assert (before_node, code) in a._fatal
+    assert code not in a._edges.get(before_node, {})

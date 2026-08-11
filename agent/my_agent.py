@@ -426,6 +426,25 @@ AGENT_SEED = _env_int("ARC_SEED", 0)
 # aggregate moved by 0.0002. tn36 is click-only, so what the widen actually
 # does there is admit lower-ranked click targets, and those turn out to be
 # worse than the random coordinates the old stuck path was probing.
+#
+# 2026-08-11: tried gating this on `self._exploding` (see EXPLODE_WINDOW/
+# EXPLODE_THRESHOLD below), reasoning that it already gates LIVENESS_
+# WIDEN's sibling mechanism successfully elsewhere -- "widen only where
+# evidence says the window is wrong". MEASURED AND REJECTED: full 25-game
+# sweep with `EAGER_WIDEN and self._exploding` came back BYTE-IDENTICAL
+# to baseline on all 25 games, aggregate 0.0761 -> 0.0761 exactly --  a
+# complete no-op, not a smaller win. The reasoning was backwards:
+# `_exploding` means a HIGH new-node rate (>=40% of the last 200 actions
+# are genuinely new, EXPLODE_THRESHOLD), but this branch fires when the
+# map looks EXHAUSTED -- i.e. discovery has stalled, the opposite
+# condition. The games this widen previously helped (ft09, su15, s5i5,
+# lp85, see the measurement above) are not "exploding" at the point
+# they'd need widening; if anything they are the reverse case
+# `_exploding` was built to detect (ar25/sc25/sb26-shaped: no reachable
+# map ever closes). ANDing two near-mutually-exclusive conditions
+# together just disables the mechanism. Reverted to the plain,
+# unconditional gate this file already had -- still off by default, per
+# the unconditional-firing rejection above.
 EAGER_WIDEN = _env_int("ARC_EAGER_WIDEN", 0)
 WIDEN_CLEARS_DEAD = _env_int("ARC_WIDEN_CLEARS_DEAD", 1)
 
@@ -524,6 +543,46 @@ LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
 # by default; not shipped. See arc-agi-3-open-threads memory for the
 # full per-game table and the next candidate.
 LIVE_CODE_PRIORITY = _env_int("ARC_LIVE_CODE_PRIORITY", 0)
+
+# The next candidate LIVE_CODE_PRIORITY's own comment calls for: the same
+# priority-boost idea, rescoped from raw (x, y) to object identity, so a
+# button that's moved (or a different-but-similarly-placed object) is not
+# conflated with it just because they once shared a pixel. Every click
+# code that proves live is tied, at the moment it proves live, to the
+# `object_signature` (see `_flood_component`/`object_signature`) of
+# whatever it clicked on -- the same colour+shape hash `segment_frame`
+# already uses, so the same physical button is recognised wherever it
+# moves to, while a coordinate that is only sometimes a button is not.
+# Non-click (simple) codes have no coordinate and so no object to key on;
+# they fall back to being ordinary untried candidates, exactly as they are
+# with this flag off.
+#
+# Uses a separate flag from LIVE_CODE_PRIORITY rather than replacing it,
+# so the rejected raw-coordinate version stays available for comparison
+# and neither implementation has to guess at the other's intent.
+#
+# MEASURED AND REJECTED (2026-08-11, full 25-game sweep): aggregate
+# 0.0761 -> 0.0729, a net regression, but not a clean loss -- it does
+# exactly what it was built for on the two games diagnosed as needing
+# it. lp85 (the original target: dead-action memory keyed by
+# coordinate, not object) goes 234 -> 67 level-1 actions, score
+# 0.01 -> 0.18. r11l -- which the raw-coordinate version actively
+# REGRESSED via the state-dependent-liveness risk -- instead IMPROVES
+# here, 112 -> 99 actions, 0.18 -> 0.24: narrower generalization really
+# does fix r11l's specific false-positive case. But the same risk shows
+# up on different games: cd82 loses its level-2 clear entirely (191/819
+# actions clearing 2 levels -> 352/4649 clearing only 1), lf52 loses its
+# level-3 clear (328/4625/48 clearing 3 -> 632/4369/(none) clearing 2),
+# m0r0 loses its only level-1 clear (1974 actions clearing -> 5001
+# exhausting, never clearing), and sp80 loses its level-3 clear
+# (invisible in the 2-decimal score, since level 1 alone already
+# supplies effectively all of sp80's 1.19 under the level-index
+# weighting -- see arc-agi-3-open-threads memory). Same fundamental risk
+# as LIVE_CODE_PRIORITY, just on a narrower and different set of games:
+# assuming an object's interactivity generalizes across different game
+# states is sometimes right and sometimes actively wrong, and object
+# identity does not settle which. Left OFF by default; not shipped.
+LIVE_OBJECT_PRIORITY = _env_int("ARC_LIVE_OBJECT_PRIORITY", 0)
 
 # 15 of the 25 dev games never clear level 1 at all, and the diagnostic
 # splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
@@ -691,6 +750,23 @@ MASK_MIN_DISTINCT = _env_int("ARC_MASK_MIN_DISTINCT", 2)
 # Refuse to mask more than this fraction of the frame. If that much of
 # the board qualifies, the reading is not a HUD and dropping it would
 # collapse unrelated states together.
+#
+# MEASURED 2026-08-11: raising this from 0.35 to 0.45, specifically to
+# let m0r0's 44%-of-frame candidate through (per an earlier note in this
+# file speculating that the cap alone was m0r0's blocker), is a complete
+# no-op -- byte-identical to baseline on all 25 games, m0r0 included.
+# Traced directly (`--game m0r0`, verbose log): m0r0's candidate is
+# rejected by MASK_COLLAPSE_GUARD, not this cap -- "rejecting a
+# 1808-cell mask (44% of frame): it fuses all 25 sampled frames into 1
+# state(s)". The collapse guard runs independently of this cap and would
+# refuse the same candidate at any cap value that admits it, so this
+# specific cap-raise can never help m0r0: the candidate is a genuinely
+# bad mask (it destroys every distinction the warmup frames carried),
+# correctly refused. The earlier "cap is the obvious next thing to try"
+# note was an incomplete diagnosis -- it never checked which gate was
+# actually firing. m0r0 has no good mask candidate under the existing
+# rules at all; it is not a good candidate being wrongly capped. See
+# arc-agi-3-open-threads memory.
 MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 
 # cn04 (2026-08-11): the strict VOLATILE_THRESHOLD rule gets exactly one
@@ -755,8 +831,31 @@ MASK_CAP_FRACTION = _env_float("ARC_MASK_CAP", 0.35)
 # ar25 moves from "never leaves level 0" to a very expensive clear
 # (invisible at 2 decimals). The real win is cd82, whose HUD candidate
 # was landing in the same size band as cn04's: level 1 goes 191 -> 111
-# actions, game score 0.40 -> 1.17. ON by default.
-MASK_STRICT_SCALE = _env_int("ARC_MASK_STRICT_SCALE", 1)
+# actions, game score 0.40 -> 1.17.
+#
+# GPU-VALIDATED AND REJECTED (2026-08-11, two independent real
+# LLM-driven runs, v31 and v32, single-variable against the v27
+# baseline): the clean local win did not transfer. clears>=1 went
+# 11/25 (v27) -> 8/25 (v31) -> 8/25 (v32) -- a stable regression, not
+# noise, even though the two GPU runs otherwise disagree wildly with
+# each other on individual game scores (v31 0.6031, v32 0.4620; tu93
+# alone swings 4.841 -> 0.125 between the two identical-config runs,
+# sb26 0.735 -> 0.028) -- this pipeline's run-to-run variance is large
+# enough that score alone is not a usable signal here, but the clear
+# COUNT held steady at 8 both times, and two specific games -- tn36
+# (3.571 -> 0.00 in both) and lf52 (0.146 -> 0.00 in both) -- lose
+# their level-1 clear in BOTH runs. cn04 itself, the game this was
+# built for, clears in v31 (0.417, LLM run finds it despite search-only
+# not) but NOT in v32 (0.00) -- does not reproduce. Root cause: on the
+# real LLM-driven path, changing mask-adoption timing changes which
+# candidate actions the LLM sees at each turn, and that cascades into
+# different trajectories far more than the local search-only sweep
+# predicted (23/25 games were byte-identical locally). Reverted to OFF
+# by default; the checkpoint machinery stays available behind
+# ARC_MASK_STRICT_SCALE=1 for further investigation, but is not a
+# default-path win. See arc-agi-3-open-threads and
+# arc-agi-3-kaggle-gpu-infra memories for the full v31/v32 breakdown.
+MASK_STRICT_SCALE = _env_int("ARC_MASK_STRICT_SCALE", 0)
 MASK_STRICT_SCALE_DOUBLINGS = _env_int("ARC_MASK_STRICT_SCALE_DOUBLINGS", 5)
 
 # sp80 (2026-08-11): `_mask_frozen` is set once, in `__init__`, and never
@@ -802,10 +901,26 @@ MASK_STRICT_SCALE_DOUBLINGS = _env_int("ARC_MASK_STRICT_SCALE_DOUBLINGS", 5)
 # move on every cycle. Level 2 goes 3253 -> 11226 actions and level 3
 # still never clears; net neutral-to-negative for sp80, and this is
 # exactly the kind of level (frequent forced respawns) the fix was
-# supposed to help. The diagnosis this flag targets is real (see its
-# own comment) but the fix needs to preserve fatal/death memory across
-# an in-level remask, not wipe it via a full graph reset. OFF by
-# default; not shipped.
+# supposed to help. OFF by default; not shipped.
+#
+# REVISITED 2026-08-11: "preserve fatal/death memory across the reset"
+# was the obvious next candidate, and does NOT work the way it sounds.
+# `_fatal`/`_deaths` are keyed by `(node, code)`, and `node` is
+# `_node_key(flat)` -- a hash that depends on `self._kept`, which IS the
+# mask. The instant the mask changes, every existing `(node, code)` key
+# refers to a node id the new mask will never produce again; simply
+# skipping the `.clear()` on these two dicts leaves them full of
+# orphaned entries that can never match anything post-remask, not a
+# working memory of what is lethal. Actually preserving it needs either
+# (a) enough stored context (the original flat frame, not just its hash)
+# to rekey each fatal entry under the new mask, which is real extra
+# bookkeeping, not a one-line change, or (b) a mask-invariant key like
+# bare `code` -- which is the same over-generalization risk this file's
+# own LIVE_CODE_PRIORITY section already measured and rejected for
+# ordinary liveness, except a false positive here is worse: a wrongly-
+# generalized FATAL verdict can make a level look unsolvable rather than
+# merely slower. Neither is attempted here. Left OFF, not shipped; a real
+# fix is bigger than this flag's original framing suggested.
 MASK_RELEARN_PER_LEVEL = _env_int("ARC_MASK_RELEARN_PER_LEVEL", 0)
 
 # The status band is what shares a row or column with the HUD without
@@ -838,6 +953,24 @@ MASK_SPAN = _env_int("ARC_MASK_SPAN", 0)
 # walk to a distant frontier that the respawn interrupts bought nothing,
 # while an untried action taken where the agent already stands records an
 # edge that stays true across every respawn to come.
+#
+# MEASURED 2026-08-11 (full 25-game sweep, max-steps 5000), after this sat
+# built and unmeasured since it was written: aggregate 0.0761 -> 0.0756,
+# a wash with a slight downward lean, and ls20 -- the game this exists
+# for -- is byte-identical (526/22 level 1, both arms). tu93 loses its
+# level-3->4 clear (769 -> 4418 actions on level 3, never reaching level
+# 4 within budget); everything else is noise-sized.
+#
+# Why ls20 does not move: this only fires from `_select`'s case (c) --
+# the current node cursor-exhausted at the current breadth AND a route to
+# a frontier exists AND that route is longer than the estimated steps
+# left in the life. ls20's 526-action level-1 overrun (baseline 22) looks
+# dominated by case (b), fresh untried-candidate probing at each
+# newly-reached node, not by walks BACK to a distant already-mapped
+# frontier -- so the specific situation this flag optimises for may
+# simply be rare on the one game it was built to help. Left OFF by
+# default; not shipped. If revisited, instrument how often case (c) is
+# even reached on ls20 before changing what happens inside it.
 RESPAWN_AWARE = _env_int("ARC_RESPAWN_AWARE", 0)
 
 # Periods to keep when estimating how long a life lasts. ls20 measures
@@ -1795,6 +1928,90 @@ def run_tool_conversation(
 # from describes a board that is several moves stale, so it is asked
 # again rather than allowed to keep executing against a memory.
 LLM_TURN_ACTIONS = _env_int("ARC_LLM_TURN_ACTIONS", 60)
+
+# 2026-08-11: `_learn_mask` (and `_track`/`_check_status`) are only ever
+# called from the top of `choose_action`, which the framework invokes once
+# per LOOP ITERATION -- but when the model drives, `_llm_act` below plays
+# up to LLM_TURN_ACTIONS real actions inside a single `choose_action` call
+# before returning. So the mask learner's "previous vs current" sample
+# spans a whole turn, not one step, while `hud_mask`'s change-rate
+# thresholds (see VOLATILE_THRESHOLD/MASK_LADDER) are calibrated on
+# single-step statistics -- this module's own docstring example is a
+# SINGLE transition where two rows changed 98.3% of the time and nothing
+# else came close. Across a 60-action window almost every cell changes at
+# least once for ordinary reasons (the avatar walking, animation), so the
+# strict rule is fed statistics it was never designed to interpret, and
+# masking is unlikely to converge correctly whenever the model is driving.
+# This gives a concrete mechanism for the biggest surprise in
+# MASK_STRICT_SCALE's GPU validation: mask-timing changes cascaded into
+# wildly different LLM trajectories (10/25 games moved on GPU vs 2/25
+# locally) -- the LLM path was never feeding the learner real per-step
+# evidence to begin with, on any config.
+#
+# Scoped narrowly to `_learn_mask` alone, not the full `_track`/
+# `_check_status` trio: those two are entangled with `_pending`-based
+# reasoning ("the action it is judging is the very one that lost us") that
+# the LLM path deliberately does not populate (see the "model's steps are
+# not recorded as graph edges" note on `_pending`, a few screens down) --
+# porting them too would mean re-deriving that interaction from scratch
+# instead of reusing a single, already-idempotent entry point. `_learn_mask`
+# alone is safe to call from here: it returns True exactly once, on
+# adoption, and is a no-op forever after (`if self._mask_frozen: return
+# False`), so `choose_action`'s own top-level call next turn will not
+# double-fire. When it does return True mid-turn, the same reset
+# `choose_action` performs on adoption runs immediately, right here --
+# nothing about the model's OWN turn logic depends on the search graph
+# (item 2's separate, still-open finding: LLM actions never touch
+# `_edges`/`_total` at all), so there is nothing to interrupt; the turn
+# simply continues with a freshly rekeyed graph waiting for whenever the
+# model is retired into the fallback.
+#
+# Off by default, and GPU-VALIDATE WITH TWO RUNS before defaulting on, per
+# the MASK_STRICT_SCALE lesson this same section documents: local-only
+# testing cannot exercise this path at all (no LLM without a GPU/model),
+# so there is no cheap local signal to check first.
+LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
+
+# 2026-08-11: by design (see the "model's steps are not recorded as graph
+# edges" note on `_pending`, a few screens down), `_llm_act` calls
+# `self._step_env` directly and never touches `self._edges`/`self._total`/
+# `self._cursor`/`self._fatal`/`self._deaths` -- every real transition the
+# model causes is logged into `self._transitions` for the forward-model
+# verifier, but that log is never turned into graph edges. When the model
+# is retired (LLM_MAX_FAILURES/LLM_MAX_TIMEOUTS), the pure-search fallback
+# takes over with a completely empty graph, even though potentially
+# hundreds of already-billed real actions explored real, reusable state
+# transitions and (worse) real, reusable proof of which moves are lethal.
+#
+# Scoped to `_edges` and `_fatal`/`_deaths` only, not `_total`/`_cursor`:
+# those two need an accurate candidate COUNT per node (`len(codes)` from a
+# full `candidate_actions` call, the most expensive thing this agent
+# does), and seeding them wrong would make `_has_untried` either lie that
+# an LLM-visited node has nothing left to try (silently losing candidates
+# the model never touched) or lie the other way (corrupting the cursor
+# invariant `_select`'s own comments call out as load-bearing). Leaving
+# them unseeded is not a partial version of the fix -- `_has_untried`
+# defaults an unlisted node to "nothing untried" (`_total.get(node, 0)`
+# defaults 0), so `_route_to_frontier`'s BFS treats every LLM-visited node
+# as a pure waypoint on the way to a real frontier, never a false dead end
+# and never a false "fully explored". The moment the search organically
+# revisits one of these nodes, `_candidates` seeds `_total`/`_cursor` for
+# it normally, exactly as it would have without this flag.
+#
+# Independent of LLM_PER_ACTION_MASK: node ids here use whatever mask is
+# currently active, same as everywhere else, and any mask change (from
+# either flag) already clears `_edges` via `_reset_graph`, so a stale-mask
+# edge cannot survive past the change that invalidated it.
+#
+# `_transitions` is capped at TRANSITION_LOG (400) real actions, so a
+# game the model plays past that only gets the most recent 400 seeded --
+# a real limitation, left as-is rather than growing an unbounded parallel
+# log for this alone.
+#
+# Off by default; needs a GPU run to test at all (no LLM without a model)
+# and two independent runs before defaulting on, per the MASK_STRICT_SCALE
+# lesson.
+LLM_SEED_EDGES = _env_int("ARC_LLM_SEED_EDGES", 0)
 
 # Recent (action, did-the-board-change) pairs offered as `history`.
 LLM_HISTORY = _env_int("ARC_LLM_HISTORY", 16)
@@ -2924,6 +3141,59 @@ def parse_action_spec(
     return action_id, None, None
 
 
+def _flood_component(
+    grid: tuple[tuple[int, ...], ...],
+    x: int,
+    y: int,
+    ignore: frozenset[int] = frozenset(),
+) -> Optional[tuple[list[tuple[int, int]], int]]:
+    """The 4-connected same-color region containing (x, y): (cells, color).
+
+    None if (x, y) is off the grid. Deliberately bounded to one component
+    rather than a frame-wide scan -- for computing a single click target's
+    object identity (see `object_signature`, LIVE_OBJECT_PRIORITY) without
+    paying for a full `segment_frame` pass, which is the most expensive
+    thing this agent does.
+    """
+    height = len(grid)
+    if not (0 <= y < height):
+        return None
+    width = len(grid[0]) if height else 0
+    if not (0 <= x < width):
+        return None
+    color = grid[y][x]
+    seen = {(y, x)}
+    stack = [(y, x)]
+    cells: list[tuple[int, int]] = []
+    while stack:
+        cy, cx = stack.pop()
+        cells.append((cy, cx))
+        for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+            if (
+                0 <= ny < height
+                and 0 <= nx < width
+                and (ny, nx) not in seen
+                and grid[ny][nx] == color
+                and (ny * width + nx) not in ignore
+            ):
+                seen.add((ny, nx))
+                stack.append((ny, nx))
+    return cells, color
+
+
+def object_signature(cells: list[tuple[int, int]], color: int) -> int:
+    """Same `color + bbox-normalised-offsets` crc32 formula as
+    `segment_frame`'s `hash` field, exposed standalone: the same shape in
+    the same color hashes equal wherever it sits, which is what
+    `_flood_component` + this function let a caller compute for one click
+    target without re-segmenting the whole frame."""
+    top = min(c[0] for c in cells)
+    left = min(c[1] for c in cells)
+    offsets = sorted((cy - top, cx - left) for cy, cx in cells)
+    signature = f"{color}|" + ";".join(f"{a},{b}" for a, b in offsets)
+    return zlib.crc32(signature.encode())
+
+
 def click_targets(
     grid: tuple[tuple[int, ...], ...],
     limit: int = MAX_CLICK_CANDIDATES,
@@ -3339,6 +3609,41 @@ READOUT_CAP = _env_int("ARC_READOUT_CAP", 400)
 # the evidence for that is that it fires: 124 probes skipped on a map
 # whose no-op presses number about 97. It is aimed at the right cost. It
 # just cannot tell a wall from a locked door.
+#
+# 2026-08-11: the hard skip above had a second, self-reinforcing bug on
+# top of "cannot tell a wall from a locked door" -- the free self-loop it
+# wrote (`_edges[node][code] = node`, "we know the outcome without paying
+# for it") meant a blocked-looking candidate was NEVER actually walked
+# into again at that node, which is also the only way `_blocked` ever
+# gets un-learned (see the `difference_update` a few lines above this
+# comment: walking onto a square is the sole proof it stopped being a
+# wall). A permanently-free skip and a permanently-blocked record fed each
+# other -- a locked door that later unlocked had no path back to being
+# tried.
+#
+# Rescoped to a de-prioritization instead: `_candidates` now stable-
+# partitions a node's candidate list so blocked-looking codes sort behind
+# everything else (same pattern as LIVE_CODE_PRIORITY's live-code
+# promotion, just at the opposite end), and the cursor's skip loop no
+# longer treats a blocked-looking code as free -- it is simply tried last,
+# for real, once nothing better remains at that node.
+#
+# MEASURED (2026-08-11, full 25-game sweep): aggregate 0.0761 -> 0.0760,
+# a wash. The old catastrophic failure is gone -- ls20 clears level 1
+# every time now, never the "not clearing it in 1500" the hard skip
+# caused -- but the claim above that a real wall "costs exactly what it
+# would have cost without this flag" does not hold up: ls20 level 1
+# actually goes 526 -> 682 actions (baseline vs this), worse, not
+# neutral. Demoting a blocked-looking candidate means genuinely live
+# candidates that happen to rank BEHIND it get tried first instead,
+# which costs real exploration whenever `_blocked`'s single-observation
+# confirm (BLOCKED_CONFIRM=1) flags a square early and pessimistically.
+# sp80 shows the same small shuffle between levels 2 and 3 (3253->3271,
+# 1670->1652) with its total unchanged. Net: a real correctness fix
+# (the mechanism can self-correct again) that is not a net local score
+# win on this sample. Left OFF by default; not shipped as a score
+# improvement, but the softened design is worth keeping over the old
+# hard skip if this is ever revisited, rather than reverting to it.
 BLOCKED_SKIP = _env_int("ARC_BLOCKED_SKIP", 0)
 
 
@@ -4054,6 +4359,14 @@ class MyAgent(Agent):
         # Full codes (action id + x/y for a click) that have moved the board
         # at least once, anywhere in the game so far. See LIVE_CODE_PRIORITY.
         self._code_live: set[int] = set()
+        # See LIVE_OBJECT_PRIORITY: `_code_object_hash` remembers which
+        # object (by `object_signature`) each click code pointed at when
+        # its candidate list was last generated, so a code that later
+        # proves live can be translated into an object hash; `_object_live`
+        # is that set of proven-live object hashes, the object-identity
+        # analogue of `_code_live`.
+        self._code_object_hash: dict[int, int] = {}
+        self._object_live: set[int] = set()
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
@@ -4588,6 +4901,50 @@ class MyAgent(Agent):
             self.action_counter += 1
 
             after = grid_of(frame)
+
+            # See LLM_PER_ACTION_MASK. This is the one real per-step
+            # transition `_learn_mask` needs and never otherwise gets
+            # while the model is driving. `_learn_mask` is a no-op once
+            # already frozen, so this cannot double-adopt against
+            # `choose_action`'s own top-level call next turn.
+            if LLM_PER_ACTION_MASK and after:
+                mask_height = len(after)
+                mask_width = len(after[0]) if mask_height else 0
+                mask_flat = tuple(chain.from_iterable(after))
+                if self._learn_mask(mask_flat, mask_width, mask_height):
+                    logger.info(
+                        "%s: masking %d volatile cells out of the state "
+                        "key at action %d (mid LLM turn); restarting the "
+                        "map",
+                        self.game_id, len(self._volatile), self._steps,
+                    )
+                    self._reset_graph()
+                    self._pending = None
+                    self._sol_start = None
+                    self._sol_edges = {}
+
+            # See LLM_SEED_EDGES. Cheap by construction: no candidate
+            # generation, just hashing the two grids the step already
+            # produced through the same `_node_key` the search itself
+            # uses -- so this is exactly what `_observe` would have
+            # recorded had a search-driven action, not the model, taken
+            # this step.
+            if LLM_SEED_EDGES and before is not None:
+                before_node = self._node_key(tuple(chain.from_iterable(before)))
+                seed_code = encode_action(action_id, x, y)
+                if frame.state is GameState.GAME_OVER:
+                    key = (before_node, seed_code)
+                    deaths = self._deaths.get(key, 0) + 1
+                    self._deaths[key] = deaths
+                    if deaths >= DEATH_TOLERANCE:
+                        self._fatal.add(key)
+                        outgoing = self._edges.get(before_node)
+                        if outgoing is not None:
+                            outgoing.pop(seed_code, None)
+                elif after:
+                    after_node = self._node_key(tuple(chain.from_iterable(after)))
+                    self._edges.setdefault(before_node, {})[seed_code] = after_node
+
             if before is not None:
                 self._transitions.append((before, label, after))
             if expected is not None and expected != after and len(drift) < 3:
@@ -5223,7 +5580,7 @@ class MyAgent(Agent):
             if self._motion is not None:
                 logger.info(
                     "%s: motion model carried into level %d: %s "
-                    "| %d walls known, %d probes skipped",
+                    "| %d walls known, %d probes deprioritized",
                     self.game_id, levels, self._motion.report(),
                     len(self._blocked), self._skipped_blocked,
                 )
@@ -5330,6 +5687,9 @@ class MyAgent(Agent):
         if node != prev_node:
             self._act_changed[action_id] += 1
             self._code_live.add(code)
+            object_hash = self._code_object_hash.get(code)
+            if object_hash is not None:
+                self._object_live.add(object_hash)
 
         # Split the level's spend by action class. ~112 of the ~117 codes a
         # node offers are ACTION6 clicks, so if clicks dominate the bill and
@@ -6018,15 +6378,6 @@ class MyAgent(Agent):
         if self._at is not None:
             self._look = self._appearance(flat, self._at, width, height)
 
-    def _skip_blocked(self, node: int, code: int) -> bool:
-        blocked = self._blocked_move(code)
-        if blocked:
-            self._skipped_blocked += 1
-            # We know the outcome without paying for it: walking into a
-            # wall leaves the board where it was.
-            self._edges.setdefault(node, {})[code] = node
-        return blocked
-
     def _blocked_move(self, code: int) -> bool:
         """Would this action walk into something that has already refused
         us, from where we are standing, wearing what we are wearing?"""
@@ -6070,6 +6421,46 @@ class MyAgent(Agent):
             if live_here:
                 rest = [c for c in codes if c not in self._code_live]
                 codes = live_here + rest
+
+        # See BLOCKED_SKIP. Same stable-partition shape as the priority
+        # boost above, mirrored to the back: a code this node's current
+        # (look, destination) history says is blocked sorts behind
+        # everything else instead of being skipped for free and forever.
+        if BLOCKED_SKIP and self._blocked:
+            blocked_here = [c for c in codes if self._blocked_move(c)]
+            if blocked_here:
+                self._skipped_blocked += len(blocked_here)
+                rest = [c for c in codes if not self._blocked_move(c)]
+                codes = rest + blocked_here
+
+        # See LIVE_OBJECT_PRIORITY. `codes`/`grid` here are exactly the
+        # candidates and the board `node` was generated from -- i.e. this
+        # IS the "before" frame an action taken from `node` would click
+        # on -- so every click code's target gets a fresh object hash
+        # every time this runs (which `_candidates`'s own cache already
+        # limits to once per distinct node). Always overwritten, never
+        # skipped if already present: the same packed code recurs across
+        # many different nodes, and the object at that coordinate can be a
+        # different one each time.
+        if LIVE_OBJECT_PRIORITY:
+            for c in codes:
+                action_id, x, y = decode_action(c)
+                if action_id != _ACTION6_ID:
+                    continue
+                found = _flood_component(grid, x, y, self._volatile)
+                if found is not None:
+                    self._code_object_hash[c] = object_signature(*found)
+            if self._object_live:
+                live_here = [
+                    c for c in codes
+                    if self._code_object_hash.get(c) in self._object_live
+                ]
+                if live_here:
+                    rest = [
+                        c for c in codes
+                        if self._code_object_hash.get(c) not in self._object_live
+                    ]
+                    codes = live_here + rest
 
         if len(self._cache) >= CANDIDATE_CACHE_LIMIT:
             self._cache.clear()
@@ -6234,9 +6625,7 @@ class MyAgent(Agent):
             else EMPTY_EDGES
         )
         while index < limit and (
-            self._is_dead(codes[index])
-            or codes[index] in recorded
-            or self._skip_blocked(node, codes[index])
+            self._is_dead(codes[index]) or codes[index] in recorded
         ):
             index += 1
         if index < limit and node in self._total:
