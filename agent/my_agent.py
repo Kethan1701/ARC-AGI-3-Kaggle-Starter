@@ -1995,6 +1995,18 @@ LLM_TURN_ACTIONS = _env_int("ARC_LLM_TURN_ACTIONS", 60)
 # comment above (calling the observation pipeline once per real action
 # inside `_llm_act`'s loop, not once per turn from `choose_action`) --
 # that fix was never implemented, only the broken behavior was measured.
+#
+# NON-ADDITIVITY WARNING, 2026-08-12 (v27/v33/v34/v35 compared directly):
+# this flag's solo effect (v34, above) does NOT predict what happens when
+# LLM_SEED_EDGES is also on (v33). tu93 and re86 are FINE under this flag
+# alone (tu93 even improves, 0.286->0.434) but DIE when LLM_SEED_EDGES is
+# added -- negative synergy this flag's own solo test could not have
+# predicted. Conversely lf52, killed by this flag alone, SURVIVES when
+# LLM_SEED_EDGES is also on -- that flag appears to offset this one's
+# damage on that game. Do not reason about the combined config from either
+# flag's solo numbers; if both are ever revisited together, treat it as a
+# fourth, independent measurement, not an inference from the first three.
+# See kops/history.log 2026-08-12T14:56Z for the full per-game breakdown.
 LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 
 # 2026-08-11: by design (see the "model's steps are not recorded as graph
@@ -2044,12 +2056,29 @@ LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 # MEASURED 2026-08-12 (v34, deconfounded): LLM_PER_ACTION_MASK alone (this
 # flag left off) already accounts for a clean -3 clears with zero
 # offsetting gains (11/25 -> 8/25) -- see that flag's comment for the
-# breakdown. Since v33's combined run was only -2 clears (11/25 -> 9/25),
-# this flag's own individual effect is still unknown but must be net
-# POSITIVE relative to mask-alone (it clawed back one clear when shipped
-# together) -- not yet isolated. v35 (pending) tests this flag ALONE
-# (LLM_PER_ACTION_MASK left off) to measure it directly and to check
-# whether it, not the mask flag, is what drove r11l/cn04's gains in v33.
+# breakdown.
+#
+# MEASURED 2026-08-12 (v35, deconfounded, ALONE this time, mask flag
+# left off): net -1 clear, mixed direction. clears>=1 11/25 -> 10/25.
+# Lost {s5i5, vc33, tn36}, but gained {ka59, sp80} -- two games that had
+# NEVER cleared in any prior version, unlike LLM_PER_ACTION_MASK's clean
+# -3/+0. Aggregate 0.6677 -> 0.5052. Still a net regression, not
+# shippable, but the least-bad of the three flag configs tested (v33
+# combined -2, v34 mask-alone -3, this -1).
+#
+# NON-ADDITIVITY WARNING: r11l/cn04's gains in v33's combined run do NOT
+# come from this flag -- they don't appear here at all, so they are a
+# genuine interaction effect (see LLM_PER_ACTION_MASK's comment above for
+# the full breakdown, e.g. vc33/lf52 surviving in combination despite
+# being lost by one flag alone). This flag's ka59/sp80 gains also
+# EVAPORATE when combined with LLM_PER_ACTION_MASK in v33. Do not treat
+# this flag's solo numbers as its contribution to the combined config.
+#
+# Both flags stay off by default: none of the three tested configurations
+# (mask alone, seed-edges alone, both together) beat v27's 11/25 clears.
+# Next step if revisited: implement the actual per-action-call-site fix
+# described in LLM_PER_ACTION_MASK's top comment (not just gating this
+# naive flag), rather than re-testing more combinations of these two.
 LLM_SEED_EDGES = _env_int("ARC_LLM_SEED_EDGES", 0)
 
 # Recent (action, did-the-board-change) pairs offered as `history`.

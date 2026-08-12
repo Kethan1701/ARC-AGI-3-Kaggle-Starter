@@ -711,39 +711,21 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
-                # v33 (2026-08-11/12) tested LLM_PER_ACTION_MASK +
-                # LLM_SEED_EDGES together: clears>=1 11/25 -> 9/25 (down),
-                # aggregate 0.6677 -> 0.9047 (up, but driven by ft09's
-                # outlier +9.524, the same scoring-trap pattern already on
-                # record). Confounded and inconclusive: +2 clears (r11l,
-                # cn04) offset by -4 (tu93, s5i5, re86, tn36).
-                #
-                # v34 (2026-08-12) deconfounded run 1/4: LLM_PER_ACTION_MASK
-                # ALONE. Clean, unambiguous regression: clears>=1 11/25 ->
-                # 8/25, aggregate 0.6677 -> 0.3201. Lost exactly {{lf52,
-                # tn36, ft09}} from v27's clearing set, gained NOTHING --
-                # no mixed direction this time. tn36 (3.571) and ft09
-                # (4.762) were two of v27's biggest score contributors,
-                # which explains most of the aggregate drop too. Matches
-                # the standing hypothesis (mask/motion learners sample
-                # once per LLM turn, not once per action, so change-rate
-                # thresholds are miscalibrated whenever the LLM drives --
-                # see my_agent.py's LLM_PER_ACTION_MASK comment). Clean
-                # enough that no same-config confirmation run was spent;
-                # moved straight to testing LLM_SEED_EDGES alone below.
-                # See kops/history.log 2026-08-12T09:27Z (v33 result) and
-                # this same push's v34 result line for the full breakdown.
-                #
-                # TEMPORARY, this push only (v35, deconfounding run 2 of
-                # up to 4): LLM_SEED_EDGES ALONE, single-variable against
-                # the v27 baseline (LLM_PER_ACTION_MASK left at its coded
-                # default, off). This also answers whether LLM_SEED_EDGES
-                # was what made v33's combined run (9/25) less bad than
-                # v34's mask-alone run (8/25). Remove once the result is
-                # read; if worth a second confirmation run, re-add
-                # unchanged rather than editing this comment in place, so
-                # the two runs stay byte-identical config.
-                env['ARC_LLM_SEED_EDGES'] = '1'
+                # Deconfounding series, all against the v27 baseline
+                # (clears>=1 11/25, aggregate 0.6677):
+                #   v33 both flags together:  9/25  (0.9047, confounded)
+                #   v34 LLM_PER_ACTION_MASK alone: 8/25  (0.3201, clean -3/+0)
+                #   v35 LLM_SEED_EDGES alone:      10/25 (0.5052, -3/+2 mixed)
+                # None beat v27. Combining is NOT additive -- v33's result
+                # cannot be derived from v34+v35's individual per-game
+                # deltas (tu93/re86 fine solo, die combined; vc33/lf52 die
+                # solo, survive combined; r11l/cn04 only clear combined).
+                # Both flags left off by default. Full breakdown in
+                # agent/my_agent.py's LLM_PER_ACTION_MASK/LLM_SEED_EDGES
+                # comments and kops/history.log 2026-08-12T14:56Z. Next
+                # step if revisited: implement the actual per-action
+                # observation-pipeline fix these flags were meant to
+                # approximate, not more flag combinations.
                 print(f'=== rehearsing {{smoke_games or "ALL games"}} '
                       f'concurrently ({SMOKE_SECONDS}s shared budget) ===',
                       flush=True)
