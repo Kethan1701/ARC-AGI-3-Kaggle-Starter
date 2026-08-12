@@ -710,6 +710,25 @@ def build() -> dict:
                 if smoke_games:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
+
+                # Deconfounding series, all against the v27 baseline
+                # (clears>=1 11/25, aggregate 0.6677):
+                #   v33 both flags together:  9/25  (0.9047, confounded)
+                #   v34 LLM_PER_ACTION_MASK alone: 8/25  (0.3201, clean -3/+0)
+                #   v35 LLM_SEED_EDGES alone:      10/25 (0.5052, -3/+2 mixed)
+                # None beat v27. Combining is NOT additive -- v33's result
+                # cannot be derived from v34+v35's individual per-game
+                # deltas (tu93/re86 fine solo, die combined; vc33/lf52 die
+                # solo, survive combined; r11l/cn04 only clear combined).
+                # Both flags left off by default. Both are already full
+                # implementations of their design (per-action mask
+                # sampling; LLM transitions seeded into the search graph),
+                # not naive stand-ins -- both were built correctly and both
+                # still regressed alone. Full breakdown in
+                # agent/my_agent.py's LLM_PER_ACTION_MASK/LLM_SEED_EDGES
+                # comments and kops/history.log 2026-08-12T14:56Z. Next
+                # step if revisited is diagnosis (why a correct per-action
+                # fix still regresses), not re-implementation.
                 print(f'=== rehearsing {{smoke_games or "ALL games"}} '
                       f'concurrently ({SMOKE_SECONDS}s shared budget) ===',
                       flush=True)
