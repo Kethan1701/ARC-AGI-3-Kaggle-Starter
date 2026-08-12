@@ -720,12 +720,15 @@ def build() -> dict:
                 # cannot be derived from v34+v35's individual per-game
                 # deltas (tu93/re86 fine solo, die combined; vc33/lf52 die
                 # solo, survive combined; r11l/cn04 only clear combined).
-                # Both flags left off by default. Full breakdown in
+                # Both flags left off by default. Both are already full
+                # implementations of their design (per-action mask
+                # sampling; LLM transitions seeded into the search graph),
+                # not naive stand-ins -- both were built correctly and both
+                # still regressed alone. Full breakdown in
                 # agent/my_agent.py's LLM_PER_ACTION_MASK/LLM_SEED_EDGES
                 # comments and kops/history.log 2026-08-12T14:56Z. Next
-                # step if revisited: implement the actual per-action
-                # observation-pipeline fix these flags were meant to
-                # approximate, not more flag combinations.
+                # step if revisited is diagnosis (why a correct per-action
+                # fix still regresses), not re-implementation.
                 print(f'=== rehearsing {{smoke_games or "ALL games"}} '
                       f'concurrently ({SMOKE_SECONDS}s shared budget) ===',
                       flush=True)

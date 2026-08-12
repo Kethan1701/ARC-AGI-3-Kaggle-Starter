@@ -1985,16 +1985,24 @@ LLM_TURN_ACTIONS = _env_int("ARC_LLM_TURN_ACTIONS", 60)
 # clearing set, gained NOTHING -- no mixed direction, unlike v33's
 # confounded run. tn36 (3.571) and ft09 (4.762) were two of v27's biggest
 # score contributors, so most of the aggregate drop traces to this same
-# loss. Confirms the mechanism this section's own analysis predicted: the
-# per-turn (not per-action) call site means change-rate thresholds
-# calibrated on single-step statistics see a delta spanning up to
-# LLM_TURN_ACTIONS=60 real actions, so masking converges on the wrong
-# signal whenever the LLM drives. Left off by default -- this is now a
-# confirmed regression, not just an untested flag. Do not re-enable
-# without first fixing the per-turn/per-action mismatch described in the
-# comment above (calling the observation pipeline once per real action
-# inside `_llm_act`'s loop, not once per turn from `choose_action`) --
-# that fix was never implemented, only the broken behavior was measured.
+# loss.
+#
+# IMPORTANT CORRECTION, same day: this flag IS the per-action fix
+# described above (the `_learn_mask` call at the per-action call site in
+# `_llm_act`, not a naive stand-in) -- it was not merely gating broken
+# behavior, it was the actual granularity fix, GPU-tested, and it still
+# regressed. So the per-turn/per-action mismatch diagnosed above is real
+# but evidently not the whole story: fixing the sampling granularity
+# alone does not recover v27's clears. One live hypothesis, not yet
+# checked against a log: per-action sampling reaches VOLATILE_WARMUP
+# (25 samples) far sooner in real-action count during an LLM-driven
+# game than it would on the search-only path, so the mask may now be
+# adopting too EARLY relative to how much of the board the model has
+# actually explored -- the same failure mode EARLY_MASK was measured and
+# rejected for elsewhere in this file ("fires at action 10 instead of 26
+# ... buys nothing"). Left off by default either way; if revisited,
+# instrument the actual adoption action-count on a failing game (lf52,
+# tn36, ft09) before proposing another fix.
 #
 # NON-ADDITIVITY WARNING, 2026-08-12 (v27/v33/v34/v35 compared directly):
 # this flag's solo effect (v34, above) does NOT predict what happens when
@@ -2076,9 +2084,16 @@ LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 #
 # Both flags stay off by default: none of the three tested configurations
 # (mask alone, seed-edges alone, both together) beat v27's 11/25 clears.
-# Next step if revisited: implement the actual per-action-call-site fix
-# described in LLM_PER_ACTION_MASK's top comment (not just gating this
-# naive flag), rather than re-testing more combinations of these two.
+# CORRECTION: both flags already ARE full implementations of their
+# respective plan items (per-action mask sampling; LLM transitions seeded
+# into the search graph), not naive stand-ins awaiting a "real" fix -- see
+# LLM_PER_ACTION_MASK's "IMPORTANT CORRECTION" paragraph above. Both were
+# implemented correctly and both still regressed alone, so the obvious
+# fixes for both diagnosed bugs have now been tried and failed. Next step
+# if revisited is diagnosis, not re-implementation: instrument what
+# actually happens on a game each flag loses (lf52/tn36/ft09 for the mask
+# flag; s5i5/vc33/tn36 for this one) rather than assuming either
+# mechanism's design was wrong.
 LLM_SEED_EDGES = _env_int("ARC_LLM_SEED_EDGES", 0)
 
 # Recent (action, did-the-board-change) pairs offered as `history`.
