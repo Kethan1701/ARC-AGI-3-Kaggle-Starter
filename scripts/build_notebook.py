@@ -711,20 +711,17 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
-                # TEMPORARY, this push only (2026-08-11): exploratory GPU
-                # test of two new, off-by-default flags (see their
-                # comments in agent/my_agent.py) that cannot be measured
-                # locally at all -- no LLM without a GPU/model. Set as a
-                # runtime env override here rather than flipping their
-                # coded default, so the tested local default (both off)
-                # stays exactly what 438 unit tests verify; only the
-                # deployed kernel's own process sees them on. Confounded
-                # on purpose -- both new/unmeasured, shipped together
-                # rather than in two separate runs, given how long a
-                # fully isolated two-run-per-flag protocol would take.
-                # Remove this block once the result is read.
-                env['ARC_LLM_PER_ACTION_MASK'] = '1'
-                env['ARC_LLM_SEED_EDGES'] = '1'
+                # v33 (2026-08-11/12) tested LLM_PER_ACTION_MASK +
+                # LLM_SEED_EDGES together via this same override block:
+                # clears>=1 11/25 -> 9/25 (down), aggregate 0.6677 -> 0.9047
+                # (up, but driven by ft09's outlier +9.524 -- the same
+                # scoring-trap pattern already on record). Confounded and
+                # inconclusive: +2 clears (r11l, cn04) offset by -4 (tu93,
+                # s5i5, re86, tn36). Block removed per its own note above,
+                # both flags back to their coded default (off) here. See
+                # kops/history.log 2026-08-12T09:27Z and
+                # arc-agi-3-open-threads memory before re-enabling either --
+                # next step is one flag at a time, not both together again.
                 print(f'=== rehearsing {{smoke_games or "ALL games"}} '
                       f'concurrently ({SMOKE_SECONDS}s shared budget) ===',
                       flush=True)

@@ -1970,6 +1970,16 @@ LLM_TURN_ACTIONS = _env_int("ARC_LLM_TURN_ACTIONS", 60)
 # the MASK_STRICT_SCALE lesson this same section documents: local-only
 # testing cannot exercise this path at all (no LLM without a GPU/model),
 # so there is no cheap local signal to check first.
+#
+# MEASURED 2026-08-11/12 (v33, kops/history.log): shipped TOGETHER with
+# LLM_SEED_EDGES (confounded, one combined signal, not attributable to
+# either flag alone). clears>=1 11/25 -> 9/25 (down). +2 clears (r11l,
+# cn04) offset by -4 (tu93, s5i5, re86, tn36). Aggregate rose 0.6677 ->
+# 0.9047 but driven by one outlier (ft09 +9.524, cleared level 2) -- same
+# scoring-trap pattern already on record, not evidence of a broad
+# improvement. Inconclusive, not a clean win. Left off by default. Next
+# step if revisited: one flag at a time, each with its own two-run GPU
+# validation, not both together again.
 LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 
 # 2026-08-11: by design (see the "model's steps are not recorded as graph
@@ -2011,6 +2021,10 @@ LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 # Off by default; needs a GPU run to test at all (no LLM without a model)
 # and two independent runs before defaulting on, per the MASK_STRICT_SCALE
 # lesson.
+#
+# MEASURED 2026-08-11/12 (v33, kops/history.log): see LLM_PER_ACTION_MASK's
+# comment above -- shipped together, confounded, inconclusive (clears>=1
+# 11/25 -> 9/25). Left off by default pending a solo re-test.
 LLM_SEED_EDGES = _env_int("ARC_LLM_SEED_EDGES", 0)
 
 # Recent (action, did-the-board-change) pairs offered as `history`.
