@@ -1977,9 +1977,24 @@ LLM_TURN_ACTIONS = _env_int("ARC_LLM_TURN_ACTIONS", 60)
 # cn04) offset by -4 (tu93, s5i5, re86, tn36). Aggregate rose 0.6677 ->
 # 0.9047 but driven by one outlier (ft09 +9.524, cleared level 2) -- same
 # scoring-trap pattern already on record, not evidence of a broad
-# improvement. Inconclusive, not a clean win. Left off by default. Next
-# step if revisited: one flag at a time, each with its own two-run GPU
-# validation, not both together again.
+# improvement. Inconclusive, not a clean win.
+#
+# MEASURED 2026-08-12 (v34, deconfounded, ALONE this time, LLM_SEED_EDGES
+# left off): clean, unambiguous regression. clears>=1 11/25 -> 8/25,
+# aggregate 0.6677 -> 0.3201. Lost exactly {lf52, tn36, ft09} from v27's
+# clearing set, gained NOTHING -- no mixed direction, unlike v33's
+# confounded run. tn36 (3.571) and ft09 (4.762) were two of v27's biggest
+# score contributors, so most of the aggregate drop traces to this same
+# loss. Confirms the mechanism this section's own analysis predicted: the
+# per-turn (not per-action) call site means change-rate thresholds
+# calibrated on single-step statistics see a delta spanning up to
+# LLM_TURN_ACTIONS=60 real actions, so masking converges on the wrong
+# signal whenever the LLM drives. Left off by default -- this is now a
+# confirmed regression, not just an untested flag. Do not re-enable
+# without first fixing the per-turn/per-action mismatch described in the
+# comment above (calling the observation pipeline once per real action
+# inside `_llm_act`'s loop, not once per turn from `choose_action`) --
+# that fix was never implemented, only the broken behavior was measured.
 LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 
 # 2026-08-11: by design (see the "model's steps are not recorded as graph
@@ -2024,7 +2039,17 @@ LLM_PER_ACTION_MASK = _env_int("ARC_LLM_PER_ACTION_MASK", 0)
 #
 # MEASURED 2026-08-11/12 (v33, kops/history.log): see LLM_PER_ACTION_MASK's
 # comment above -- shipped together, confounded, inconclusive (clears>=1
-# 11/25 -> 9/25). Left off by default pending a solo re-test.
+# 11/25 -> 9/25).
+#
+# MEASURED 2026-08-12 (v34, deconfounded): LLM_PER_ACTION_MASK alone (this
+# flag left off) already accounts for a clean -3 clears with zero
+# offsetting gains (11/25 -> 8/25) -- see that flag's comment for the
+# breakdown. Since v33's combined run was only -2 clears (11/25 -> 9/25),
+# this flag's own individual effect is still unknown but must be net
+# POSITIVE relative to mask-alone (it clawed back one clear when shipped
+# together) -- not yet isolated. v35 (pending) tests this flag ALONE
+# (LLM_PER_ACTION_MASK left off) to measure it directly and to check
+# whether it, not the mask flag, is what drove r11l/cn04's gains in v33.
 LLM_SEED_EDGES = _env_int("ARC_LLM_SEED_EDGES", 0)
 
 # Recent (action, did-the-board-change) pairs offered as `history`.
