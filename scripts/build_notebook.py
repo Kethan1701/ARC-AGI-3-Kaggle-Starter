@@ -233,14 +233,17 @@ SMOKE_STEPS = 1200
 # unused (kops/history.log, 2026-08-06T12:39:27Z) -- but that run's own
 # blocker turned out to be an unrelated HTTP-400 context-overflow bug
 # (LLM_EVICT_SLACK, reverted same day), not proof the full-cost test is
-# pointless. Nothing this session has tested the real 7.5x (27000s)
-# regime. TEMPORARY, this push only (depth-push item 0, see
-# fancy-launching-thunder plan): full-cost test, zero other code changes,
-# current default config otherwise. Revert to 7200 once the result is
-# read -- do not leave 27000 as the default rehearsal budget, it costs
-# 3.75x the GPU time of every other local iteration for a diagnostic that
-# only needs to run once.
-SMOKE_SECONDS = 27000
+# pointless.
+#
+# v36 (2026-08-12, depth-push item 0) ran the real 7.5x (27000s) budget
+# once, zero other code changes, to see whether `clears>=2:0/25` is a
+# budget artifact or a real ceiling. That push already carries its own
+# 27000 value (baked into the spliced notebook at push time, commit
+# 8c8d15d) -- reverted here immediately after pushing so no *later* push
+# (e.g. for the depth-push code fixes) accidentally inherits the 3.75x
+# GPU cost. See kops/history.log for the v36 result once it lands, and
+# fancy-launching-thunder plan item 0.
+SMOKE_SECONDS = 7200
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
