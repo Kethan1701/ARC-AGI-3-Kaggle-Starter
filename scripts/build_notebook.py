@@ -228,7 +228,19 @@ SMOKE_STEPS = 1200
 # a first, moderate step (2x cost, not 7.5x) to see whether either game
 # pushes past its previous halt point before committing to the full-cost
 # test. See arc-agi-3-kaggle-gpu-infra memory.
-SMOKE_SECONDS = 7200
+#
+# v26's 2x step found `clears>=2` STILL 0/25 even with budget visibly
+# unused (kops/history.log, 2026-08-06T12:39:27Z) -- but that run's own
+# blocker turned out to be an unrelated HTTP-400 context-overflow bug
+# (LLM_EVICT_SLACK, reverted same day), not proof the full-cost test is
+# pointless. Nothing this session has tested the real 7.5x (27000s)
+# regime. TEMPORARY, this push only (depth-push item 0, see
+# fancy-launching-thunder plan): full-cost test, zero other code changes,
+# current default config otherwise. Revert to 7200 once the result is
+# read -- do not leave 27000 as the default rehearsal budget, it costs
+# 3.75x the GPU time of every other local iteration for a diagnostic that
+# only needs to run once.
+SMOKE_SECONDS = 27000
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 #
