@@ -717,11 +717,17 @@ def build() -> dict:
                 # (up, but driven by ft09's outlier +9.524 -- the same
                 # scoring-trap pattern already on record). Confounded and
                 # inconclusive: +2 clears (r11l, cn04) offset by -4 (tu93,
-                # s5i5, re86, tn36). Block removed per its own note above,
-                # both flags back to their coded default (off) here. See
-                # kops/history.log 2026-08-12T09:27Z and
-                # arc-agi-3-open-threads memory before re-enabling either --
-                # next step is one flag at a time, not both together again.
+                # s5i5, re86, tn36). See kops/history.log 2026-08-12T09:27Z
+                # and arc-agi-3-open-threads memory for the full breakdown.
+                #
+                # TEMPORARY, this push only (v34, deconfounding run 1 of
+                # up to 4): LLM_PER_ACTION_MASK ALONE, single-variable
+                # against the v27 baseline (LLM_SEED_EDGES left at its
+                # coded default, off). Remove once the result is read; if
+                # this looks worth a second confirmation run, re-add
+                # unchanged rather than editing this comment in place, so
+                # the two runs stay byte-identical config.
+                env['ARC_LLM_PER_ACTION_MASK'] = '1'
                 print(f'=== rehearsing {{smoke_games or "ALL games"}} '
                       f'concurrently ({SMOKE_SECONDS}s shared budget) ===',
                       flush=True)
