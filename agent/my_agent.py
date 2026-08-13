@@ -1613,6 +1613,15 @@ LLM_REPEAT_RESET = _env_int("ARC_LLM_REPEAT_RESET", 2)
 # MASK_STRICT_SCALE proved cascades far more on the real LLM-driven path
 # than any local-only signal can predict (no LLM without a GPU/model, so
 # there is no cheap local check for this either).
+#
+# REJECTED at threshold=8 (v37/v38, kops/history.log): two identical-config
+# GPU runs did not reproduce each other. v37 hit clears>=2=2 (vc33, ft09)
+# with a 5-lost/2-gained breadth swap vs v27; v38, same code and env,
+# scored clears>=2=0 and a game-set nearly identical to v27 minus 3 (no
+# gains at all). Aggregate swung 0.7516 -> 0.2741 run to run. Confirms this
+# flag sits in the same fragile LLM-turn-structure category as
+# MASK_STRICT_SCALE (v31 1-off gain, non-reproduced in v32) -- leave at 0
+# until a threshold or trigger condition survives two matching runs.
 LLM_MAX_STALE_TURNS = _env_int("ARC_LLM_MAX_STALE_TURNS", 0)
 # How many python calls the model may make per observe-plan-act turn.
 #
