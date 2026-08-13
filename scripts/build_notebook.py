@@ -726,6 +726,18 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
+                # TEMPORARY, this push only (v37): GPU-validate depth-push
+                # Fix A (agent/my_agent.py's LLM_MAX_STALE_TURNS, committed
+                # default 0/off). 8 turns chosen per the plan's own
+                # reasoning -- v29 averaged 175 turns/game, so a single
+                # digit is still a large fraction of typical usage, and
+                # generous enough that a game the model is genuinely
+                # making progress on won't get cut off by this alone.
+                # Revert this line right after the push completes so a
+                # later unrelated push doesn't silently inherit it (same
+                # discipline as v36's SMOKE_SECONDS override).
+                env['ARC_LLM_MAX_STALE_TURNS'] = '8'
+
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
                 #   v33 both flags together:  9/25  (0.9047, confounded)
