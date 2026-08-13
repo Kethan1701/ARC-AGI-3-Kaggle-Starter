@@ -402,6 +402,19 @@ def test_the_ladder_only_ever_relaxes():
     assert list(agent.MASK_LADDER) == sorted(agent.MASK_LADDER, reverse=True)
 
 
+def test_llm_max_stale_turns_ships_off():
+    """Depth-push Fix A (2026-08-12): retires the LLM to pure search after
+    N turns with no genuine level-up, closing the gap LLM_MAX_FAILURES/
+    LLM_MAX_TIMEOUTS cannot see (both reset on any single successful
+    call, so a model that keeps responding uselessly never trips them --
+    see agent/my_agent.py's LLM_MAX_STALE_TURNS comment and
+    tests/test_llm_turn.py for the mechanism tests). 0 = off, matching
+    LLM_MAX_TOKENS's convention. Needs two independent GPU runs before
+    defaulting on, same risk category as MASK_STRICT_SCALE below -- this
+    changes WHEN control permanently passes from the LLM to search."""
+    assert agent.LLM_MAX_STALE_TURNS == 0
+
+
 def test_mask_strict_scale_ships_off():
     """Clean local win (25-game sweep: aggregate 0.0761 -> 0.1070, cd82
     0.40 -> 1.17), but GPU-VALIDATED AND REJECTED on the real LLM-driven

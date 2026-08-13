@@ -1579,6 +1579,41 @@ LLM_MAX_TIMEOUTS = _env_int("ARC_LLM_MAX_TIMEOUTS", 12)
 # `_llm_turn`: 1 is a note, 2 says the note did not land and the model is
 # now agreeing with its own history, which only a reset breaks.
 LLM_REPEAT_RESET = _env_int("ARC_LLM_REPEAT_RESET", 2)
+
+# 2026-08-12 (depth-push Fix A): turns since the last genuine level-up,
+# before the model is retired to pure search, same as LLM_MAX_FAILURES/
+# LLM_MAX_TIMEOUTS above but gated on PROGRESS instead of TRANSPORT
+# health. Those two only count consecutive failed/timed-out calls, and
+# both reset to zero on any single successful response (see `_llm_turn`)
+# -- so a model that keeps getting valid-but-useless responses (looping,
+# replaying, never advancing a level) never trips them. There is
+# currently no code path that retires the model for being unproductive;
+# LLM_REPEAT_RESET only resets the transcript after 2 identical turns and
+# gives the model another shot, indefinitely, against the same shared
+# `_DEADLINE` (`my_agent.py` module level) every other one of the 25
+# concurrent games is also racing against. Concretely: v27's sp80 spent
+# 424 real actions across many LLM turns without clearing level 1
+# (baseline 39), while pure search alone clears it in 78 -- the model was
+# not failing, it was just not helping, and nothing handed the game to
+# search until the shared deadline ran out for everyone.
+#
+# Direct precedent already shipped for the separate lightweight `python`
+# policy path: POLICY_GIVE_UP ("a model that cannot help this game should
+# not keep being paid to say so") -- this ports the same idea to the big
+# tool-calling LLM path, which has no equivalent today.
+#
+# 0 = off (no cap), matching LLM_MAX_TOKENS's convention. Off by default:
+# unlike LIVE_CODE_PRIORITY/LIVE_OBJECT_PRIORITY or the mask-timing
+# flags, this carries no state-dependent generalization risk -- it is a
+# monotonic per-game counter, not a memory keyed on board content, so its
+# only failure mode is "threshold too aggressive" (a single scalar to
+# tune), not a wrongly-generalized verdict. Still needs GPU validation
+# with two independent runs before defaulting on: it changes WHEN control
+# permanently passes from the LLM to search, the same category of change
+# MASK_STRICT_SCALE proved cascades far more on the real LLM-driven path
+# than any local-only signal can predict (no LLM without a GPU/model, so
+# there is no cheap local check for this either).
+LLM_MAX_STALE_TURNS = _env_int("ARC_LLM_MAX_STALE_TURNS", 0)
 # How many python calls the model may make per observe-plan-act turn.
 #
 # Was 12, on TAAF's principle that the model should not ration tool calls.
@@ -4569,6 +4604,10 @@ class MyAgent(Agent):
         self._llm_messages: list[dict[str, Any]] = []
         self._llm_history: list[str] = []
         self._llm_turns = 0
+        # See LLM_MAX_STALE_TURNS. Turns since the last genuine level-up;
+        # reset in `_observe`'s own-best-level branch, not by a repeat-turn
+        # reset or any transport signal.
+        self._llm_turns_since_progress = 0
         self._llm_note = ""
         # Every real transition we have paid for, as (before, label, after).
         # `verify()` replays these against a candidate forward model, which
@@ -5432,6 +5471,28 @@ class MyAgent(Agent):
         self._llm_timeouts = 0
         self._llm_turns += 1
 
+        # See LLM_MAX_STALE_TURNS. Reset happens in `_observe`'s own
+        # genuine-new-best-level branch, not here -- this only counts.
+        # Placed after a SUCCESSFUL call, deliberately: a turn that failed
+        # outright already goes through the transport-failure retirement
+        # path above and never reaches here, so this counter only measures
+        # turns where the model was actually heard from and still made no
+        # progress -- exactly the gap LLM_MAX_FAILURES/LLM_MAX_TIMEOUTS
+        # cannot see, since both reset to zero on this same successful-call
+        # path one line up.
+        self._llm_turns_since_progress += 1
+        if (
+            LLM_MAX_STALE_TURNS
+            and self._llm_turns_since_progress >= LLM_MAX_STALE_TURNS
+        ):
+            logger.info(
+                "%s: retiring the model after %d turns with no level-up "
+                "past level %d; the search plays the rest of this game",
+                self.game_id, self._llm_turns_since_progress,
+                self._best_levels,
+            )
+            self._llm_dead = True
+
         # Did this turn just replay the last one?
         #
         # Exact match, deliberately. A looser rule -- "hit the action cap
@@ -5685,6 +5746,10 @@ class MyAgent(Agent):
             )
             self._best_levels = levels
             self._stuck_steps = 0
+            # See LLM_MAX_STALE_TURNS: a genuine new best level is real
+            # progress, so the model earns a fresh run of turns before
+            # it's judged stuck again.
+            self._llm_turns_since_progress = 0
             # A cleared level is unreachable from here on, so everything
             # learned about it is dead weight. Dropping it keeps memory
             # proportional to the level being played, not the whole run.
