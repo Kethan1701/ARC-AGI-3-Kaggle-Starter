@@ -726,6 +726,17 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
+                # TEMPORARY, this push only (v38): GPU-validate depth-push Fix A,
+                # run 2/2 (identical config to v37) -- LLM retirement after N
+                # turns with no level-up. v37 (run 1/2) result: clears>=2 0->2
+                # (vc33, ft09), matching v36's item-0 diagnostic direction, but
+                # clears>=1 net -3 (lost tn36/tu93/lf52/s5i5/su15, gained
+                # cn04/r11l). This run tests reproducibility per the standing
+                # two-run rule before any default-flip decision -- see
+                # kops/history.log v37 entry. REVERT IMMEDIATELY after this
+                # push completes, matching the v37/SMOKE_SECONDS precedent.
+                env['ARC_LLM_MAX_STALE_TURNS'] = '8'
+
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
                 #   v33 both flags together:  9/25  (0.9047, confounded)
