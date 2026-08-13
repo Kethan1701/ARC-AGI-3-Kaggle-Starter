@@ -110,6 +110,8 @@ def _turn_agent(env):
     a._llm_messages = []
     a._llm_history = []
     a._llm_turns = 0
+    a._llm_turns_since_progress = 0
+    a._best_levels = 0
     a._llm_note = ""
     a._transitions = deque(maxlen=agent_mod.TRANSITION_LOG)
     a._verify_calls = 0
@@ -395,6 +397,47 @@ def test_a_recovered_turn_clears_the_failure_count(monkeypatch):
 
     a._llm_turn(agent_mod.grid_of(env.current), env.current)
     assert a._llm_failures == 0
+
+
+def test_a_stalled_model_is_retired_after_llm_max_stale_turns(monkeypatch):
+    """LLM_MAX_FAILURES/LLM_MAX_TIMEOUTS cannot see this failure mode: a
+    model that keeps getting valid-but-useless responses never trips them,
+    since both reset to zero on every successful call (see
+    test_a_recovered_turn_clears_the_failure_count above). This is the
+    progress-based backstop for exactly that gap -- turns since the last
+    genuine level-up, not consecutive transport failures."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    monkeypatch.setattr(agent_mod, "LLM_MAX_STALE_TURNS", 3)
+    grid = agent_mod.grid_of(env.current)
+
+    for i in range(1, 3):
+        _script(monkeypatch, [_reply(content="thinking")])
+        a._llm_turn(grid, env.current)  # False: reasoned, took no action
+        assert a._llm_failures == 0, "a content-only reply is not a transport failure"
+        assert a._llm_dead is False, f"retired after only {i} stale turn(s)"
+
+    _script(monkeypatch, [_reply(content="thinking")])
+    a._llm_turn(grid, env.current)
+    assert a._llm_dead is True, "3 stale turns should retire the model"
+    assert a._llm_turns_since_progress == 3
+
+
+def test_llm_max_stale_turns_off_by_default_never_retires_on_progress_alone(monkeypatch):
+    """0 means off, matching LLM_MAX_TOKENS's convention -- a long,
+    otherwise-healthy game must not be retired just because it has not
+    leveled up yet."""
+    env = _FakeEnv(_frame(_grid()))
+    a = _turn_agent(env)
+    assert agent_mod.LLM_MAX_STALE_TURNS == 0
+    grid = agent_mod.grid_of(env.current)
+
+    for _ in range(20):
+        _script(monkeypatch, [_reply(content="thinking")])
+        a._llm_turn(grid, env.current)
+        assert a._llm_dead is False
+
+    assert a._llm_turns_since_progress == 20
 
 
 def test_a_failed_turn_does_not_leave_a_broken_transcript(monkeypatch):
