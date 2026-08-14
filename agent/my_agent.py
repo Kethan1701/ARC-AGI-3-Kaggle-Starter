@@ -1687,6 +1687,20 @@ LLM_MAX_STALE_TURNS = _env_int("ARC_LLM_MAX_STALE_TURNS", 0)
 # arc-agi-3-open-threads, level-1 breadth is what the score target
 # actually needs, and that's what fell. Reverted to 12. See
 # arc-agi-3-kaggle-gpu-infra memory before raising this again.
+#
+# RE-TESTED at 16 under the clears>=2 bar (v39/v40, kops/history.log,
+# depth-push item 1): two identical-config GPU runs gave opposite
+# outcomes. v39: clears>=1 11->7, clears>=2 0->0 (no depth at all, net
+# -4 breadth). v40: clears>=1 11->14, clears>=2 0->2 (tu93, ft09 both
+# reach level 2), net +3 breadth -- the best depth-push result of the
+# whole session, on paper. But it does not survive the two-run rule:
+# only 7 of v40's 14 clears are shared with v39, and clears>=2 went
+# 0->0 in one run and 0->2 in the other on the exact same code -- the
+# same non-reproduction pattern already seen with ARC_LLM_MAX_STALE_TURNS
+# (v37/v38). REJECTED as default; stays at 12. A single striking run in
+# either direction is not enough evidence on this pipeline -- see
+# arc-agi-3-kaggle-gpu-infra memory for the run-to-run variance this
+# session has repeatedly measured.
 LLM_MAX_TOOL_CALLS = _env_int("ARC_LLM_MAX_TOOL_CALLS", 12)
 
 PYTHON_TOOL_SCHEMA = {
