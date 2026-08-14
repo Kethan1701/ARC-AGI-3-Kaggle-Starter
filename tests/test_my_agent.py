@@ -1070,7 +1070,7 @@ def test_the_model_outlives_the_graph():
     """The whole point: `_reset_graph` drops every node id at a level
     boundary, and what the actions do is not keyed on any of them."""
     a = _status_agent()
-    for name in ("_edges", "_fatal", "_deaths", "_cache"):
+    for name in ("_edges", "_fatal", "_deaths", "_fatal_flats", "_cache"):
         setattr(a, name, {1: 2})
     a._blocked = {(0, 4, 5)}
     a._at = (5, 5)
@@ -1083,6 +1083,119 @@ def test_the_model_outlives_the_graph():
     a._reset_graph()
     assert a._edges == {}                      # the graph really did go
     assert a._motion.displacement(1) == before == (-1, 0)
+
+
+def test_fatal_memory_flags_ship_off():
+    """Both layers of Fix B (depth-push plan) start OFF -- see
+    agent/my_agent.py's MASK_RELEARN_PER_LEVEL comment block for the sp80
+    respawn-storm history these exist to fix, and kops/history.log for
+    GPU validation status once it exists."""
+    assert agent.FATAL_SURVIVES_LEVEL == 0
+    assert agent.FATAL_SURVIVES_MASK_CHANGE == 0
+
+
+def test_reset_graph_also_drops_fatal_flats():
+    """`_fatal_flats` has to go with `_fatal`/`_deaths` on every ordinary
+    reset (mask-exhausted re-explore, exploit-cycle) -- only the level-up
+    path is special-cased to preserve them, tested separately below."""
+    a = _status_agent()
+    for name in ("_edges", "_fatal", "_deaths", "_fatal_flats", "_cache"):
+        setattr(a, name, {1: 2})
+    a._blocked = {(0, 4, 5)}
+    a._at = (5, 5)
+    a._at_confirmed = 3
+    a._reset_graph()
+    assert a._fatal_flats == {}
+
+
+def _remask_agent(kept, fatal_flats):
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a._kept = kept
+    a._fatal_flats = fatal_flats
+    return a
+
+
+def test_remask_fatal_memory_rekeys_under_the_new_mask():
+    """See FATAL_SURVIVES_MASK_CHANGE: a `(node, code)` fatal entry only
+    means anything under the `_kept` it was computed with. Adopting a new
+    mask has to produce a new node id for the stored flat frame, not
+    carry the stale one forward -- the exact bug the comment above this
+    flag's declaration describes for a bare `.clear()`-free attempt."""
+    flat = (1, 2, 3, 4, 5)
+    old_kept = (0, 1, 2, 3, 4)
+    new_kept = (0, 2, 4)
+    code = 99
+    old_node = hash(tuple(map(flat.__getitem__, old_kept)))
+    a = _remask_agent(old_kept, {(old_node, code): flat})
+    a._kept = new_kept  # simulates `_learn_mask` having already adopted it
+    remapped = a._remask_fatal_memory()
+    new_node = hash(tuple(map(flat.__getitem__, new_kept)))
+    assert new_node != old_node
+    assert remapped == {(new_node, code): flat}
+
+
+def test_remask_fatal_memory_is_empty_when_nothing_was_ever_fatal():
+    a = _remask_agent((0, 1), {})
+    assert a._remask_fatal_memory() == {}
+
+
+def _level_up_agent():
+    """An agent one action away from `_observe` crediting a new best
+    level -- `_level` already equals the frame's `levels_completed`, so
+    only the `levels > self._best_levels` branch (the ordinary per-level
+    `_reset_graph()`) fires, not the level-transition bookkeeping above
+    it. `_pending` is None so `_observe` returns right after that branch,
+    keeping this fixture to just what `_reset_graph()` itself touches."""
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a.game_id = "test-0000"
+    a._steps = 10
+    a._sol_start = 0
+    a._level = 2
+    a._best_levels = 1
+    a._pending = None
+    a._pending_flat = None
+    a._stuck_steps = 5
+    a._llm_turns_since_progress = 3
+    a._level_start_node = 1
+    a._level_start_board = 1
+    a._board_idx = (0,)
+    a._status_boards = {1: 1}
+    a._status = (1,)
+    a._last_respawn = 1
+    a._blocked = {(0, 1, 1)}
+    a._at = (1, 1)
+    a._at_confirmed = 2
+    a._total = {1: 1}
+    a._cursor = {1: 1}
+    a._edges = {1: {2: 3}}
+    a._fatal = {(1, 2)}
+    a._deaths = {(1, 2): 3}
+    a._fatal_flats = {(1, 2): (9, 9, 9)}
+    a._cache = {1: [2]}
+    a._plan = agent.deque([(1, 2)])
+    return a
+
+
+def test_fatal_survives_an_ordinary_level_up(monkeypatch):
+    monkeypatch.setattr(agent, "FATAL_SURVIVES_LEVEL", 1)
+    a = _level_up_agent()
+    frame = agent.FrameData(state=agent.GameState.NOT_FINISHED, levels_completed=2)
+    a._observe(node=5, latest_frame=frame)
+    assert a._fatal == {(1, 2)}
+    assert a._deaths == {(1, 2): 3}
+    assert a._fatal_flats == {(1, 2): (9, 9, 9)}
+    # the rest of the graph still drops, same as always
+    assert a._edges == {}
+    assert a._total == {}
+
+
+def test_fatal_does_not_survive_a_level_up_by_default():
+    a = _level_up_agent()
+    frame = agent.FrameData(state=agent.GameState.NOT_FINISHED, levels_completed=2)
+    a._observe(node=5, latest_frame=frame)
+    assert a._fatal == set()
+    assert a._deaths == {}
+    assert a._fatal_flats == {}
 
 
 def test_learning_the_motion_is_on_and_costs_no_actions():

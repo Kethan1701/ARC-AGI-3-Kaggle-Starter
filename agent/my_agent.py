@@ -923,6 +923,35 @@ MASK_STRICT_SCALE_DOUBLINGS = _env_int("ARC_MASK_STRICT_SCALE_DOUBLINGS", 5)
 # fix is bigger than this flag's original framing suggested.
 MASK_RELEARN_PER_LEVEL = _env_int("ARC_MASK_RELEARN_PER_LEVEL", 0)
 
+# Fix B (depth-push plan, two layers), attempting the "real fix" the note
+# above says this needs.
+#
+# Layer 1 -- FATAL_SURVIVES_LEVEL: the ordinary per-level `_reset_graph()`
+# call (on beating a level, not on a mask change) throws `_fatal`/`_deaths`
+# away even though `_kept` -- and therefore what a `node` id means -- did
+# NOT change at a plain level-up. A stale `(node, code)` entry can only
+# ever match a board the current mask would hash to the same key, so it
+# cannot spuriously collide with an unrelated level's board any more than
+# two nodes within the same level already can (an accepted, pre-existing
+# risk). Snapshotting `_fatal`/`_deaths`/`_fatal_flats` around the level-up
+# reset and restoring them after is a pure information-preservation change
+# with no rekeying needed. Gated separately from Layer 2 so it can be
+# GPU-validated alone first.
+FATAL_SURVIVES_LEVEL = _env_int("ARC_FATAL_SURVIVES_LEVEL", 0)
+
+# Layer 2 -- FATAL_SURVIVES_MASK_CHANGE: implements option (a) from the
+# note above. At the two sites where `_reset_graph()` follows a genuine
+# `_learn_mask() -> True` (mask actually adopted or re-adopted), rekey
+# every stored `_fatal_flats` entry under the mask that was just adopted
+# (`_node_key` again, now against the new `_kept`) instead of discarding
+# it. This is what MASK_RELEARN_PER_LEVEL actually needed: its rejection
+# was sp80 respawning 480+ times re-discovering and re-forgetting the same
+# fatal move every relearn cycle, because the old fix cleared `_fatal`
+# unconditionally on every mask change. Per that rejection's own note,
+# never ship MASK_RELEARN_PER_LEVEL=1 again without this also on -- the
+# two are meant to be tested together, not this flag alone.
+FATAL_SURVIVES_MASK_CHANGE = _env_int("ARC_FATAL_SURVIVES_MASK_CHANGE", 0)
+
 # The status band is what shares a row or column with the HUD without
 # ticking itself (see `status_band`). Capped for the same reason the mask
 # is: past a certain size the "band" is just the board, and re-opening
@@ -4511,6 +4540,13 @@ class MyAgent(Agent):
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
+        # The flat frame each `_fatal` entry was proven lethal from, keyed
+        # the same way. See FATAL_SURVIVES_LEVEL/FATAL_SURVIVES_MASK_CHANGE:
+        # `node` is a hash of `flat` under `_kept`, so it stops meaning
+        # anything the instant the mask changes -- storing the original
+        # flat lets `_remask_fatal_memory` rekey the verdict instead of
+        # just losing it.
+        self._fatal_flats: dict[tuple[int, int], tuple[int, ...]] = {}
 
         # Recomputed-on-demand candidate lists, bounded.
         self._cache: dict[int, list[int]] = {}
@@ -4589,6 +4625,11 @@ class MyAgent(Agent):
         # --- execution bookkeeping ----------------------------------
         # (node, code) awaiting its outcome, folded in on the next call
         self._pending: Optional[tuple[int, int]] = None
+        # The flat frame `_pending`'s node was computed from, kept in
+        # lockstep with it. See FATAL_SURVIVES_MASK_CHANGE: this is what
+        # lets a freshly-proven-fatal entry be rekeyed under a later mask
+        # instead of just going stale.
+        self._pending_flat: Optional[tuple[int, ...]] = None
         # payload handed to the env; see do_action_request()
         self._pending_data: dict[str, Any] = {"game_id": ""}
         self._pending_reasoning: Optional[dict[str, Any]] = None
@@ -4766,8 +4807,15 @@ class MyAgent(Agent):
                 "action %d; restarting the map",
                 self.game_id, len(self._volatile), self._steps,
             )
+            remasked_fatal = (
+                self._remask_fatal_memory() if FATAL_SURVIVES_MASK_CHANGE else None
+            )
             self._reset_graph()
+            if remasked_fatal is not None:
+                self._fatal = set(remasked_fatal)
+                self._fatal_flats = remasked_fatal
             self._pending = None
+            self._pending_flat = None
             # Every node id recorded so far was keyed on different cells,
             # so the route through the current level is unrecoverable too.
             # Banked routes are plain action sequences and stay valid.
@@ -4838,6 +4886,7 @@ class MyAgent(Agent):
             self._plan.clear()
             self._replay.clear()
             self._pending = None
+            self._pending_flat = None
             return self._emit(_RESET_ID, None, None, "reset")
 
         # 3. Finish opening a fresh scored run. Two RESETs in a row always
@@ -4848,6 +4897,7 @@ class MyAgent(Agent):
             self._resets_queued -= 1
             self._plan.clear()
             self._pending = None
+            self._pending_flat = None
             if self._resets_queued == 0:
                 # The game is about to jump back to the start of level 0.
                 # If we were already on level 0 the level counter does not
@@ -4869,6 +4919,7 @@ class MyAgent(Agent):
         #     transition that never happened.
         if not self._llm_dead:
             self._pending = None
+            self._pending_flat = None
             if self._llm_turn(grid, latest_frame):
                 self._noop = True
                 return GameAction.from_id(_RESET_ID)
@@ -4887,12 +4938,14 @@ class MyAgent(Agent):
                 break
             self._replay.popleft()
             self._pending = (node, code)
+            self._pending_flat = flat
             action_id, x, y = decode_action(code)
             return self._emit(action_id, x, y, "replay")
 
         # 5. Decide.
         code, why = self._select(node, grid, latest_frame)
         self._pending = (node, code)
+        self._pending_flat = flat
         action_id, x, y = decode_action(code)
         return self._emit(action_id, x, y, why)
 
@@ -5063,8 +5116,16 @@ class MyAgent(Agent):
                         "map",
                         self.game_id, len(self._volatile), self._steps,
                     )
+                    remasked_fatal = (
+                        self._remask_fatal_memory()
+                        if FATAL_SURVIVES_MASK_CHANGE else None
+                    )
                     self._reset_graph()
+                    if remasked_fatal is not None:
+                        self._fatal = set(remasked_fatal)
+                        self._fatal_flats = remasked_fatal
                     self._pending = None
+                    self._pending_flat = None
                     self._sol_start = None
                     self._sol_edges = {}
 
@@ -5074,6 +5135,13 @@ class MyAgent(Agent):
             # uses -- so this is exactly what `_observe` would have
             # recorded had a search-driven action, not the model, taken
             # this step.
+            #
+            # NOT wired into `_fatal_flats` (see FATAL_SURVIVES_MASK_CHANGE):
+            # this path never touches `_pending`, so there is no natural
+            # hook to capture the flat frame from. LLM_SEED_EDGES is off
+            # by default (v35, kops/history.log -- net regression), so any
+            # fatal entry recorded here going stale on a later mask change
+            # is an existing, already-accepted gap, not a new one.
             if LLM_SEED_EDGES and before is not None:
                 before_node = self._node_key(tuple(chain.from_iterable(before)))
                 seed_code = encode_action(action_id, x, y)
@@ -5735,6 +5803,7 @@ class MyAgent(Agent):
     def _observe(self, node: int, latest_frame: FrameData) -> None:
         """Fold the outcome of the previous action into the graph."""
         pending, self._pending = self._pending, None
+        pending_flat, self._pending_flat = self._pending_flat, None
         levels = latest_frame.levels_completed
 
         # First frame of the run, or the state key just changed under us
@@ -5776,7 +5845,24 @@ class MyAgent(Agent):
             # A cleared level is unreachable from here on, so everything
             # learned about it is dead weight. Dropping it keeps memory
             # proportional to the level being played, not the whole run.
-            self._reset_graph()
+            #
+            # See FATAL_SURVIVES_LEVEL: `_kept` (the mask) does not change
+            # here, only the level, so `_fatal`/`_deaths`/`_fatal_flats`
+            # still mean exactly what they meant a moment ago -- no
+            # rekeying needed, just don't throw them away. Snapshot as
+            # copies, not references: `_reset_graph()` clears these dicts
+            # in place, which would wipe the snapshot too if it aliased
+            # the same objects.
+            if FATAL_SURVIVES_LEVEL:
+                fatal_snapshot = set(self._fatal)
+                deaths_snapshot = dict(self._deaths)
+                fatal_flats_snapshot = dict(self._fatal_flats)
+                self._reset_graph()
+                self._fatal = fatal_snapshot
+                self._deaths = deaths_snapshot
+                self._fatal_flats = fatal_flats_snapshot
+            else:
+                self._reset_graph()
             if MASK_RELEARN_PER_LEVEL:
                 self._rearm_mask_learning()
 
@@ -5792,6 +5878,8 @@ class MyAgent(Agent):
             self._deaths[key] = deaths
             if deaths >= DEATH_TOLERANCE:
                 self._fatal.add(key)
+                if pending_flat is not None:
+                    self._fatal_flats[key] = pending_flat
                 outgoing = self._edges.get(prev_node)
                 if outgoing is not None:
                     outgoing.pop(code, None)
@@ -6378,8 +6466,32 @@ class MyAgent(Agent):
         self._edges.clear()
         self._fatal.clear()
         self._deaths.clear()
+        self._fatal_flats.clear()
         self._cache.clear()
         self._plan.clear()
+
+    def _remask_fatal_memory(self) -> dict[tuple[int, int], tuple[int, ...]]:
+        """Rekey `_fatal_flats` under the mask that was just adopted.
+
+        Call this BEFORE `_reset_graph()`, at a genuine mask-adoption site
+        only (a fresh `_learn_mask() -> True`, not an ordinary level-up or
+        the map-exhausted/exploit-cycle resets, which intentionally still
+        forget -- see FATAL_SURVIVES_MASK_CHANGE). `_kept` must already
+        reflect the new mask by the time this runs, which `_learn_mask`
+        guarantees (it sets `_kept` itself before returning True).
+
+        Returns the new `(node, code) -> flat` mapping; the caller is
+        responsible for installing it as `_fatal`/`_fatal_flats` after
+        `_reset_graph()` clears the old ones. Death counts below
+        DEATH_TOLERANCE are not migrated -- only a full proven-fatal
+        verdict is worth carrying across a mask change; partial counts
+        keyed to node ids the new mask will never reproduce are just
+        noise.
+        """
+        remapped: dict[tuple[int, int], tuple[int, ...]] = {}
+        for (_, code), flat in self._fatal_flats.items():
+            remapped[(self._node_key(flat), code)] = flat
+        return remapped
 
     def _rearm_mask_learning(self) -> None:
         """Re-open `_learn_mask` for a fresh look, see MASK_RELEARN_PER_LEVEL.
