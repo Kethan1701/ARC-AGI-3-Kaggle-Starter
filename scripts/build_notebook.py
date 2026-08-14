@@ -726,6 +726,19 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
+                # Depth-push item 1, GPU validation run 2/2 (v40, identical
+                # config to v39): re-testing v29 (LLM_MAX_TOOL_CALLS 12->16,
+                # clears>=1 11->10, clears>=2 0->2) under this round's
+                # clears>=2 bar. v39 run 1/2 did NOT reproduce v29's signal
+                # at all -- clears>=2 stayed 0->0, and breadth net-regressed
+                # (clears>=1 11->7, 4 lost/0 gained: tn36, vc33, lf52, re86).
+                # Same fragile LLM-turn-structure risk category as Fix A
+                # (ARC_LLM_MAX_STALE_TURNS) -- one run is not enough to
+                # reject per the standing two-run rule (see v37/v38
+                # precedent in kops/history.log), so pushing an identical
+                # second run before a final verdict.
+                env['ARC_LLM_MAX_TOOL_CALLS'] = '16'
+
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
                 #   v33 both flags together:  9/25  (0.9047, confounded)
