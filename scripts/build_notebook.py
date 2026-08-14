@@ -726,6 +726,17 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
+                # Depth-push Fix B, Layer 1 only (ARC_FATAL_SURVIVES_LEVEL),
+                # GPU validation run 1/2 vs v27+cap-12 baseline. Layer 2
+                # (ARC_FATAL_SURVIVES_MASK_CHANGE) stays off -- single
+                # variable per push, per the standing rule. Local sweep was
+                # byte-identical to baseline across all 25 games (this
+                # effect needs GPU-scale run length to manifest -- sp80's
+                # targeted respawn storm never happens inside the local
+                # 5000-action budget). See agent/my_agent.py's
+                # FATAL_SURVIVES_LEVEL comment for the mechanism.
+                env['ARC_FATAL_SURVIVES_LEVEL'] = '1'
+
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
                 #   v33 both flags together:  9/25  (0.9047, confounded)
