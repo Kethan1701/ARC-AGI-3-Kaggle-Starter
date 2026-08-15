@@ -725,7 +725,6 @@ def build() -> dict:
                 if smoke_games:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
-                env['ARC_FATAL_SURVIVES_LEVEL'] = '1'
 
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
