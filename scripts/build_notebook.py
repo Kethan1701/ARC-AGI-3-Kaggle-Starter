@@ -725,13 +725,6 @@ def build() -> dict:
                 if smoke_games:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
-                # v44: Fix B Layer 2 GPU validation run 2/2 (identical
-                # config to v43) vs v27+cap-12 baseline. v43 gave zero
-                # clears>=2 signal (net -2 clears>=1, sp80 unaffected) --
-                # this run decides ship/reject per the standing two-run
-                # rule.
-                env['ARC_MASK_RELEARN_PER_LEVEL'] = '1'
-                env['ARC_FATAL_SURVIVES_MASK_CHANGE'] = '1'
 
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
