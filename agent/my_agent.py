@@ -937,6 +937,21 @@ MASK_RELEARN_PER_LEVEL = _env_int("ARC_MASK_RELEARN_PER_LEVEL", 0)
 # reset and restoring them after is a pure information-preservation change
 # with no rekeying needed. Gated separately from Layer 2 so it can be
 # GPU-validated alone first.
+#
+# REJECTED (v41/v42, two-run GPU validation): clears>=2 went 0->1 (v41,
+# re86 only) then 0->2 (v42, vc33+ft09) -- zero game overlap between the
+# two identical-config runs, the same non-reproduction signature already
+# seen on LLM_MAX_STALE_TURNS (v37/v38) and LLM_MAX_TOOL_CALLS (v39/v40).
+# ft09 in particular has now hit level 2 under four unrelated GPU runs
+# this session (v36 budget-only, v37 Fix A, v40 LLM_MAX_TOOL_CALLS, v42
+# this flag) -- strong evidence it is a fragile game that stochastically
+# reaches level 2 regardless of which flag is set, not a real effect of
+# any one of them. sp80, the actual game Layer 1 was designed for, scored
+# 0.00 (died at level 0) in BOTH runs -- no observable benefit at all.
+# clears>=1 net negative both runs (v41 -2, v42 -1). Left OFF; see
+# kops/history.log v42 for the full verdict. Layer 2
+# (FATAL_SURVIVES_MASK_CHANGE below) targets sp80's actual failure mode
+# and has not been GPU-tested independently of this rejected layer.
 FATAL_SURVIVES_LEVEL = _env_int("ARC_FATAL_SURVIVES_LEVEL", 0)
 
 # Layer 2 -- FATAL_SURVIVES_MASK_CHANGE: implements option (a) from the
