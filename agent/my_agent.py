@@ -965,6 +965,31 @@ FATAL_SURVIVES_LEVEL = _env_int("ARC_FATAL_SURVIVES_LEVEL", 0)
 # unconditionally on every mask change. Per that rejection's own note,
 # never ship MASK_RELEARN_PER_LEVEL=1 again without this also on -- the
 # two are meant to be tested together, not this flag alone.
+#
+# REJECTED (v43/v44, two-run GPU validation, tested together with
+# MASK_RELEARN_PER_LEVEL=1 per the note above -- this flag is a no-op
+# without it): clears>=2 stayed flat at 0/25 in BOTH runs, a clean
+# reproduction of the null result, not the usual noisy 0->1->2 flip-flop
+# seen on every other tested flag this session. clears>=1 net negative
+# both runs vs the v27 baseline (11->9, 11->10). sp80 -- the actual game
+# this layer was built to fix -- scored 0.00 and died on level 0 in BOTH
+# runs (276/39 actions in v43, 191/39 in v44), identical failure mode to
+# the unfixed baseline. No observable benefit to its own target game, no
+# depth signal anywhere else. Left OFF; see kops/history.log v43/v44 for
+# full scorecards.
+#
+# Also killed on external grounds: Dries Smit's writeup on winning the
+# ARC-AGI-3 Developer Preview competition (Medium, "1st Place in the
+# ARC-AGI-3 Agent Preview Competition") describes resetting ALL
+# experience/state at every level-up -- the opposite of what this flag
+# and FATAL_SURVIVES_LEVEL both attempt -- calling it what "reliably
+# achieved high performance," done "for simplicity." Different
+# architecture (CNN-based, not this graph/mask agent) so not proof by
+# itself, but it corroborates the internal null result rather than
+# contradicting it: preserving fatal-move memory across level/mask
+# transitions is not the direction to keep pushing. Fix B (both layers)
+# is closed out as of v44; do not re-attempt fatal-memory preservation
+# without new evidence that changes this picture.
 FATAL_SURVIVES_MASK_CHANGE = _env_int("ARC_FATAL_SURVIVES_MASK_CHANGE", 0)
 
 # The status band is what shares a row or column with the HUD without
