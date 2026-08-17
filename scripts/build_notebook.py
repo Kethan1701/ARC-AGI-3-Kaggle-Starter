@@ -725,14 +725,6 @@ def build() -> dict:
                 if smoke_games:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
-                # v43: Fix B Layer 2 GPU validation run 1/2 vs v27+cap-12
-                # baseline. Per the depth-push plan's explicit gate,
-                # MASK_RELEARN_PER_LEVEL is revived together with its
-                # rekey migration this time (never alone -- that was
-                # rejected specifically for the fatal-memory loss this
-                # fixes). FATAL_SURVIVES_LEVEL stays 0 (rejected, v41/v42).
-                env['ARC_MASK_RELEARN_PER_LEVEL'] = '1'
-                env['ARC_FATAL_SURVIVES_MASK_CHANGE'] = '1'
 
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
