@@ -1652,6 +1652,7 @@ def test_mid_turn_mask_adoption_resets_the_graph_immediately(monkeypatch):
     a._edges = {1: {2: 3}}
     a._fatal = {(1, 2)}
     a._deaths = {(1, 2): 1}
+    a._fatal_flats = {(1, 2): (9, 9, 9)}
     a._cache = {1: [2]}
     a._plan = deque([1, 2])
     a._level_start_node = 1
@@ -1661,6 +1662,7 @@ def test_mid_turn_mask_adoption_resets_the_graph_immediately(monkeypatch):
     a._status = 2
     a._last_respawn = 5
     a._pending = (1, 2)
+    a._pending_flat = (9, 9, 9)
     a._sol_start = 1
     a._sol_edges = {1: {2: 3}}
     verdicts = [False, True]
@@ -1674,6 +1676,8 @@ def test_mid_turn_mask_adoption_resets_the_graph_immediately(monkeypatch):
     assert a._blocked == set()
     assert a._at is None
     assert a._pending is None
+    assert a._pending_flat is None
+    assert a._fatal_flats == {}  # dropped, not rekeyed: FATAL_SURVIVES_MASK_CHANGE is off
     assert a._sol_start is None
     assert a._sol_edges == {}
     # The turn was not interrupted: both scripted actions still played.
