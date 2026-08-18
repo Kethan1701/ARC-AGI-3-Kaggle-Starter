@@ -726,6 +726,12 @@ def build() -> dict:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
 
+                # v46: LIVE_OBJECT_NEIGHBORHOOD=1, Fix C GPU validation run
+                # 2/2, identical config to v45 (clears>=1 11->12, clears>=2
+                # 0->1 via ar25 -- not lp85, the design target). Standing
+                # two-run rule before any ship/reject decision.
+                env['ARC_LIVE_OBJECT_NEIGHBORHOOD'] = '1'
+
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
                 #   v33 both flags together:  9/25  (0.9047, confounded)
