@@ -725,16 +725,6 @@ def build() -> dict:
                 if smoke_games:
                     cmd += ['--game', ','.join(smoke_games)]
                 env['ARC_RUN_BUDGET_SECONDS'] = str({SMOKE_SECONDS})
-                # v45: Fix C (LIVE_OBJECT_NEIGHBORHOOD) GPU validation
-                # run 1/2 vs v27+cap-12 baseline. Local sweep: aggregate
-                # 0.0761->0.0838, clears>=1 flat 12, clears>=2 5->3 (a
-                # real regression on the metric that matters this round,
-                # under a rising aggregate -- see agent/my_agent.py's
-                # commit for the full per-game breakdown). Proceeding to
-                # GPU per the standing two-run protocol since local sweeps
-                # do not decide anything touching node/liveness identity
-                # either way.
-                env['ARC_LIVE_OBJECT_NEIGHBORHOOD'] = '1'
 
                 # Deconfounding series, all against the v27 baseline
                 # (clears>=1 11/25, aggregate 0.6677):
