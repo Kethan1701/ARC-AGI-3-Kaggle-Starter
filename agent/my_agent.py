@@ -304,6 +304,9 @@ DEAD_CLICK_TRIALS = _env_int("ARC_DEAD_CLICK_TRIALS", 240)
 # Shared empty mapping for `_edges` lookups on unmapped nodes.
 EMPTY_EDGES: dict[int, int] = {}
 
+# Same idea for `_edges_rev`/`_object_live_at` lookups (LIVE_OBJECT_NEIGHBORHOOD).
+EMPTY_SET: frozenset[int] = frozenset()
+
 # Coarse fallback sweep, tried only after every object click has been
 # tried from a node: stride 8 over 64x64 => 64 extra targets.
 LATTICE_STRIDE = _env_int("ARC_LATTICE_STRIDE", 8)
@@ -583,6 +586,47 @@ LIVE_CODE_PRIORITY = _env_int("ARC_LIVE_CODE_PRIORITY", 0)
 # states is sometimes right and sometimes actively wrong, and object
 # identity does not settle which. Left OFF by default; not shipped.
 LIVE_OBJECT_PRIORITY = _env_int("ARC_LIVE_OBJECT_PRIORITY", 0)
+
+# The next candidate LIVE_OBJECT_PRIORITY's own rejection calls for: scope
+# the priority boost to a NEIGHBORHOOD around the current node instead of
+# the whole game. Kept as a separate flag so the whole-game version above
+# stays available for comparison.
+#
+# Structurally different from both LIVE_CODE_PRIORITY and
+# LIVE_OBJECT_PRIORITY's rejections, not just narrower in degree: `_edges`
+# (the graph `_hop_neighborhood` walks, via its reverse index
+# `_edges_rev`) is rebuilt empty at every level-up and mask adoption
+# (`_reset_graph`; see FATAL_SURVIVES_LEVEL/FATAL_SURVIVES_MASK_CHANGE for
+# the other call sites this shares). A node id recorded pre-reset becomes
+# permanently unreachable the instant `_edges`/`_edges_rev` reset -- the
+# existing graph reset IS the decay mechanism, for free, which is exactly
+# the cross-level-leakage failure mode both whole-game rejections describe
+# (sp80/cd82/lf52/m0r0 losing clears on a LATER level/room from a liveness
+# verdict proven on an earlier one). What this does NOT solve: two
+# graph-close rooms within the SAME level with different button semantics
+# can still be over-generalized -- narrower than "whole game", not zero.
+#
+# See `_hop_neighborhood`'s own comment for why the BFS walks `_edges_rev`
+# (backward) rather than `_edges` (forward, the direction
+# `_route_to_frontier` uses) -- a plain forward BFS would be a near
+# no-op here, for a reason specific to when `_candidates` runs.
+LIVE_OBJECT_NEIGHBORHOOD = _env_int("ARC_LIVE_OBJECT_NEIGHBORHOOD", 0)
+LIVE_OBJECT_NEIGHBORHOOD_HOPS = _env_int("ARC_LIVE_OBJECT_NEIGHBORHOOD_HOPS", 2)
+
+# `_hop_neighborhood`'s own expansion cap -- deliberately NOT PLAN_NODE_CAP.
+# That constant is sized for `_route_to_frontier`, which runs occasionally
+# (only when the plan queue empties). `_hop_neighborhood` runs on every
+# SINGLE newly-discovered node's first candidate-generation call -- a much
+# hotter path. A node whose `_edges_rev` fan-in is large (a respawn/reset
+# point many different paths converge on, say) can pull thousands of nodes
+# into just a 2-hop neighborhood, and at PLAN_NODE_CAP that cost repeats on
+# every subsequent node discovery for the rest of the game -- measured
+# directly (2026-08-17): with PLAN_NODE_CAP, 10 of 13 games tested hung
+# past a 45s-per-game cutoff that the same 13 games cleared comfortably
+# under LIVE_OBJECT_NEIGHBORHOOD=0. 64 is generous for a 2-hop
+# neighborhood under normal branching and orders of magnitude cheaper than
+# 50,000 in the pathological case.
+LIVE_OBJECT_NEIGHBORHOOD_CAP = _env_int("ARC_LIVE_OBJECT_NEIGHBORHOOD_CAP", 64)
 
 # 15 of the 25 dev games never clear level 1 at all, and the diagnostic
 # splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
@@ -4577,7 +4621,25 @@ class MyAgent(Agent):
         # analogue of `_code_live`.
         self._code_object_hash: dict[int, int] = {}
         self._object_live: set[int] = set()
+        # See LIVE_OBJECT_NEIGHBORHOOD: same proof as `_object_live` above,
+        # but scoped to WHERE it was proven live (the set of `prev_node`s
+        # it fired from) instead of a whole-game verdict. `_edges` resets
+        # at every level-up/mask change (`_reset_graph`), so a node id from
+        # a previous level/mask is never reachable again once that
+        # happens -- the decay this needs, for free.
+        self._object_live_at: dict[int, set[int]] = {}
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
+        # Reverse of `_edges` (destination -> source nodes), maintained at
+        # the same write sites. Exists only for LIVE_OBJECT_NEIGHBORHOOD's
+        # BFS: a brand-new node has no OUTGOING edges yet -- nothing has
+        # ever been tried from it, since `_candidates` computes its
+        # ordering exactly once, on first visit, before any action is
+        # taken from it -- so a forward BFS (the same direction
+        # `_route_to_frontier` walks) would always dead-end on exactly the
+        # node this exists to help. Walking backward instead reaches the
+        # nodes the agent actually arrived from, which is where a fresh
+        # discovery is physically closest to.
+        self._edges_rev: dict[int, set[int]] = {}
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
         # The flat frame each `_fatal` entry was proven lethal from, keyed
@@ -5197,6 +5259,7 @@ class MyAgent(Agent):
                 elif after:
                     after_node = self._node_key(tuple(chain.from_iterable(after)))
                     self._edges.setdefault(before_node, {})[seed_code] = after_node
+                    self._edges_rev.setdefault(after_node, set()).add(before_node)
 
             if before is not None:
                 self._transitions.append((before, label, after))
@@ -5943,6 +6006,7 @@ class MyAgent(Agent):
 
         if prev_node in self._total:
             self._edges.setdefault(prev_node, {})[code] = node
+            self._edges_rev.setdefault(node, set()).add(prev_node)
 
         # A code that just moved us somewhere genuinely new is the single
         # best hint available about which direction this game rewards.
@@ -5989,6 +6053,7 @@ class MyAgent(Agent):
             object_hash = self._code_object_hash.get(code)
             if object_hash is not None:
                 self._object_live.add(object_hash)
+                self._object_live_at.setdefault(object_hash, set()).add(prev_node)
 
         # Split the level's spend by action class. ~112 of the ~117 codes a
         # node offers are ACTION6 clicks, so if clicks dominate the bill and
@@ -6504,6 +6569,7 @@ class MyAgent(Agent):
         self._total.clear()
         self._cursor.clear()
         self._edges.clear()
+        self._edges_rev.clear()
         self._fatal.clear()
         self._deaths.clear()
         self._fatal_flats.clear()
@@ -6719,6 +6785,42 @@ class MyAgent(Agent):
             self._at[1] + step[1],
         ) in self._blocked
 
+    def _hop_neighborhood(self, start: int, hops: int) -> set[int]:
+        """Nodes within `hops` backward hops of `start` over `_edges_rev`.
+
+        "Backward" on purpose, unlike `_route_to_frontier`'s forward BFS
+        over `_edges`: `_candidates` computes a node's ordering exactly
+        once, on first visit, before any action has ever been taken FROM
+        it -- so at the moment this runs, `start` has no outgoing edges
+        yet, and a forward BFS would always dead-end on exactly the node
+        LIVE_OBJECT_NEIGHBORHOOD exists to help. Walking `_edges_rev`
+        instead reaches the nodes the agent actually arrived from, which
+        is where a fresh discovery is physically closest to -- and is
+        never empty for any node beyond the very first of the game, since
+        reaching `start` at all required an edge into it.
+
+        Capped at LIVE_OBJECT_NEIGHBORHOOD_CAP -- see that constant's
+        comment for why this is deliberately NOT PLAN_NODE_CAP.
+        """
+        neighborhood: set[int] = {start}
+        frontier: set[int] = {start}
+        expanded = 0
+        for _ in range(hops):
+            if len(neighborhood) >= LIVE_OBJECT_NEIGHBORHOOD_CAP:
+                break
+            next_frontier: set[int] = set()
+            for n in frontier:
+                if expanded >= LIVE_OBJECT_NEIGHBORHOOD_CAP:
+                    return neighborhood
+                expanded += 1
+                next_frontier.update(self._edges_rev.get(n, EMPTY_SET))
+            next_frontier -= neighborhood
+            if not next_frontier:
+                break
+            neighborhood |= next_frontier
+            frontier = next_frontier
+        return neighborhood
+
     def _candidates(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
     ) -> list[int]:
@@ -6765,7 +6867,28 @@ class MyAgent(Agent):
         # skipped if already present: the same packed code recurs across
         # many different nodes, and the object at that coordinate can be a
         # different one each time.
-        if LIVE_OBJECT_PRIORITY:
+        # Shared by LIVE_OBJECT_PRIORITY and LIVE_OBJECT_NEIGHBORHOOD --
+        # either one needs `_code_object_hash` populated for this node.
+        #
+        # Skipped while `self._exploding` (a HIGH new-node rate -- see
+        # EXPLODE_WINDOW/EXPLODE_THRESHOLD, and NOT the EAGER_WIDEN
+        # mistake of gating on the opposite condition): `_flood_component`
+        # is a real per-candidate cost, and this loop runs once per
+        # NEWLY-discovered node -- on an exploding, never-closing map
+        # (ar25/sc25/sb26-shaped) that means once per action, for as long
+        # as the game runs. Measured directly (2026-08-18): ar25 with
+        # LIVE_OBJECT_NEIGHBORHOOD=1, 20 real actions, cProfile --
+        # `_flood_component` alone: 1533 calls, 6.6s cumulative, on top of
+        # `_candidates` averaging 0.47s/call -- extrapolated to a
+        # 5000-action budget that is 30+ minutes on a game this mechanism
+        # cannot help anyway (no reachable map ever closes, so there is no
+        # stable neighborhood to exploit). This is exactly the risk the
+        # depth-push plan's own Fix C section named in advance ("BFS cost
+        # per newly-cached node... potentially frequent on exploding
+        # games") -- it just turned out to be this shared hash computation
+        # doing the damage, not the BFS in `_hop_neighborhood` itself
+        # (which is separately capped at LIVE_OBJECT_NEIGHBORHOOD_CAP).
+        if (LIVE_OBJECT_PRIORITY or LIVE_OBJECT_NEIGHBORHOOD) and not self._exploding:
             for c in codes:
                 action_id, x, y = decode_action(c)
                 if action_id != _ACTION6_ID:
@@ -6773,6 +6896,8 @@ class MyAgent(Agent):
                 found = _flood_component(grid, x, y, self._volatile)
                 if found is not None:
                     self._code_object_hash[c] = object_signature(*found)
+
+        if LIVE_OBJECT_PRIORITY:
             if self._object_live:
                 live_here = [
                     c for c in codes
@@ -6784,6 +6909,28 @@ class MyAgent(Agent):
                         if self._code_object_hash.get(c) not in self._object_live
                     ]
                     codes = live_here + rest
+
+        # See LIVE_OBJECT_NEIGHBORHOOD. Same idea as LIVE_OBJECT_PRIORITY
+        # above, but an object only counts as live if it was proven live
+        # at a node within `LIVE_OBJECT_NEIGHBORHOOD_HOPS` of `node` --
+        # see `_hop_neighborhood`'s comment for why that BFS walks
+        # `_edges_rev` (backward) instead of `_edges`.
+        if LIVE_OBJECT_NEIGHBORHOOD and self._object_live_at:
+            nearby = self._hop_neighborhood(node, LIVE_OBJECT_NEIGHBORHOOD_HOPS)
+            live_here = [
+                c for c in codes
+                if not nearby.isdisjoint(
+                    self._object_live_at.get(self._code_object_hash.get(c), EMPTY_SET)
+                )
+            ]
+            if live_here:
+                rest = [
+                    c for c in codes
+                    if nearby.isdisjoint(
+                        self._object_live_at.get(self._code_object_hash.get(c), EMPTY_SET)
+                    )
+                ]
+                codes = live_here + rest
 
         if len(self._cache) >= CANDIDATE_CACHE_LIMIT:
             self._cache.clear()
