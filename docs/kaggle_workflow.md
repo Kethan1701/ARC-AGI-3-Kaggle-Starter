@@ -15,13 +15,34 @@ instead of copied.
 
 - **Phase A** (`kaggle kernels push`, then Kaggle runs it): burns GPU
   quota only. Free to repeat.
-- **Phase B** (clicking Submit / `kaggle competitions submit`): burns a
-  **submission slot**. The CLI cannot do this for a code competition --
-  it is a manual click, and it needs **explicit sign-off each time**, not
-  once per session. A Phase A run that looks good is a candidate for
-  Phase B, never an autopilot trigger.
+- **Phase B** (`kaggle competitions submit`, or the Submit button on the
+  kernel page): burns a **submission slot**, and needs **explicit
+  sign-off each time**, not once per session. A Phase A run that looks
+  good is a candidate for Phase B, never an autopilot trigger.
 
-Everything in `scripts/kops/` operates in Phase A. None of it submits.
+  **Corrected 2026-08-28.** This bullet used to say "The CLI cannot do
+  this for a code competition -- it is a manual click." That is false.
+  `kaggle competitions submit` has `-k` and `-v` precisely for code
+  competitions:
+
+      kaggle competitions submit arc-prize-2026-arc-agi-3 \
+          -k kethansaikoneru/arc-prize-2026-arc-agi-3-starter \
+          -v <kernel-version> -f submission.parquet \
+          -m "<what this run tests>"
+
+  Verified against submission 55840177. Two traps: the version must be a
+  kernel version that reached COMPLETE (a cancelled run has no output to
+  submit), and the success message is only "N submissions remaining
+  today" -- which reads exactly like a refusal when N is 0. Confirm with
+  `kaggle competitions submissions` instead of trusting that line.
+
+  That the CLI *can* submit makes the sign-off rule more important, not
+  less: the manual click used to be an accidental safety interlock, and
+  it never really was one. Nothing but the rule now stands between a
+  script and a spent slot.
+
+Nothing in `scripts/kops/` submits. `wait_submission.sh` observes Phase B
+but cannot start it; everything else operates in Phase A.
 
 ## The loop
 
@@ -57,7 +78,14 @@ Everything in `scripts/kops/` operates in Phase A. None of it submits.
    kops/history.log, whether the answer is "keep" or "revert."
 
 7. Only on the user's explicit go-ahead, and never inferred from a score
-   alone: Phase B, the Submit click.
+   alone: Phase B.
+       kaggle competitions submit <comp> -k <owner/kernel> \
+           -v <kernel-version> -f submission.parquet -m "<what it tests>"
+   Then watch it with the Monitor tool, same as step 3:
+       wsl bash /path/to/repo/scripts/kops/wait_submission.sh
+   Phase B replays the notebook against the HIDDEN game set, on the
+   agent's real 7.5h budget -- expect hours, not the ~2h of a Phase A
+   rehearsal.
 ```
 
 ## Why Monitor, not a background Bash loop
@@ -114,8 +142,14 @@ scripts/kops/
   lib.sh       shared setup: cd to repo root, load the token, define
                KERNEL_ID/COMPETITION/paths. Source it, don't run it.
   push.sh      build -> verify -> push -> log to history.log
-  wait.sh      poll to a terminal state; hand its command straight to
-               Monitor
+  wait.sh      poll a KERNEL to a terminal state; hand its command
+               straight to Monitor
+  wait_submission.sh
+               poll the newest SUBMISSION until it stops being PENDING;
+               also written for Monitor. The Phase B companion to wait.sh
+  check_kernel.sh / check_submission.sh
+               one-shot status reads, for when you want an answer now
+               rather than a watch
   pull.sh      pull a run's output into kaggle_runs/<label>/
   checks.py    guards against the SPLICED notebook; extend in place when
                a run teaches you an invariant that must hold from here on
