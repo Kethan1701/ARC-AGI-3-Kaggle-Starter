@@ -26,11 +26,30 @@ while true; do
     # this exact script (silently, after a single RUNNING line, exit 1)
     # even though the kernel itself was still genuinely running -- fall
     # back to empty output and retry instead of exiting.
-    status=$("$KAGGLE" kernels status "$KERNEL_ID" 2>&1 | tr -d '\r' || true)
-    if [ -z "$status" ]; then
+    #
+    # Send stderr to /dev/null rather than merging it, and require the
+    # `KernelWorkerStatus.` marker before trusting the line at all. The
+    # old form merged stderr via `2>&1`, which put a crashing CLI's whole
+    # traceback INTO $status -- so the `-z` retry guard could never fire
+    # (a traceback is not empty) and the traceback fell straight through
+    # to the terminal-state `case` below. Observed 2026-08-28: a WSL DNS
+    # failure ("Temporary failure in name resolution") echoed a full
+    # traceback as a status change during the v46 baseline watch. It was
+    # harmless only because bash `case` is case-sensitive and the text
+    # read "NameResolutionError", not "ERROR" -- any CLI message carrying
+    # an uppercase ERROR or CANCEL would have exited 1 and reported a
+    # perfectly healthy kernel as dead.
+    status=$("$KAGGLE" kernels status "$KERNEL_ID" 2>/dev/null | tr -d '\r' || true)
+    case "$status" in
+    *KernelWorkerStatus.*) ;;  # a real status line -- fall through
+    *)
+        # Empty, or anything that is not a status line: treat as
+        # transient and retry without echoing it, so a network blip
+        # does not surface as a bogus "status change" event.
         sleep 60
         continue
-    fi
+        ;;
+    esac
     if [ "$status" != "$last" ]; then
         echo "$(date -u +%H:%M:%S)  $status"
         last="$status"
