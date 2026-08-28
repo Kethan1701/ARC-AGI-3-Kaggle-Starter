@@ -40,7 +40,16 @@ while true; do
         echo "done."
         exit 0
         ;;
-    *ERROR*|*CANCELLED*)
+    # `*CANCEL*`, not `*CANCELLED*`: the API never emits the string
+    # "CANCELLED". A killed run reports
+    # `KernelWorkerStatus.CANCEL_ACKNOWLEDGED` (confirmed 2026-08-28
+    # against the run killed as v46), with `CANCEL_REQUESTED` as the
+    # transient before it -- neither matches `*CANCELLED*`, so this
+    # branch never fired and a cancelled kernel left the watcher
+    # spinning until its timeout instead of exiting 1. The status line
+    # still printed on change, so the failure looked like "no news"
+    # rather than a hang. Match the prefix and cover all three.
+    *ERROR*|*CANCEL*)
         echo "kernel ended without completing."
         exit 1
         ;;
