@@ -13,10 +13,24 @@
 # were wrong: "process lifetime" (falsified when v24's per-tick-subprocess
 # redesign failed identically) and "reaching for Bash --run_in_background
 # at all" (falsified when the prescribed replacement, the Monitor tool,
-# died with the same code). The only factor common to all four is a
-# long-lived `wsl bash` process sleeping between polls. The mechanism
-# inside WSL is still unmeasured -- this script does not claim to know
-# it, it just keeps the watch out of WSL.
+# died with the same code). A third was recorded here -- "the only
+# factor common to all four is a long-lived `wsl bash` process sleeping
+# between polls" -- and 2026-08-29 falsified that one too: this very
+# script, PowerShell-native and never touching WSL, went silent mid-watch
+# on submission 55862549 after three healthy heartbeats, with no terminal
+# event and no exit code. ~4.5h passed unobserved.
+#
+# So: no mechanism is claimed. Three confident diagnoses have each been
+# overturned by the next observation, and a fourth guess would repeat the
+# pattern rather than end it. Staying out of WSL is still worth doing (it
+# removes one moving part) but it is NOT a fix, and this script must not
+# be trusted to run to completion.
+#
+# WHAT ACTUALLY HOLDS is procedural, and it has outlived every falsified
+# mechanism: silence from a watcher is evidence of NOTHING. Never report
+# a terminal state on a watcher's word, and re-verify with a direct read
+# whenever events STOP arriving -- not only when they say something.
+# A dead watcher and a healthy pending run look identical from here.
 #
 # .kaggle/access_token is a bearer token, so the REST API needs no venv,
 # no kaggle CLI, and no WSL. The token goes into a header and nowhere
