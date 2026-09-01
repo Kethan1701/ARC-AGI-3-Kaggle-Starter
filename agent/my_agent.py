@@ -504,6 +504,54 @@ LIVENESS_MIN_CLICKS = _env_int("ARC_LIVENESS_MIN_CLICKS", 40)
 # and tn36 (43%) are far above it; ft09 (0.4%) and lp85 (2%) far below.
 LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
 
+# --- widening on commute cost, rather than on click liveness ------------
+#
+# LIVENESS_WIDEN above answers "are this game's clicks inert?". That is a
+# property of the *game*, and the 2026-08-31 sweep proved it is not the
+# discriminator for breadth: dropping LIVENESS_MIN_CLICKS 40 -> 12 rescued
+# the slow games it was aimed at (su15 281 -> 227, lp85 206 -> 175) and
+# r11l still lost its clear outright. Liveness cannot see the failure,
+# because the failure is not about clicks at all.
+#
+# What the sweep actually measured: ARC_BREADTH trades fast-game speed for
+# slow-game survival, and it does so along one axis. At breadth 6 the games
+# that clear quickly get cheaper (tn36 -6, sp80 -6, vc33 -30, lp85 -28)
+# while the games that clear slowly explode (cd82 +127, lf52 +310) or die
+# (r11l). The explosion has a mechanism, and `_report_budget` names it: a
+# slow clear spends 15.3% of its actions on "route-to-frontier". Halving
+# the breadth exhausts every node twice as fast, so the agent walks the map
+# twice as often -- and each walk is billed.
+#
+# But widening is free. Candidate order is a pure function of the grid, so
+# raising the breadth only raises `limit`: every cursor stays valid and
+# every node already visited reopens at once, at a cost of zero actions.
+# So whenever the search is about to *pay* a commute, and widening would
+# hand it an untried candidate right where it already stands, widening
+# strictly dominates walking.
+#
+# That gives a breadth that is adaptive per game and per level without any
+# per-game table: start narrow and cheap, and pay for reach only in the
+# games that demonstrably need reach, at the moment they demonstrate it.
+#
+# The threshold is the route length at which commuting is judged not worth
+# it. 0 disables the rule entirely and reproduces v47 exactly.
+WIDEN_ROUTE_COST = _env_int("ARC_WIDEN_ROUTE_COST", 0)
+
+# Deepen only the node that is actually stuck, instead of the whole level.
+#
+# `self._breadth` is one scalar for the entire level, so widening to rescue
+# a single node reopens EVERY node at once and rewrites the whole search
+# trajectory. Measured: ARC_BREADTH=6 + ARC_WIDEN_ROUTE_COST=2 recovers
+# r11l's clear (LOST -> 242) but thrashes cd82 (+127) and lf52 (+474), and
+# lf52 gets *worse* the more the rule fires (826 at cost 4 -> 990 at cost
+# 2). A repair that helps one node by perturbing every other node is not a
+# repair, it is a different search.
+#
+# Per-node deepening keeps the global breadth cheap and spends candidates
+# only where the search has demonstrated it is stuck -- the same evidence
+# the global rule uses, applied where the evidence was actually gathered.
+NODE_WIDEN = _env_int("ARC_NODE_WIDEN", 0)
+
 # lp85 level 2 (2026-08-07): LIVENESS_WIDEN fixed level 1 (502 -> 234
 # actions) but level 2 still burns ~4800 actions to map 31 nodes, 71% of
 # them "probe-untried". Root cause: `_is_dead` is keyed by action *type*
@@ -4578,6 +4626,21 @@ class MyAgent(Agent):
 
     MAX_ACTIONS = MAX_ACTIONS_PER_GAME
 
+    # Defaults for instance state that the methods below read.
+    #
+    # The test suite builds agents with `MyAgent.__new__(MyAgent)` --
+    # bypassing __init__ -- and sets only the attributes a given case
+    # needs, so any NEW attribute read on a path under test raises
+    # AttributeError there while working fine in production. These
+    # defaults are the contract that keeps that harness usable.
+    #
+    # They are shared, so nothing may mutate one in place without
+    # rebinding to a fresh instance-level object first. `__init__` rebinds
+    # it, so a real agent never touches this object; the single in-place
+    # writer (`_node_breadth`, under NODE_WIDEN) rebinds when it finds the
+    # map empty.
+    _node_breadth: dict[int, int] = {}
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
@@ -4599,6 +4662,10 @@ class MyAgent(Agent):
         self._total: dict[int, int] = {}          # node -> candidate count
         self._cursor: dict[int, int] = {}         # node -> next index to try
         self._breadth = BREADTH_INITIAL           # candidates per node, deepens
+        # Per-node overrides of the above (see NODE_WIDEN). Empty unless
+        # NODE_WIDEN is on, and `_breadth_at` maxes against the global, so
+        # an empty dict reproduces the scalar behaviour exactly.
+        self._node_breadth: dict[int, int] = {}
         # Click hit rate for the current level (see LIVENESS_WIDEN). Reset at
         # each level boundary, alongside the breadth it governs.
         self._click_tried = 0
@@ -6083,6 +6150,7 @@ class MyAgent(Agent):
         # boundary would spend the new level's budget at the old level's
         # difficulty.
         self._breadth = BREADTH_INITIAL
+        self._node_breadth = {}
         self._click_tried = 0
         self._click_live = 0
         # The dead-action record deliberately survives the level boundary.
@@ -6966,10 +7034,51 @@ class MyAgent(Agent):
             and not self._act_changed[action_id]
         )
 
+    def _breadth_at(self, node: int) -> int:
+        """How many candidates this node may spend.
+
+        Maxed against the global breadth, not read instead of it, so
+        LIVENESS_WIDEN still lifts every node -- including ones already
+        deepened individually -- and an empty override map is exactly the
+        old scalar behaviour.
+        """
+        if not self._node_breadth:
+            return self._breadth
+        return max(self._breadth, self._node_breadth.get(node, 0))
+
     def _has_untried(self, node: int) -> bool:
         return self._cursor.get(node, 0) < min(
-            self._total.get(node, 0), self._breadth
+            self._total.get(node, 0), self._breadth_at(node)
         )
+
+    def _widen_reopens(self, node: int, codes: list[int]) -> bool:
+        """Would doubling the breadth hand (b) a probe right here?
+
+        This deliberately mirrors (b)'s own filter -- same cursor, same
+        dead-action and recorded-edge skips -- rather than approximating it
+        with `len(codes) > self._breadth`. The looser test is wrong
+        whenever the reopened slots are all dead clicks, and it would widen
+        on games whose extra candidates buy nothing, which is precisely the
+        failure mode that got EAGER_WIDEN rejected.
+
+        True here means the widen *replaces* the commute with a probe at
+        this node, rather than merely postponing it.
+        """
+        if node not in self._total:
+            return False
+        cur = self._breadth_at(node)
+        hi = min(len(codes), min(cur * 2, BREADTH_MAX))
+        index = self._cursor.get(node, 0)
+        recorded = (
+            self._edges.get(node, EMPTY_EDGES)
+            if (SKIP_RECORDED or self._policy is not None)
+            else EMPTY_EDGES
+        )
+        while index < hi and (
+            self._is_dead(codes[index]) or codes[index] in recorded
+        ):
+            index += 1
+        return index < hi
 
     def _select(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
@@ -7087,7 +7196,7 @@ class MyAgent(Agent):
         #     edges out of turn today. It is forced on whenever a model
         #     is driving, where it is load-bearing, and otherwise defaults
         #     off so the no-model agent stays exactly the one that scored.
-        limit = min(len(codes), self._breadth)
+        limit = min(len(codes), self._breadth_at(node))
         index = self._cursor.get(node, 0)
         recorded = (
             self._edges.get(node, EMPTY_EDGES)
@@ -7108,6 +7217,46 @@ class MyAgent(Agent):
         #     isn't, using only edges already verified by experience.
         route = self._route_to_frontier(node)
         if route:
+            # (c0) Widen instead of commuting. See WIDEN_ROUTE_COST.
+            #
+            #      This is the whole point of the rule: the alternative on
+            #      offer here is `len(route)` billed actions that discover
+            #      nothing -- they only move the agent to where discovery
+            #      is possible -- versus a widen that costs nothing and
+            #      makes discovery possible where it already stands.
+            #
+            #      It sits before the deadline check on purpose. Being
+            #      close to the step limit is the strongest possible reason
+            #      not to spend the next actions travelling.
+            if (
+                WIDEN_ROUTE_COST
+                and len(route) >= WIDEN_ROUTE_COST
+                and self._breadth_at(node) < BREADTH_MAX
+                and self._widen_reopens(node, codes)
+            ):
+                if NODE_WIDEN:
+                    if not self._node_breadth:
+                        # May still be the shared class-level default; see
+                        # the note on MyAgent's class attributes.
+                        self._node_breadth = {}
+                    self._node_breadth[node] = min(
+                        self._breadth_at(node) * 2, BREADTH_MAX
+                    )
+                else:
+                    self._breadth = min(self._breadth * 2, BREADTH_MAX)
+                self._stuck_steps = 0
+                # As with LIVENESS_WIDEN, the dead-action record survives:
+                # it is the most valuable thing the run has learned, and
+                # wiping it is the suspected cause of eager widening
+                # costing tn36 52 -> 86.
+                logger.info(
+                    "%s: frontier is %d actions away after %d actions; "
+                    "widening breadth to %d (%s) instead of walking",
+                    self.game_id, len(route), self._steps,
+                    self._breadth_at(node), "this node" if NODE_WIDEN else "level",
+                )
+                return self._select(node, grid, latest_frame)
+
             left = self._steps_left()
             if left is not None and len(route) > left:
                 code = self._local_probe(node, codes)
