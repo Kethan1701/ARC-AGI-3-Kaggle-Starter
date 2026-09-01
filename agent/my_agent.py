@@ -122,9 +122,12 @@ alone is enough to know what has and hasn't been tried.
 
 from __future__ import annotations
 
+import ast
 import base64
+import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -139,7 +142,8 @@ import urllib.request
 import zlib
 from collections import Counter, deque
 from itertools import chain
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Hashable, Iterable, Optional
 
 from arcengine import FrameData, GameAction, GameState
 
@@ -4619,6 +4623,206 @@ class VisionPolicy:
 
 
 # ---------------------------------------------------------------------
+# Persistent per-game memory
+# ---------------------------------------------------------------------
+# Moved here verbatim from a standalone `game_memory.py`. It is defined in
+# this file rather than imported because `scripts/build_notebook.py`
+# splices ONE hardcoded path -- `agent/my_agent.py` -- into the submission
+# notebook. A sibling module would work in every local run and then fail
+# with ModuleNotFoundError on the kernel, i.e. only after a submission slot
+# had been spent. No cross-module import, by construction.
+#
+# WHY IT EXISTS: ARC-AGI-3 scores each level as
+# `min(1, human_actions / ai_actions) ** 2`, so committed actions are the
+# scarce resource and internal reasoning is free. The documented leak this
+# plugs is re-exploring a level you already solved after a death/reset
+# drops you back onto it.
+#
+# Action-agnostic (any hashable token, persisted via repr()) and
+# frame-agnostic (numpy array, nested list/tuple, or bytes; keyed by a
+# stable fingerprint, never the raw grid). ARC-AGI-3 environments are
+# deterministic, so replaying recorded actions from the recorded
+# level-start state reproduces the solve; `solved_path` verifies the
+# start-state fingerprint first and returns None on mismatch.
+
+Frame = Any          # 64x64 grid: numpy array, nested list/tuple, or bytes
+Action = Hashable    # "ACTION3" or ("ACTION6", x, y), etc.
+
+# Wire the memory into the live agent. OFF by default, and deliberately so:
+# it changes the action trajectory, and replaying a banked route is the one
+# local gain this project has measured as NOT transferring to the graded
+# leaderboard (local 2.10 -> graded 0.19). With this at 0 the agent is
+# byte-identical to the v47 default that graded 0.29.
+GAME_MEMORY = _env_int("ARC_GAME_MEMORY", 0)
+
+
+def fingerprint(frame: Frame) -> str:
+    """Stable 16-byte hash of a frame grid. Handles numpy arrays and nested lists."""
+    if hasattr(frame, "tobytes"):                 # numpy array
+        raw = frame.tobytes()
+    elif isinstance(frame, (bytes, bytearray)):
+        raw = bytes(frame)
+    else:                                          # nested list/tuple of ints
+        raw = json.dumps(frame, separators=(",", ":")).encode()
+    return hashlib.blake2b(raw, digest_size=16).hexdigest()
+
+
+def _tok(action: Action) -> str:
+    """Action -> stable string token (JSON/round-trip safe)."""
+    return repr(action)
+
+
+def _untok(token: str) -> Action:
+    try:
+        return ast.literal_eval(token)
+    except (ValueError, SyntaxError):
+        return token
+
+
+class GameMemory:
+    def __init__(self, game_id: str, *, store_frames: bool = True,
+                 frame_cache_cap: int = 4096) -> None:
+        self.game_id = game_id
+        self.store_frames = store_frames
+        self.frame_cache_cap = frame_cache_cap
+
+        # transition graph:  (state_fp, action_tok) -> next_state_fp
+        self.transitions: dict[tuple[str, str], str] = {}
+        # every state fingerprint we've ever observed
+        self.visited: set[str] = set()
+        # state_fp -> set of action_toks already tried from it
+        self.tried: dict[str, set[str]] = {}
+        # solved paths:  level -> {"start_fp", "actions"(tokens), "count"}
+        self.solved: dict[int, dict] = {}
+        # best committed-action count seen per level (RHAE bookkeeping)
+        self.level_best: dict[int, int] = {}
+        # in-run only, NOT persisted: fp -> frame (capped, for free simulation)
+        self._frames: dict[str, Frame] = {}
+
+    # ----- recording ------------------------------------------------------- #
+    def record(self, frame: Frame, action: Action, next_frame: Frame) -> str:
+        """Log one observed transition. Returns the next-state fingerprint."""
+        fp, nfp, tok = fingerprint(frame), fingerprint(next_frame), _tok(action)
+        self.visited.add(fp)
+        self.visited.add(nfp)
+        self.transitions[(fp, tok)] = nfp
+        self.tried.setdefault(fp, set()).add(tok)
+        if self.store_frames:
+            self._cache_frame(fp, frame)
+            self._cache_frame(nfp, next_frame)
+        return nfp
+
+    def _cache_frame(self, fp: str, frame: Frame) -> None:
+        self._frames[fp] = frame
+        while len(self._frames) > self.frame_cache_cap:
+            self._frames.pop(next(iter(self._frames)))   # FIFO eviction
+
+    # ----- exploration guidance (saves squared-cost actions) --------------- #
+    def tried_action(self, frame: Frame, action: Action) -> bool:
+        return _tok(action) in self.tried.get(fingerprint(frame), ())
+
+    def untried_actions(self, frame: Frame, candidates: Iterable[Action]) -> list[Action]:
+        """Of `candidates`, the ones we have NOT yet tried from this state."""
+        seen = self.tried.get(fingerprint(frame), set())
+        return [a for a in candidates if _tok(a) not in seen]
+
+    def is_known_state(self, frame: Frame) -> bool:
+        return fingerprint(frame) in self.visited
+
+    # ----- free forward simulation (thinking is free, actions are not) ----- #
+    def predict_fp(self, frame: Frame, action: Action) -> Optional[str]:
+        """Known next-state fingerprint for (state, action), or None."""
+        return self.transitions.get((fingerprint(frame), _tok(action)))
+
+    def predict_frame(self, frame: Frame, action: Action) -> Optional[Frame]:
+        """Known next *frame* for (state, action) if it's still cached, else None."""
+        nfp = self.predict_fp(frame, action)
+        return self._frames.get(nfp) if nfp else None
+
+    # ----- solved-level cache (the leak plug) ------------------------------ #
+    def mark_solved(self, level: int, start_frame: Frame, actions: list[Action]) -> None:
+        """Cache the winning action sequence for a level; keep the shortest."""
+        count = len(actions)
+        prev = self.solved.get(level)
+        if prev is None or count < prev["count"]:
+            self.solved[level] = {
+                "start_fp": fingerprint(start_frame),
+                "actions": [_tok(a) for a in actions],
+                "count": count,
+            }
+        self.level_best[level] = min(self.level_best.get(level, math.inf), count)
+
+    def has_solved(self, level: int) -> bool:
+        return level in self.solved
+
+    def solved_path(self, level: int, current_frame: Frame) -> Optional[list[Action]]:
+        """
+        Replay actions for `level` IF the current state matches the recorded
+        level-start (determinism guard). Returns None -> caller must explore.
+        """
+        rec = self.solved.get(level)
+        if rec is None or fingerprint(current_frame) != rec["start_fp"]:
+            return None
+        return [_untok(t) for t in rec["actions"]]
+
+    # ----- persistence (frames are NOT persisted -- they're re-observable) - #
+    def to_dict(self) -> dict:
+        return {
+            "game_id": self.game_id,
+            "store_frames": self.store_frames,
+            "frame_cache_cap": self.frame_cache_cap,
+            "transitions": [[s, a, n] for (s, a), n in self.transitions.items()],
+            "visited": sorted(self.visited),
+            "tried": {fp: sorted(t) for fp, t in self.tried.items()},
+            "solved": {str(k): v for k, v in self.solved.items()},
+            "level_best": {str(k): (None if v == math.inf else v)
+                           for k, v in self.level_best.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GameMemory":
+        m = cls(d["game_id"], store_frames=d.get("store_frames", True),
+                frame_cache_cap=d.get("frame_cache_cap", 4096))
+        m.transitions = {(s, a): n for s, a, n in d.get("transitions", [])}
+        m.visited = set(d.get("visited", []))
+        m.tried = {fp: set(t) for fp, t in d.get("tried", {}).items()}
+        m.solved = {int(k): v for k, v in d.get("solved", {}).items()}
+        m.level_best = {int(k): (math.inf if v is None else v)
+                        for k, v in d.get("level_best", {}).items()}
+        return m
+
+
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(name))
+
+
+class MemoryStore:
+    """One JSON file per game, loaded lazily, survives across runs."""
+
+    def __init__(self, path: str = "./arc_memory", **game_kwargs: Any) -> None:
+        self.dir = Path(path)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.game_kwargs = game_kwargs
+        self._games: dict[str, GameMemory] = {}
+
+    def _file(self, game_id: str) -> Path:
+        return self.dir / f"{_safe(game_id)}.json"
+
+    def game(self, game_id: str) -> GameMemory:
+        if game_id not in self._games:
+            f = self._file(game_id)
+            if f.exists():
+                self._games[game_id] = GameMemory.from_dict(json.loads(f.read_text()))
+            else:
+                self._games[game_id] = GameMemory(game_id, **self.game_kwargs)
+        return self._games[game_id]
+
+    def save(self, game_id: Optional[str] = None) -> None:
+        for gid in ([game_id] if game_id else list(self._games)):
+            self._file(gid).write_text(json.dumps(self._games[gid].to_dict()))
+
+
+# ---------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------
 class MyAgent(Agent):
@@ -4636,10 +4840,14 @@ class MyAgent(Agent):
     #
     # They are shared, so nothing may mutate one in place without
     # rebinding to a fresh instance-level object first. `__init__` rebinds
-    # it, so a real agent never touches this object; the single in-place
-    # writer (`_node_breadth`, under NODE_WIDEN) rebinds when it finds the
-    # map empty.
+    # every one of them, so a real agent never touches these objects; the
+    # single in-place writer (`_node_breadth`, under NODE_WIDEN) rebinds
+    # when it finds the map empty.
     _node_breadth: dict[int, int] = {}
+    _memory: Optional["GameMemory"] = None
+    _mem_start: Optional[tuple[int, ...]] = None
+    _mem_path: list[int] = []
+    _mem_replay: "deque[int]" = deque()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -4938,6 +5146,18 @@ class MyAgent(Agent):
         # the agent would cycle forever without ever exploring.
         self._want_cycle = False
 
+        # Per-game memory (see GameMemory). None unless ARC_GAME_MEMORY is
+        # set, which keeps the default trajectory bit-identical to v47 --
+        # every attribute below is only ever touched behind that check.
+        self._memory = GameMemory(self.game_id) if GAME_MEMORY else None
+        # Board the current level started from, and the actions committed
+        # since, so a clear can be banked as (start_state -> action list).
+        self._mem_start: Optional[tuple[int, ...]] = None
+        self._mem_path: list[int] = []
+        # Cached route being replayed after a reset put us back on a level
+        # the memory has already solved.
+        self._mem_replay: deque[int] = deque()
+
     # -- framework hooks ---------------------------------------------
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -5110,6 +5330,17 @@ class MyAgent(Agent):
             self._pending_flat = flat
             action_id, x, y = decode_action(code)
             return self._emit(action_id, x, y, "replay")
+
+        # 4b. Spend a route recovered from memory after a reset. Kept
+        #     separate from the banked-route replay above: that one is
+        #     keyed on `_solutions` and validated per level, this one was
+        #     already validated once by `solved_path`'s fingerprint check.
+        if self._mem_replay:
+            code = self._mem_replay.popleft()
+            self._pending = (node, code)
+            self._pending_flat = flat
+            action_id, x, y = decode_action(code)
+            return self._emit(action_id, x, y, "memory-replay")
 
         # 5. Decide.
         code, why = self._select(node, grid, latest_frame)
@@ -5976,6 +6207,17 @@ class MyAgent(Agent):
         pending_flat, self._pending_flat = self._pending_flat, None
         levels = latest_frame.levels_completed
 
+        # Fold the transition we just paid for into memory. `pending_flat`
+        # is the board the action was chosen on and `_last_flat` is what it
+        # produced, so this is exactly one observed edge per billed action.
+        if (
+            self._memory is not None
+            and pending is not None
+            and pending_flat is not None
+        ):
+            self._memory.record(pending_flat, pending[1], self._last_flat)
+            self._mem_path.append(pending[1])
+
         # First frame of the run, or the state key just changed under us
         # when the HUD mask was adopted: root the solution graph here.
         if self._sol_start is None:
@@ -5994,10 +6236,29 @@ class MyAgent(Agent):
                 # The action we are being shown the result of is the one
                 # that beat the level, so it is the last step of the route.
                 self._harvest(self._level, pending)
+                # Bank the same clear in memory, keyed on the board the
+                # level started from. `mark_solved` keeps the shortest.
+                if self._memory is not None and self._mem_start is not None:
+                    self._memory.mark_solved(
+                        self._level, self._mem_start, self._mem_path
+                    )
             elif levels < self._level:
                 # Only a full reset moves the counter backwards, and it
                 # puts us back at the start of level 0.
                 self._cycles += 1
+                # This is the leak GameMemory exists to plug: a reset has
+                # dropped us onto a level we already solved. `solved_path`
+                # re-checks the start-state fingerprint and returns None on
+                # any mismatch, so a stale route falls back to exploring.
+                if self._memory is not None:
+                    cached = self._memory.solved_path(levels, self._last_flat)
+                    if cached is not None:
+                        logger.info(
+                            "%s: memory holds level %d in %d actions; "
+                            "replaying instead of re-exploring",
+                            self.game_id, levels, len(cached),
+                        )
+                        self._mem_replay = deque(cached)
             self._level = levels
             self._begin_level(node)
 
@@ -6153,6 +6414,11 @@ class MyAgent(Agent):
         self._node_breadth = {}
         self._click_tried = 0
         self._click_live = 0
+        # A level is banked as (board it started on -> actions committed),
+        # so both halves restart with the level.
+        if self._memory is not None:
+            self._mem_start = self._last_flat
+            self._mem_path = []
         # The dead-action record deliberately survives the level boundary.
         # Which actions a game wires up is a property of the *game*, not of
         # the level, so clearing it made every level re-pay the cost of
