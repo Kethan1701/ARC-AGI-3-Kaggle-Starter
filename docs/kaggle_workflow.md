@@ -15,13 +15,34 @@ instead of copied.
 
 - **Phase A** (`kaggle kernels push`, then Kaggle runs it): burns GPU
   quota only. Free to repeat.
-- **Phase B** (clicking Submit / `kaggle competitions submit`): burns a
-  **submission slot**. The CLI cannot do this for a code competition --
-  it is a manual click, and it needs **explicit sign-off each time**, not
-  once per session. A Phase A run that looks good is a candidate for
-  Phase B, never an autopilot trigger.
+- **Phase B** (`kaggle competitions submit`, or the Submit button on the
+  kernel page): burns a **submission slot**, and needs **explicit
+  sign-off each time**, not once per session. A Phase A run that looks
+  good is a candidate for Phase B, never an autopilot trigger.
 
-Everything in `scripts/kops/` operates in Phase A. None of it submits.
+  **Corrected 2026-08-28.** This bullet used to say "The CLI cannot do
+  this for a code competition -- it is a manual click." That is false.
+  `kaggle competitions submit` has `-k` and `-v` precisely for code
+  competitions:
+
+      kaggle competitions submit arc-prize-2026-arc-agi-3 \
+          -k kethansaikoneru/arc-prize-2026-arc-agi-3-starter \
+          -v <kernel-version> -f submission.parquet \
+          -m "<what this run tests>"
+
+  Verified against submission 55840177. Two traps: the version must be a
+  kernel version that reached COMPLETE (a cancelled run has no output to
+  submit), and the success message is only "N submissions remaining
+  today" -- which reads exactly like a refusal when N is 0. Confirm with
+  `kaggle competitions submissions` instead of trusting that line.
+
+  That the CLI *can* submit makes the sign-off rule more important, not
+  less: the manual click used to be an accidental safety interlock, and
+  it never really was one. Nothing but the rule now stands between a
+  script and a spent slot.
+
+Nothing in `scripts/kops/` submits. `wait_submission.sh` observes Phase B
+but cannot start it; everything else operates in Phase A.
 
 ## The loop
 
@@ -38,11 +59,13 @@ Everything in `scripts/kops/` operates in Phase A. None of it submits.
      deploys nothing; only the spliced output ships)
    - pushes, and appends a line to kops/history.log
 
-3. Watch it to completion with the harness's Monitor tool, command:
-       wsl bash /path/to/repo/scripts/kops/wait.sh
-   Do NOT reach for `Bash --run_in_background` wrapping a sleep loop
-   around a `wsl bash` call -- see "Why Monitor, not a background Bash
-   loop" below.
+3. Watch it to completion with the harness's Monitor tool, armed
+   `persistent: true`. A Phase A rehearsal runs ~2h; Monitor's
+   non-persistent timeout maxes at 1h, so without that flag the watcher
+   is guaranteed to die before the kernel finishes.
+   Do NOT put a long-lived `wsl bash` sleep loop behind it -- that is the
+   one thing all four exit-4 watcher deaths share. See "The exit-4
+   watcher failure" below.
 
 4. scripts/kops/pull.sh <label>
    Pulls the finished run's log and server log into kaggle_runs/<label>/
@@ -57,27 +80,74 @@ Everything in `scripts/kops/` operates in Phase A. None of it submits.
    kops/history.log, whether the answer is "keep" or "revert."
 
 7. Only on the user's explicit go-ahead, and never inferred from a score
-   alone: Phase B, the Submit click.
+   alone: Phase B.
+       kaggle competitions submit <comp> -k <owner/kernel> \
+           -v <kernel-version> -f submission.parquet -m "<what it tests>"
+   Then watch it with the Monitor tool, `persistent: true`, driving a
+   PowerShell-native poll of the Kaggle REST API rather than
+   `wsl bash wait_submission.sh` -- see "The exit-4 watcher failure".
+   Phase B replays the notebook against the HIDDEN game set, on the
+   agent's real 7.5h budget -- expect hours, not the ~2h of a Phase A
+   rehearsal. Budget the watch accordingly: 55840177 was still `pending`
+   6h23m after submission, which is normal, not a stall.
 ```
 
-## Why Monitor, not a background Bash loop
+## The exit-4 watcher failure
 
-Three watchers in a row -- for v22, v23, and a v24 attempt that moved the
-poll loop from inside a single long-lived `wsl bash` process to a fresh
-`wsl bash` subprocess per 120s tick specifically to test whether process
-lifetime was the cause -- all died with exit code 4 well before the
-kernel finished. The redesign between attempt 2 and 3 didn't change the
-failure, which means the cause was never process lifetime; it was
-reaching for `Bash --run_in_background` at all for a "watch until done,
-notify me of the outcome" task.
+**Rewritten 2026-08-28. The previous version of this section named the
+wrong cause, and acting on it cost a fourth dead watcher.**
 
-The harness has a dedicated tool for exactly that: **Monitor**. Point its
-`command` at `scripts/kops/wait.sh` (itself: poll every 60s, print a line
-only on status change, exit 0 on COMPLETE / 1 on ERROR or CANCELLED) and
-it handles the polling lifecycle instead of a hand-rolled sleep loop
-trying to reimplement it. If a kernel run outlives the monitor's own
-timeout window, re-arm it rather than falling back to the Bash loop that
-failed three times.
+It used to read: three watchers (v22, v23, a v24 attempt) all died with
+exit code 4 before their kernel finished, the redesign between attempts
+didn't change it, therefore the cause was "reaching for
+`Bash --run_in_background` at all," and the fix was the harness's
+**Monitor** tool.
+
+That prescription was followed for Phase B submission 55840177. The
+Monitor-driven watcher printed one status line at 09:29:28 and **died
+with exit code 4** -- the same code, under the tool that was supposed to
+be the cure. So `Bash --run_in_background` was never the cause. Four
+failures, and the only thing all four share is a **long-lived
+`wsl bash` process sleeping between polls**. The harness tool wrapping
+it was never the variable.
+
+The mechanism inside WSL is still unproven -- do not write one down here
+until it is measured. What is established is narrower and enough to act
+on: keep the watch process out of WSL.
+
+Two things to do instead, both independent of the unproven mechanism:
+
+1. **Poll from PowerShell, not WSL.** `.kaggle/access_token` is a bearer
+   token, so the Kaggle REST API is reachable with `Invoke-RestMethod`
+   and no venv, no `kaggle` CLI, and no WSL:
+
+       GET https://www.kaggle.com/api/v1/competitions/submissions/list/<comp>
+       Authorization: Bearer <token>
+
+   Returns JSON with `ref`, `status` (lowercase `pending`/`complete`
+   here, *not* the CLI's `SubmissionStatus.` prefix -- a watcher ported
+   between the two must change its comparison or it will never match),
+   and `publicScore`. Read the token into a variable and put it only in a
+   header; never on a command line.
+
+2. **Set `persistent: true`.** This is a separate, certain bug in the old
+   advice. Monitor's non-persistent timeout maxes out at one hour, and
+   Phase B replays against the hidden game set on the agent's real 7.5h
+   budget. A non-persistent watcher **cannot** survive to a Phase B
+   score no matter what causes exit 4. "Re-arm it if the run outlives the
+   window" was busywork papering over a wrong flag.
+
+The `wsl bash` versions of `wait.sh` / `wait_submission.sh` are still
+correct as **one-shot logic** and still fine for short Phase A polls, but
+prefer `check_kernel.sh` / `check_submission.sh` for a direct read and a
+PowerShell-native loop for anything that has to stay alive for hours.
+
+**Standing rule, unchanged and reinforced:** never report a terminal
+state from a watcher's silence or its exit alone. Confirm with an
+independent direct status read first. Three of these four failures were
+initially indistinguishable from "still running," and the CSV-parsing bug
+in `wait_submission.sh` produced the opposite error -- a confident false
+"resolved" on the first poll.
 
 ## The scoring trap
 
@@ -114,8 +184,19 @@ scripts/kops/
   lib.sh       shared setup: cd to repo root, load the token, define
                KERNEL_ID/COMPETITION/paths. Source it, don't run it.
   push.sh      build -> verify -> push -> log to history.log
-  wait.sh      poll to a terminal state; hand its command straight to
-               Monitor
+  wait.sh      poll a KERNEL to a terminal state; hand its command
+               straight to Monitor
+  watch_submission.ps1
+               THE Phase B watcher. PowerShell + Kaggle REST API, no WSL,
+               for Monitor with persistent: true. Use this, not
+               wait_submission.sh -- see "The exit-4 watcher failure"
+  wait_submission.sh
+               the WSL/CLI predecessor. Logic is correct and it is fine
+               for a short poll, but as a long-lived `wsl bash` process it
+               is the shape that has died with exit code 4 four times
+  check_kernel.sh / check_submission.sh
+               one-shot status reads, for when you want an answer now
+               rather than a watch
   pull.sh      pull a run's output into kaggle_runs/<label>/
   checks.py    guards against the SPLICED notebook; extend in place when
                a run teaches you an invariant that must hold from here on

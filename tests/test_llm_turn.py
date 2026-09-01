@@ -1650,6 +1650,7 @@ def test_mid_turn_mask_adoption_resets_the_graph_immediately(monkeypatch):
     a._total = {1: 1}
     a._cursor = {1: 1}
     a._edges = {1: {2: 3}}
+    a._edges_rev = {3: {1}}
     a._fatal = {(1, 2)}
     a._deaths = {(1, 2): 1}
     a._fatal_flats = {(1, 2): (9, 9, 9)}
@@ -1699,6 +1700,7 @@ def test_llm_seed_edges_populates_the_graph_from_real_transitions(monkeypatch):
     a._turn_frame = env.current
     a._kept = None
     a._edges = {}
+    a._edges_rev = {}
     a._fatal = set()
     a._deaths = {}
 
@@ -1708,6 +1710,7 @@ def test_llm_seed_edges_populates_the_graph_from_real_transitions(monkeypatch):
     after_node = a._node_key(_flat(after_rows))
     code = agent_mod.encode_action(1, None, None)
     assert a._edges == {before_node: {code: after_node}}
+    assert a._edges_rev == {after_node: {before_node}}
 
 
 def test_llm_seed_edges_is_off_by_default(monkeypatch):

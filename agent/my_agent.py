@@ -122,9 +122,12 @@ alone is enough to know what has and hasn't been tried.
 
 from __future__ import annotations
 
+import ast
 import base64
+import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -139,7 +142,8 @@ import urllib.request
 import zlib
 from collections import Counter, deque
 from itertools import chain
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Hashable, Iterable, Optional
 
 from arcengine import FrameData, GameAction, GameState
 
@@ -303,6 +307,9 @@ DEAD_CLICK_TRIALS = _env_int("ARC_DEAD_CLICK_TRIALS", 240)
 
 # Shared empty mapping for `_edges` lookups on unmapped nodes.
 EMPTY_EDGES: dict[int, int] = {}
+
+# Same idea for `_edges_rev`/`_object_live_at` lookups (LIVE_OBJECT_NEIGHBORHOOD).
+EMPTY_SET: frozenset[int] = frozenset()
 
 # Coarse fallback sweep, tried only after every object click has been
 # tried from a node: stride 8 over 64x64 => 64 extra targets.
@@ -501,6 +508,54 @@ LIVENESS_MIN_CLICKS = _env_int("ARC_LIVENESS_MIN_CLICKS", 40)
 # and tn36 (43%) are far above it; ft09 (0.4%) and lp85 (2%) far below.
 LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
 
+# --- widening on commute cost, rather than on click liveness ------------
+#
+# LIVENESS_WIDEN above answers "are this game's clicks inert?". That is a
+# property of the *game*, and the 2026-08-31 sweep proved it is not the
+# discriminator for breadth: dropping LIVENESS_MIN_CLICKS 40 -> 12 rescued
+# the slow games it was aimed at (su15 281 -> 227, lp85 206 -> 175) and
+# r11l still lost its clear outright. Liveness cannot see the failure,
+# because the failure is not about clicks at all.
+#
+# What the sweep actually measured: ARC_BREADTH trades fast-game speed for
+# slow-game survival, and it does so along one axis. At breadth 6 the games
+# that clear quickly get cheaper (tn36 -6, sp80 -6, vc33 -30, lp85 -28)
+# while the games that clear slowly explode (cd82 +127, lf52 +310) or die
+# (r11l). The explosion has a mechanism, and `_report_budget` names it: a
+# slow clear spends 15.3% of its actions on "route-to-frontier". Halving
+# the breadth exhausts every node twice as fast, so the agent walks the map
+# twice as often -- and each walk is billed.
+#
+# But widening is free. Candidate order is a pure function of the grid, so
+# raising the breadth only raises `limit`: every cursor stays valid and
+# every node already visited reopens at once, at a cost of zero actions.
+# So whenever the search is about to *pay* a commute, and widening would
+# hand it an untried candidate right where it already stands, widening
+# strictly dominates walking.
+#
+# That gives a breadth that is adaptive per game and per level without any
+# per-game table: start narrow and cheap, and pay for reach only in the
+# games that demonstrably need reach, at the moment they demonstrate it.
+#
+# The threshold is the route length at which commuting is judged not worth
+# it. 0 disables the rule entirely and reproduces v47 exactly.
+WIDEN_ROUTE_COST = _env_int("ARC_WIDEN_ROUTE_COST", 0)
+
+# Deepen only the node that is actually stuck, instead of the whole level.
+#
+# `self._breadth` is one scalar for the entire level, so widening to rescue
+# a single node reopens EVERY node at once and rewrites the whole search
+# trajectory. Measured: ARC_BREADTH=6 + ARC_WIDEN_ROUTE_COST=2 recovers
+# r11l's clear (LOST -> 242) but thrashes cd82 (+127) and lf52 (+474), and
+# lf52 gets *worse* the more the rule fires (826 at cost 4 -> 990 at cost
+# 2). A repair that helps one node by perturbing every other node is not a
+# repair, it is a different search.
+#
+# Per-node deepening keeps the global breadth cheap and spends candidates
+# only where the search has demonstrated it is stuck -- the same evidence
+# the global rule uses, applied where the evidence was actually gathered.
+NODE_WIDEN = _env_int("ARC_NODE_WIDEN", 0)
+
 # lp85 level 2 (2026-08-07): LIVENESS_WIDEN fixed level 1 (502 -> 234
 # actions) but level 2 still burns ~4800 actions to map 31 nodes, 71% of
 # them "probe-untried". Root cause: `_is_dead` is keyed by action *type*
@@ -583,6 +638,47 @@ LIVE_CODE_PRIORITY = _env_int("ARC_LIVE_CODE_PRIORITY", 0)
 # states is sometimes right and sometimes actively wrong, and object
 # identity does not settle which. Left OFF by default; not shipped.
 LIVE_OBJECT_PRIORITY = _env_int("ARC_LIVE_OBJECT_PRIORITY", 0)
+
+# The next candidate LIVE_OBJECT_PRIORITY's own rejection calls for: scope
+# the priority boost to a NEIGHBORHOOD around the current node instead of
+# the whole game. Kept as a separate flag so the whole-game version above
+# stays available for comparison.
+#
+# Structurally different from both LIVE_CODE_PRIORITY and
+# LIVE_OBJECT_PRIORITY's rejections, not just narrower in degree: `_edges`
+# (the graph `_hop_neighborhood` walks, via its reverse index
+# `_edges_rev`) is rebuilt empty at every level-up and mask adoption
+# (`_reset_graph`; see FATAL_SURVIVES_LEVEL/FATAL_SURVIVES_MASK_CHANGE for
+# the other call sites this shares). A node id recorded pre-reset becomes
+# permanently unreachable the instant `_edges`/`_edges_rev` reset -- the
+# existing graph reset IS the decay mechanism, for free, which is exactly
+# the cross-level-leakage failure mode both whole-game rejections describe
+# (sp80/cd82/lf52/m0r0 losing clears on a LATER level/room from a liveness
+# verdict proven on an earlier one). What this does NOT solve: two
+# graph-close rooms within the SAME level with different button semantics
+# can still be over-generalized -- narrower than "whole game", not zero.
+#
+# See `_hop_neighborhood`'s own comment for why the BFS walks `_edges_rev`
+# (backward) rather than `_edges` (forward, the direction
+# `_route_to_frontier` uses) -- a plain forward BFS would be a near
+# no-op here, for a reason specific to when `_candidates` runs.
+LIVE_OBJECT_NEIGHBORHOOD = _env_int("ARC_LIVE_OBJECT_NEIGHBORHOOD", 0)
+LIVE_OBJECT_NEIGHBORHOOD_HOPS = _env_int("ARC_LIVE_OBJECT_NEIGHBORHOOD_HOPS", 2)
+
+# `_hop_neighborhood`'s own expansion cap -- deliberately NOT PLAN_NODE_CAP.
+# That constant is sized for `_route_to_frontier`, which runs occasionally
+# (only when the plan queue empties). `_hop_neighborhood` runs on every
+# SINGLE newly-discovered node's first candidate-generation call -- a much
+# hotter path. A node whose `_edges_rev` fan-in is large (a respawn/reset
+# point many different paths converge on, say) can pull thousands of nodes
+# into just a 2-hop neighborhood, and at PLAN_NODE_CAP that cost repeats on
+# every subsequent node discovery for the rest of the game -- measured
+# directly (2026-08-17): with PLAN_NODE_CAP, 10 of 13 games tested hung
+# past a 45s-per-game cutoff that the same 13 games cleared comfortably
+# under LIVE_OBJECT_NEIGHBORHOOD=0. 64 is generous for a 2-hop
+# neighborhood under normal branching and orders of magnitude cheaper than
+# 50,000 in the pathological case.
+LIVE_OBJECT_NEIGHBORHOOD_CAP = _env_int("ARC_LIVE_OBJECT_NEIGHBORHOOD_CAP", 64)
 
 # 15 of the 25 dev games never clear level 1 at all, and the diagnostic
 # splits them cleanly: on ar25/sc25/sb26 the node count grows ~0.2-0.66 per
@@ -965,6 +1061,31 @@ FATAL_SURVIVES_LEVEL = _env_int("ARC_FATAL_SURVIVES_LEVEL", 0)
 # unconditionally on every mask change. Per that rejection's own note,
 # never ship MASK_RELEARN_PER_LEVEL=1 again without this also on -- the
 # two are meant to be tested together, not this flag alone.
+#
+# REJECTED (v43/v44, two-run GPU validation, tested together with
+# MASK_RELEARN_PER_LEVEL=1 per the note above -- this flag is a no-op
+# without it): clears>=2 stayed flat at 0/25 in BOTH runs, a clean
+# reproduction of the null result, not the usual noisy 0->1->2 flip-flop
+# seen on every other tested flag this session. clears>=1 net negative
+# both runs vs the v27 baseline (11->9, 11->10). sp80 -- the actual game
+# this layer was built to fix -- scored 0.00 and died on level 0 in BOTH
+# runs (276/39 actions in v43, 191/39 in v44), identical failure mode to
+# the unfixed baseline. No observable benefit to its own target game, no
+# depth signal anywhere else. Left OFF; see kops/history.log v43/v44 for
+# full scorecards.
+#
+# Also killed on external grounds: Dries Smit's writeup on winning the
+# ARC-AGI-3 Developer Preview competition (Medium, "1st Place in the
+# ARC-AGI-3 Agent Preview Competition") describes resetting ALL
+# experience/state at every level-up -- the opposite of what this flag
+# and FATAL_SURVIVES_LEVEL both attempt -- calling it what "reliably
+# achieved high performance," done "for simplicity." Different
+# architecture (CNN-based, not this graph/mask agent) so not proof by
+# itself, but it corroborates the internal null result rather than
+# contradicting it: preserving fatal-move memory across level/mask
+# transitions is not the direction to keep pushing. Fix B (both layers)
+# is closed out as of v44; do not re-attempt fatal-memory preservation
+# without new evidence that changes this picture.
 FATAL_SURVIVES_MASK_CHANGE = _env_int("ARC_FATAL_SURVIVES_MASK_CHANGE", 0)
 
 # The status band is what shares a row or column with the HUD without
@@ -4502,12 +4623,231 @@ class VisionPolicy:
 
 
 # ---------------------------------------------------------------------
+# Persistent per-game memory
+# ---------------------------------------------------------------------
+# Moved here verbatim from a standalone `game_memory.py`. It is defined in
+# this file rather than imported because `scripts/build_notebook.py`
+# splices ONE hardcoded path -- `agent/my_agent.py` -- into the submission
+# notebook. A sibling module would work in every local run and then fail
+# with ModuleNotFoundError on the kernel, i.e. only after a submission slot
+# had been spent. No cross-module import, by construction.
+#
+# WHY IT EXISTS: ARC-AGI-3 scores each level as
+# `min(1, human_actions / ai_actions) ** 2`, so committed actions are the
+# scarce resource and internal reasoning is free. The documented leak this
+# plugs is re-exploring a level you already solved after a death/reset
+# drops you back onto it.
+#
+# Action-agnostic (any hashable token, persisted via repr()) and
+# frame-agnostic (numpy array, nested list/tuple, or bytes; keyed by a
+# stable fingerprint, never the raw grid). ARC-AGI-3 environments are
+# deterministic, so replaying recorded actions from the recorded
+# level-start state reproduces the solve; `solved_path` verifies the
+# start-state fingerprint first and returns None on mismatch.
+
+Frame = Any          # 64x64 grid: numpy array, nested list/tuple, or bytes
+Action = Hashable    # "ACTION3" or ("ACTION6", x, y), etc.
+
+# Wire the memory into the live agent. OFF by default, and deliberately so:
+# it changes the action trajectory, and replaying a banked route is the one
+# local gain this project has measured as NOT transferring to the graded
+# leaderboard (local 2.10 -> graded 0.19). With this at 0 the agent is
+# byte-identical to the v47 default that graded 0.29.
+GAME_MEMORY = _env_int("ARC_GAME_MEMORY", 0)
+
+
+def fingerprint(frame: Frame) -> str:
+    """Stable 16-byte hash of a frame grid. Handles numpy arrays and nested lists."""
+    if hasattr(frame, "tobytes"):                 # numpy array
+        raw = frame.tobytes()
+    elif isinstance(frame, (bytes, bytearray)):
+        raw = bytes(frame)
+    else:                                          # nested list/tuple of ints
+        raw = json.dumps(frame, separators=(",", ":")).encode()
+    return hashlib.blake2b(raw, digest_size=16).hexdigest()
+
+
+def _tok(action: Action) -> str:
+    """Action -> stable string token (JSON/round-trip safe)."""
+    return repr(action)
+
+
+def _untok(token: str) -> Action:
+    try:
+        return ast.literal_eval(token)
+    except (ValueError, SyntaxError):
+        return token
+
+
+class GameMemory:
+    def __init__(self, game_id: str, *, store_frames: bool = True,
+                 frame_cache_cap: int = 4096) -> None:
+        self.game_id = game_id
+        self.store_frames = store_frames
+        self.frame_cache_cap = frame_cache_cap
+
+        # transition graph:  (state_fp, action_tok) -> next_state_fp
+        self.transitions: dict[tuple[str, str], str] = {}
+        # every state fingerprint we've ever observed
+        self.visited: set[str] = set()
+        # state_fp -> set of action_toks already tried from it
+        self.tried: dict[str, set[str]] = {}
+        # solved paths:  level -> {"start_fp", "actions"(tokens), "count"}
+        self.solved: dict[int, dict] = {}
+        # best committed-action count seen per level (RHAE bookkeeping)
+        self.level_best: dict[int, int] = {}
+        # in-run only, NOT persisted: fp -> frame (capped, for free simulation)
+        self._frames: dict[str, Frame] = {}
+
+    # ----- recording ------------------------------------------------------- #
+    def record(self, frame: Frame, action: Action, next_frame: Frame) -> str:
+        """Log one observed transition. Returns the next-state fingerprint."""
+        fp, nfp, tok = fingerprint(frame), fingerprint(next_frame), _tok(action)
+        self.visited.add(fp)
+        self.visited.add(nfp)
+        self.transitions[(fp, tok)] = nfp
+        self.tried.setdefault(fp, set()).add(tok)
+        if self.store_frames:
+            self._cache_frame(fp, frame)
+            self._cache_frame(nfp, next_frame)
+        return nfp
+
+    def _cache_frame(self, fp: str, frame: Frame) -> None:
+        self._frames[fp] = frame
+        while len(self._frames) > self.frame_cache_cap:
+            self._frames.pop(next(iter(self._frames)))   # FIFO eviction
+
+    # ----- exploration guidance (saves squared-cost actions) --------------- #
+    def tried_action(self, frame: Frame, action: Action) -> bool:
+        return _tok(action) in self.tried.get(fingerprint(frame), ())
+
+    def untried_actions(self, frame: Frame, candidates: Iterable[Action]) -> list[Action]:
+        """Of `candidates`, the ones we have NOT yet tried from this state."""
+        seen = self.tried.get(fingerprint(frame), set())
+        return [a for a in candidates if _tok(a) not in seen]
+
+    def is_known_state(self, frame: Frame) -> bool:
+        return fingerprint(frame) in self.visited
+
+    # ----- free forward simulation (thinking is free, actions are not) ----- #
+    def predict_fp(self, frame: Frame, action: Action) -> Optional[str]:
+        """Known next-state fingerprint for (state, action), or None."""
+        return self.transitions.get((fingerprint(frame), _tok(action)))
+
+    def predict_frame(self, frame: Frame, action: Action) -> Optional[Frame]:
+        """Known next *frame* for (state, action) if it's still cached, else None."""
+        nfp = self.predict_fp(frame, action)
+        return self._frames.get(nfp) if nfp else None
+
+    # ----- solved-level cache (the leak plug) ------------------------------ #
+    def mark_solved(self, level: int, start_frame: Frame, actions: list[Action]) -> None:
+        """Cache the winning action sequence for a level; keep the shortest."""
+        count = len(actions)
+        prev = self.solved.get(level)
+        if prev is None or count < prev["count"]:
+            self.solved[level] = {
+                "start_fp": fingerprint(start_frame),
+                "actions": [_tok(a) for a in actions],
+                "count": count,
+            }
+        self.level_best[level] = min(self.level_best.get(level, math.inf), count)
+
+    def has_solved(self, level: int) -> bool:
+        return level in self.solved
+
+    def solved_path(self, level: int, current_frame: Frame) -> Optional[list[Action]]:
+        """
+        Replay actions for `level` IF the current state matches the recorded
+        level-start (determinism guard). Returns None -> caller must explore.
+        """
+        rec = self.solved.get(level)
+        if rec is None or fingerprint(current_frame) != rec["start_fp"]:
+            return None
+        return [_untok(t) for t in rec["actions"]]
+
+    # ----- persistence (frames are NOT persisted -- they're re-observable) - #
+    def to_dict(self) -> dict:
+        return {
+            "game_id": self.game_id,
+            "store_frames": self.store_frames,
+            "frame_cache_cap": self.frame_cache_cap,
+            "transitions": [[s, a, n] for (s, a), n in self.transitions.items()],
+            "visited": sorted(self.visited),
+            "tried": {fp: sorted(t) for fp, t in self.tried.items()},
+            "solved": {str(k): v for k, v in self.solved.items()},
+            "level_best": {str(k): (None if v == math.inf else v)
+                           for k, v in self.level_best.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GameMemory":
+        m = cls(d["game_id"], store_frames=d.get("store_frames", True),
+                frame_cache_cap=d.get("frame_cache_cap", 4096))
+        m.transitions = {(s, a): n for s, a, n in d.get("transitions", [])}
+        m.visited = set(d.get("visited", []))
+        m.tried = {fp: set(t) for fp, t in d.get("tried", {}).items()}
+        m.solved = {int(k): v for k, v in d.get("solved", {}).items()}
+        m.level_best = {int(k): (math.inf if v is None else v)
+                        for k, v in d.get("level_best", {}).items()}
+        return m
+
+
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(name))
+
+
+class MemoryStore:
+    """One JSON file per game, loaded lazily, survives across runs."""
+
+    def __init__(self, path: str = "./arc_memory", **game_kwargs: Any) -> None:
+        self.dir = Path(path)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.game_kwargs = game_kwargs
+        self._games: dict[str, GameMemory] = {}
+
+    def _file(self, game_id: str) -> Path:
+        return self.dir / f"{_safe(game_id)}.json"
+
+    def game(self, game_id: str) -> GameMemory:
+        if game_id not in self._games:
+            f = self._file(game_id)
+            if f.exists():
+                self._games[game_id] = GameMemory.from_dict(json.loads(f.read_text()))
+            else:
+                self._games[game_id] = GameMemory(game_id, **self.game_kwargs)
+        return self._games[game_id]
+
+    def save(self, game_id: Optional[str] = None) -> None:
+        for gid in ([game_id] if game_id else list(self._games)):
+            self._file(gid).write_text(json.dumps(self._games[gid].to_dict()))
+
+
+# ---------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------
 class MyAgent(Agent):
     """One instance per game; see the module docstring for the strategy."""
 
     MAX_ACTIONS = MAX_ACTIONS_PER_GAME
+
+    # Defaults for instance state that the methods below read.
+    #
+    # The test suite builds agents with `MyAgent.__new__(MyAgent)` --
+    # bypassing __init__ -- and sets only the attributes a given case
+    # needs, so any NEW attribute read on a path under test raises
+    # AttributeError there while working fine in production. These
+    # defaults are the contract that keeps that harness usable.
+    #
+    # They are shared, so nothing may mutate one in place without
+    # rebinding to a fresh instance-level object first. `__init__` rebinds
+    # every one of them, so a real agent never touches these objects; the
+    # single in-place writer (`_node_breadth`, under NODE_WIDEN) rebinds
+    # when it finds the map empty.
+    _node_breadth: dict[int, int] = {}
+    _memory: Optional["GameMemory"] = None
+    _mem_start: Optional[tuple[int, ...]] = None
+    _mem_path: list[int] = []
+    _mem_replay: "deque[int]" = deque()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -4530,6 +4870,10 @@ class MyAgent(Agent):
         self._total: dict[int, int] = {}          # node -> candidate count
         self._cursor: dict[int, int] = {}         # node -> next index to try
         self._breadth = BREADTH_INITIAL           # candidates per node, deepens
+        # Per-node overrides of the above (see NODE_WIDEN). Empty unless
+        # NODE_WIDEN is on, and `_breadth_at` maxes against the global, so
+        # an empty dict reproduces the scalar behaviour exactly.
+        self._node_breadth: dict[int, int] = {}
         # Click hit rate for the current level (see LIVENESS_WIDEN). Reset at
         # each level boundary, alongside the breadth it governs.
         self._click_tried = 0
@@ -4552,7 +4896,25 @@ class MyAgent(Agent):
         # analogue of `_code_live`.
         self._code_object_hash: dict[int, int] = {}
         self._object_live: set[int] = set()
+        # See LIVE_OBJECT_NEIGHBORHOOD: same proof as `_object_live` above,
+        # but scoped to WHERE it was proven live (the set of `prev_node`s
+        # it fired from) instead of a whole-game verdict. `_edges` resets
+        # at every level-up/mask change (`_reset_graph`), so a node id from
+        # a previous level/mask is never reachable again once that
+        # happens -- the decay this needs, for free.
+        self._object_live_at: dict[int, set[int]] = {}
         self._edges: dict[int, dict[int, int]] = {}  # node -> code -> node
+        # Reverse of `_edges` (destination -> source nodes), maintained at
+        # the same write sites. Exists only for LIVE_OBJECT_NEIGHBORHOOD's
+        # BFS: a brand-new node has no OUTGOING edges yet -- nothing has
+        # ever been tried from it, since `_candidates` computes its
+        # ordering exactly once, on first visit, before any action is
+        # taken from it -- so a forward BFS (the same direction
+        # `_route_to_frontier` walks) would always dead-end on exactly the
+        # node this exists to help. Walking backward instead reaches the
+        # nodes the agent actually arrived from, which is where a fresh
+        # discovery is physically closest to.
+        self._edges_rev: dict[int, set[int]] = {}
         self._fatal: set[tuple[int, int]] = set()     # (node, code) proven lethal
         self._deaths: dict[tuple[int, int], int] = {}  # deaths seen per (node, code)
         # The flat frame each `_fatal` entry was proven lethal from, keyed
@@ -4784,6 +5146,18 @@ class MyAgent(Agent):
         # the agent would cycle forever without ever exploring.
         self._want_cycle = False
 
+        # Per-game memory (see GameMemory). None unless ARC_GAME_MEMORY is
+        # set, which keeps the default trajectory bit-identical to v47 --
+        # every attribute below is only ever touched behind that check.
+        self._memory = GameMemory(self.game_id) if GAME_MEMORY else None
+        # Board the current level started from, and the actions committed
+        # since, so a clear can be banked as (start_state -> action list).
+        self._mem_start: Optional[tuple[int, ...]] = None
+        self._mem_path: list[int] = []
+        # Cached route being replayed after a reset put us back on a level
+        # the memory has already solved.
+        self._mem_replay: deque[int] = deque()
+
     # -- framework hooks ---------------------------------------------
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         if latest_frame.state is GameState.WIN:
@@ -4956,6 +5330,17 @@ class MyAgent(Agent):
             self._pending_flat = flat
             action_id, x, y = decode_action(code)
             return self._emit(action_id, x, y, "replay")
+
+        # 4b. Spend a route recovered from memory after a reset. Kept
+        #     separate from the banked-route replay above: that one is
+        #     keyed on `_solutions` and validated per level, this one was
+        #     already validated once by `solved_path`'s fingerprint check.
+        if self._mem_replay:
+            code = self._mem_replay.popleft()
+            self._pending = (node, code)
+            self._pending_flat = flat
+            action_id, x, y = decode_action(code)
+            return self._emit(action_id, x, y, "memory-replay")
 
         # 5. Decide.
         code, why = self._select(node, grid, latest_frame)
@@ -5172,6 +5557,7 @@ class MyAgent(Agent):
                 elif after:
                     after_node = self._node_key(tuple(chain.from_iterable(after)))
                     self._edges.setdefault(before_node, {})[seed_code] = after_node
+                    self._edges_rev.setdefault(after_node, set()).add(before_node)
 
             if before is not None:
                 self._transitions.append((before, label, after))
@@ -5821,6 +6207,17 @@ class MyAgent(Agent):
         pending_flat, self._pending_flat = self._pending_flat, None
         levels = latest_frame.levels_completed
 
+        # Fold the transition we just paid for into memory. `pending_flat`
+        # is the board the action was chosen on and `_last_flat` is what it
+        # produced, so this is exactly one observed edge per billed action.
+        if (
+            self._memory is not None
+            and pending is not None
+            and pending_flat is not None
+        ):
+            self._memory.record(pending_flat, pending[1], self._last_flat)
+            self._mem_path.append(pending[1])
+
         # First frame of the run, or the state key just changed under us
         # when the HUD mask was adopted: root the solution graph here.
         if self._sol_start is None:
@@ -5839,10 +6236,29 @@ class MyAgent(Agent):
                 # The action we are being shown the result of is the one
                 # that beat the level, so it is the last step of the route.
                 self._harvest(self._level, pending)
+                # Bank the same clear in memory, keyed on the board the
+                # level started from. `mark_solved` keeps the shortest.
+                if self._memory is not None and self._mem_start is not None:
+                    self._memory.mark_solved(
+                        self._level, self._mem_start, self._mem_path
+                    )
             elif levels < self._level:
                 # Only a full reset moves the counter backwards, and it
                 # puts us back at the start of level 0.
                 self._cycles += 1
+                # This is the leak GameMemory exists to plug: a reset has
+                # dropped us onto a level we already solved. `solved_path`
+                # re-checks the start-state fingerprint and returns None on
+                # any mismatch, so a stale route falls back to exploring.
+                if self._memory is not None:
+                    cached = self._memory.solved_path(levels, self._last_flat)
+                    if cached is not None:
+                        logger.info(
+                            "%s: memory holds level %d in %d actions; "
+                            "replaying instead of re-exploring",
+                            self.game_id, levels, len(cached),
+                        )
+                        self._mem_replay = deque(cached)
             self._level = levels
             self._begin_level(node)
 
@@ -5918,6 +6334,7 @@ class MyAgent(Agent):
 
         if prev_node in self._total:
             self._edges.setdefault(prev_node, {})[code] = node
+            self._edges_rev.setdefault(node, set()).add(prev_node)
 
         # A code that just moved us somewhere genuinely new is the single
         # best hint available about which direction this game rewards.
@@ -5964,6 +6381,7 @@ class MyAgent(Agent):
             object_hash = self._code_object_hash.get(code)
             if object_hash is not None:
                 self._object_live.add(object_hash)
+                self._object_live_at.setdefault(object_hash, set()).add(prev_node)
 
         # Split the level's spend by action class. ~112 of the ~117 codes a
         # node offers are ACTION6 clicks, so if clicks dominate the bill and
@@ -5993,8 +6411,14 @@ class MyAgent(Agent):
         # boundary would spend the new level's budget at the old level's
         # difficulty.
         self._breadth = BREADTH_INITIAL
+        self._node_breadth = {}
         self._click_tried = 0
         self._click_live = 0
+        # A level is banked as (board it started on -> actions committed),
+        # so both halves restart with the level.
+        if self._memory is not None:
+            self._mem_start = self._last_flat
+            self._mem_path = []
         # The dead-action record deliberately survives the level boundary.
         # Which actions a game wires up is a property of the *game*, not of
         # the level, so clearing it made every level re-pay the cost of
@@ -6479,6 +6903,7 @@ class MyAgent(Agent):
         self._total.clear()
         self._cursor.clear()
         self._edges.clear()
+        self._edges_rev.clear()
         self._fatal.clear()
         self._deaths.clear()
         self._fatal_flats.clear()
@@ -6694,6 +7119,42 @@ class MyAgent(Agent):
             self._at[1] + step[1],
         ) in self._blocked
 
+    def _hop_neighborhood(self, start: int, hops: int) -> set[int]:
+        """Nodes within `hops` backward hops of `start` over `_edges_rev`.
+
+        "Backward" on purpose, unlike `_route_to_frontier`'s forward BFS
+        over `_edges`: `_candidates` computes a node's ordering exactly
+        once, on first visit, before any action has ever been taken FROM
+        it -- so at the moment this runs, `start` has no outgoing edges
+        yet, and a forward BFS would always dead-end on exactly the node
+        LIVE_OBJECT_NEIGHBORHOOD exists to help. Walking `_edges_rev`
+        instead reaches the nodes the agent actually arrived from, which
+        is where a fresh discovery is physically closest to -- and is
+        never empty for any node beyond the very first of the game, since
+        reaching `start` at all required an edge into it.
+
+        Capped at LIVE_OBJECT_NEIGHBORHOOD_CAP -- see that constant's
+        comment for why this is deliberately NOT PLAN_NODE_CAP.
+        """
+        neighborhood: set[int] = {start}
+        frontier: set[int] = {start}
+        expanded = 0
+        for _ in range(hops):
+            if len(neighborhood) >= LIVE_OBJECT_NEIGHBORHOOD_CAP:
+                break
+            next_frontier: set[int] = set()
+            for n in frontier:
+                if expanded >= LIVE_OBJECT_NEIGHBORHOOD_CAP:
+                    return neighborhood
+                expanded += 1
+                next_frontier.update(self._edges_rev.get(n, EMPTY_SET))
+            next_frontier -= neighborhood
+            if not next_frontier:
+                break
+            neighborhood |= next_frontier
+            frontier = next_frontier
+        return neighborhood
+
     def _candidates(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
     ) -> list[int]:
@@ -6740,7 +7201,28 @@ class MyAgent(Agent):
         # skipped if already present: the same packed code recurs across
         # many different nodes, and the object at that coordinate can be a
         # different one each time.
-        if LIVE_OBJECT_PRIORITY:
+        # Shared by LIVE_OBJECT_PRIORITY and LIVE_OBJECT_NEIGHBORHOOD --
+        # either one needs `_code_object_hash` populated for this node.
+        #
+        # Skipped while `self._exploding` (a HIGH new-node rate -- see
+        # EXPLODE_WINDOW/EXPLODE_THRESHOLD, and NOT the EAGER_WIDEN
+        # mistake of gating on the opposite condition): `_flood_component`
+        # is a real per-candidate cost, and this loop runs once per
+        # NEWLY-discovered node -- on an exploding, never-closing map
+        # (ar25/sc25/sb26-shaped) that means once per action, for as long
+        # as the game runs. Measured directly (2026-08-18): ar25 with
+        # LIVE_OBJECT_NEIGHBORHOOD=1, 20 real actions, cProfile --
+        # `_flood_component` alone: 1533 calls, 6.6s cumulative, on top of
+        # `_candidates` averaging 0.47s/call -- extrapolated to a
+        # 5000-action budget that is 30+ minutes on a game this mechanism
+        # cannot help anyway (no reachable map ever closes, so there is no
+        # stable neighborhood to exploit). This is exactly the risk the
+        # depth-push plan's own Fix C section named in advance ("BFS cost
+        # per newly-cached node... potentially frequent on exploding
+        # games") -- it just turned out to be this shared hash computation
+        # doing the damage, not the BFS in `_hop_neighborhood` itself
+        # (which is separately capped at LIVE_OBJECT_NEIGHBORHOOD_CAP).
+        if (LIVE_OBJECT_PRIORITY or LIVE_OBJECT_NEIGHBORHOOD) and not self._exploding:
             for c in codes:
                 action_id, x, y = decode_action(c)
                 if action_id != _ACTION6_ID:
@@ -6748,6 +7230,8 @@ class MyAgent(Agent):
                 found = _flood_component(grid, x, y, self._volatile)
                 if found is not None:
                     self._code_object_hash[c] = object_signature(*found)
+
+        if LIVE_OBJECT_PRIORITY:
             if self._object_live:
                 live_here = [
                     c for c in codes
@@ -6759,6 +7243,28 @@ class MyAgent(Agent):
                         if self._code_object_hash.get(c) not in self._object_live
                     ]
                     codes = live_here + rest
+
+        # See LIVE_OBJECT_NEIGHBORHOOD. Same idea as LIVE_OBJECT_PRIORITY
+        # above, but an object only counts as live if it was proven live
+        # at a node within `LIVE_OBJECT_NEIGHBORHOOD_HOPS` of `node` --
+        # see `_hop_neighborhood`'s comment for why that BFS walks
+        # `_edges_rev` (backward) instead of `_edges`.
+        if LIVE_OBJECT_NEIGHBORHOOD and self._object_live_at:
+            nearby = self._hop_neighborhood(node, LIVE_OBJECT_NEIGHBORHOOD_HOPS)
+            live_here = [
+                c for c in codes
+                if not nearby.isdisjoint(
+                    self._object_live_at.get(self._code_object_hash.get(c), EMPTY_SET)
+                )
+            ]
+            if live_here:
+                rest = [
+                    c for c in codes
+                    if nearby.isdisjoint(
+                        self._object_live_at.get(self._code_object_hash.get(c), EMPTY_SET)
+                    )
+                ]
+                codes = live_here + rest
 
         if len(self._cache) >= CANDIDATE_CACHE_LIMIT:
             self._cache.clear()
@@ -6794,10 +7300,51 @@ class MyAgent(Agent):
             and not self._act_changed[action_id]
         )
 
+    def _breadth_at(self, node: int) -> int:
+        """How many candidates this node may spend.
+
+        Maxed against the global breadth, not read instead of it, so
+        LIVENESS_WIDEN still lifts every node -- including ones already
+        deepened individually -- and an empty override map is exactly the
+        old scalar behaviour.
+        """
+        if not self._node_breadth:
+            return self._breadth
+        return max(self._breadth, self._node_breadth.get(node, 0))
+
     def _has_untried(self, node: int) -> bool:
         return self._cursor.get(node, 0) < min(
-            self._total.get(node, 0), self._breadth
+            self._total.get(node, 0), self._breadth_at(node)
         )
+
+    def _widen_reopens(self, node: int, codes: list[int]) -> bool:
+        """Would doubling the breadth hand (b) a probe right here?
+
+        This deliberately mirrors (b)'s own filter -- same cursor, same
+        dead-action and recorded-edge skips -- rather than approximating it
+        with `len(codes) > self._breadth`. The looser test is wrong
+        whenever the reopened slots are all dead clicks, and it would widen
+        on games whose extra candidates buy nothing, which is precisely the
+        failure mode that got EAGER_WIDEN rejected.
+
+        True here means the widen *replaces* the commute with a probe at
+        this node, rather than merely postponing it.
+        """
+        if node not in self._total:
+            return False
+        cur = self._breadth_at(node)
+        hi = min(len(codes), min(cur * 2, BREADTH_MAX))
+        index = self._cursor.get(node, 0)
+        recorded = (
+            self._edges.get(node, EMPTY_EDGES)
+            if (SKIP_RECORDED or self._policy is not None)
+            else EMPTY_EDGES
+        )
+        while index < hi and (
+            self._is_dead(codes[index]) or codes[index] in recorded
+        ):
+            index += 1
+        return index < hi
 
     def _select(
         self, node: int, grid: tuple[tuple[int, ...], ...], latest_frame: FrameData
@@ -6915,7 +7462,7 @@ class MyAgent(Agent):
         #     edges out of turn today. It is forced on whenever a model
         #     is driving, where it is load-bearing, and otherwise defaults
         #     off so the no-model agent stays exactly the one that scored.
-        limit = min(len(codes), self._breadth)
+        limit = min(len(codes), self._breadth_at(node))
         index = self._cursor.get(node, 0)
         recorded = (
             self._edges.get(node, EMPTY_EDGES)
@@ -6936,6 +7483,46 @@ class MyAgent(Agent):
         #     isn't, using only edges already verified by experience.
         route = self._route_to_frontier(node)
         if route:
+            # (c0) Widen instead of commuting. See WIDEN_ROUTE_COST.
+            #
+            #      This is the whole point of the rule: the alternative on
+            #      offer here is `len(route)` billed actions that discover
+            #      nothing -- they only move the agent to where discovery
+            #      is possible -- versus a widen that costs nothing and
+            #      makes discovery possible where it already stands.
+            #
+            #      It sits before the deadline check on purpose. Being
+            #      close to the step limit is the strongest possible reason
+            #      not to spend the next actions travelling.
+            if (
+                WIDEN_ROUTE_COST
+                and len(route) >= WIDEN_ROUTE_COST
+                and self._breadth_at(node) < BREADTH_MAX
+                and self._widen_reopens(node, codes)
+            ):
+                if NODE_WIDEN:
+                    if not self._node_breadth:
+                        # May still be the shared class-level default; see
+                        # the note on MyAgent's class attributes.
+                        self._node_breadth = {}
+                    self._node_breadth[node] = min(
+                        self._breadth_at(node) * 2, BREADTH_MAX
+                    )
+                else:
+                    self._breadth = min(self._breadth * 2, BREADTH_MAX)
+                self._stuck_steps = 0
+                # As with LIVENESS_WIDEN, the dead-action record survives:
+                # it is the most valuable thing the run has learned, and
+                # wiping it is the suspected cause of eager widening
+                # costing tn36 52 -> 86.
+                logger.info(
+                    "%s: frontier is %d actions away after %d actions; "
+                    "widening breadth to %d (%s) instead of walking",
+                    self.game_id, len(route), self._steps,
+                    self._breadth_at(node), "this node" if NODE_WIDEN else "level",
+                )
+                return self._select(node, grid, latest_frame)
+
             left = self._steps_left()
             if left is not None and len(route) > left:
                 code = self._local_probe(node, codes)

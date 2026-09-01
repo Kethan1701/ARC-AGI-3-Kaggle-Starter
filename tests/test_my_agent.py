@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -180,6 +181,167 @@ def test_object_signature_matches_segment_frame_hash():
     node = next(n for n in parsed["nodes"] if n["color"] == 3)
     cells, color = agent._flood_component(freeze(grid), 3, 3)
     assert agent.object_signature(cells, color) == node["hash"]
+
+
+# -- LIVE_OBJECT_NEIGHBORHOOD (Fix C, depth-push plan) ------------------
+def _hop_agent(edges_rev):
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a._edges_rev = edges_rev
+    return a
+
+
+def test_hop_neighborhood_reaches_ancestors_within_hops():
+    """100 -> 200 -> 300 -> 400 in the forward graph (`_edges`);
+    `_edges_rev` is the reverse of that, which is the direction
+    `_hop_neighborhood` actually walks -- see its comment for why."""
+    edges_rev = {200: {100}, 300: {200}, 400: {300}}
+    a = _hop_agent(edges_rev)
+    assert a._hop_neighborhood(400, 0) == {400}
+    assert a._hop_neighborhood(400, 1) == {400, 300}
+    assert a._hop_neighborhood(400, 2) == {400, 300, 200}
+    assert a._hop_neighborhood(400, 3) == {400, 300, 200, 100}
+    # Exhausts the graph before the hop budget runs out -- must not error.
+    assert a._hop_neighborhood(400, 10) == {400, 300, 200, 100}
+
+
+def test_hop_neighborhood_is_just_the_start_with_no_incoming_edges():
+    """The degenerate case this flag exists to handle: a brand-new node
+    that nothing has ever transitioned INTO yet (or, in practice, the
+    much more common case of a node with no recorded parent at all)."""
+    a = _hop_agent({})
+    assert a._hop_neighborhood(999, 5) == {999}
+
+
+def test_hop_neighborhood_does_not_survive_reset_graph():
+    """See LIVE_OBJECT_NEIGHBORHOOD's comment: `_edges_rev` has to decay
+    across a level-up/mask change exactly like `_edges` itself, since a
+    node id from a previous level/mask means nothing under the new one."""
+    a = _status_agent()
+    for name in ("_edges", "_edges_rev", "_fatal", "_deaths", "_fatal_flats", "_cache"):
+        setattr(a, name, {1: 2})
+    a._edges_rev = {400: {300}, 300: {200}, 200: {100}}
+    a._blocked = {(0, 4, 5)}
+    a._at = (5, 5)
+    a._at_confirmed = 3
+    assert a._hop_neighborhood(400, 3) == {400, 300, 200, 100}
+    a._reset_graph()
+    assert a._hop_neighborhood(400, 3) == {400}
+
+
+def _neighborhood_agent():
+    a = agent.MyAgent.__new__(agent.MyAgent)
+    a._cache = {}
+    a._volatile = frozenset()
+    a._code_object_hash = {}
+    a._object_live = set()
+    a._object_live_at = {}
+    a._edges = {}
+    a._edges_rev = {}
+    a._total = {}
+    a._cursor = {}
+    a._graph_full = False
+    a._exploding = False
+    a.game_id = "test-0000"
+    return a
+
+
+def test_live_object_neighborhood_boosts_a_code_proven_live_nearby(monkeypatch):
+    """An object proven live 2 hops back (in `_edges_rev` terms) moves
+    its click to the front of a brand-new node's candidate list, the
+    same stable-partition shape as LIVE_OBJECT_PRIORITY -- but only
+    because it is inside the hop radius; see the companion test below
+    for the negative case."""
+    monkeypatch.setattr(agent, "LIVE_OBJECT_NEIGHBORHOOD", 1)
+    monkeypatch.setattr(agent, "LIVE_OBJECT_NEIGHBORHOOD_HOPS", 2)
+    monkeypatch.setattr(agent, "LIVE_OBJECT_PRIORITY", 0)  # not under test here
+
+    grid = solid(32, 32, color=0)
+    grid[5][5] = 3     # a second rare object, competing for first place
+    grid[20][20] = 7   # the target object
+    frozen = freeze(grid)
+    frame = SimpleNamespace(available_actions=[agent._ACTION6_ID])
+    click_code = agent.encode_action(agent._ACTION6_ID, 20, 20)
+    cells, color = agent._flood_component(frozen, 20, 20)
+    obj_hash = agent.object_signature(cells, color)
+
+    baseline = agent.candidate_actions(
+        frozen, frame.available_actions, node=999, ignore=frozenset()
+    )
+    assert baseline[0] != click_code, (
+        "test needs a target that is NOT already ranked first, or the "
+        "boost has nothing observable to do"
+    )
+
+    a = _neighborhood_agent()
+    a._edges_rev = {300: {200}, 200: {100}}   # 100 -> 200 -> 300, forward
+    a._object_live_at = {obj_hash: {100}}     # proven live AT node 100
+
+    codes = a._candidates(300, frozen, frame)  # 300 is 2 hops from 100
+    assert codes[0] == click_code
+
+
+def test_live_object_neighborhood_does_not_boost_beyond_hops(monkeypatch):
+    """Same setup as above, but the hop budget is too small to reach the
+    node the object was proven live at -- the boost must not fire."""
+    monkeypatch.setattr(agent, "LIVE_OBJECT_NEIGHBORHOOD", 1)
+    monkeypatch.setattr(agent, "LIVE_OBJECT_NEIGHBORHOOD_HOPS", 1)
+    monkeypatch.setattr(agent, "LIVE_OBJECT_PRIORITY", 0)
+
+    grid = solid(32, 32, color=0)
+    grid[5][5] = 3
+    grid[20][20] = 7
+    frozen = freeze(grid)
+    frame = SimpleNamespace(available_actions=[agent._ACTION6_ID])
+    cells, color = agent._flood_component(frozen, 20, 20)
+    obj_hash = agent.object_signature(cells, color)
+
+    baseline = agent.candidate_actions(
+        frozen, frame.available_actions, node=999, ignore=frozenset()
+    )
+
+    a = _neighborhood_agent()
+    a._edges_rev = {300: {200}, 200: {100}}   # 300 is 2 hops from 100
+    a._object_live_at = {obj_hash: {100}}
+
+    codes = a._candidates(300, frozen, frame)
+    assert codes == baseline
+
+
+def test_live_object_neighborhood_is_skipped_while_exploding(monkeypatch):
+    """See the comment above `_flood_component`'s call site: on an
+    exploding, never-closing map (ar25/sc25/sb26-shaped -- see
+    `_exploding`'s own comment), the flood-fill this boost needs is a
+    real per-candidate cost paid on every newly-discovered node, which on
+    an exploding game means every action for as long as it runs. Measured
+    directly (2026-08-18) at 30+ minutes extrapolated over a 5000-action
+    budget on ar25 before this gate existed. Same setup as the positive
+    case above, but `_exploding=True` -- the boost must not fire, and
+    `_code_object_hash` must not even get populated for this node."""
+    monkeypatch.setattr(agent, "LIVE_OBJECT_NEIGHBORHOOD", 1)
+    monkeypatch.setattr(agent, "LIVE_OBJECT_NEIGHBORHOOD_HOPS", 2)
+    monkeypatch.setattr(agent, "LIVE_OBJECT_PRIORITY", 0)
+
+    grid = solid(32, 32, color=0)
+    grid[5][5] = 3
+    grid[20][20] = 7
+    frozen = freeze(grid)
+    frame = SimpleNamespace(available_actions=[agent._ACTION6_ID])
+    click_code = agent.encode_action(agent._ACTION6_ID, 20, 20)
+    cells, color = agent._flood_component(frozen, 20, 20)
+    obj_hash = agent.object_signature(cells, color)
+
+    baseline = agent.candidate_actions(
+        frozen, frame.available_actions, node=999, ignore=frozenset()
+    )
+
+    a = _neighborhood_agent()
+    a._exploding = True
+    a._edges_rev = {300: {200}, 200: {100}}   # would be within hops if not exploding
+    a._object_live_at = {obj_hash: {100}}
+
+    codes = a._candidates(300, frozen, frame)
+    assert codes == baseline
+    assert click_code not in a._code_object_hash
 
 
 # -- candidate ordering -----------------------------------------------
@@ -1070,7 +1232,7 @@ def test_the_model_outlives_the_graph():
     """The whole point: `_reset_graph` drops every node id at a level
     boundary, and what the actions do is not keyed on any of them."""
     a = _status_agent()
-    for name in ("_edges", "_fatal", "_deaths", "_fatal_flats", "_cache"):
+    for name in ("_edges", "_edges_rev", "_fatal", "_deaths", "_fatal_flats", "_cache"):
         setattr(a, name, {1: 2})
     a._blocked = {(0, 4, 5)}
     a._at = (5, 5)
@@ -1099,7 +1261,7 @@ def test_reset_graph_also_drops_fatal_flats():
     reset (mask-exhausted re-explore, exploit-cycle) -- only the level-up
     path is special-cased to preserve them, tested separately below."""
     a = _status_agent()
-    for name in ("_edges", "_fatal", "_deaths", "_fatal_flats", "_cache"):
+    for name in ("_edges", "_edges_rev", "_fatal", "_deaths", "_fatal_flats", "_cache"):
         setattr(a, name, {1: 2})
     a._blocked = {(0, 4, 5)}
     a._at = (5, 5)
@@ -1168,6 +1330,7 @@ def _level_up_agent():
     a._total = {1: 1}
     a._cursor = {1: 1}
     a._edges = {1: {2: 3}}
+    a._edges_rev = {3: {1}}
     a._fatal = {(1, 2)}
     a._deaths = {(1, 2): 3}
     a._fatal_flats = {(1, 2): (9, 9, 9)}

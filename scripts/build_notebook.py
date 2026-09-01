@@ -40,8 +40,16 @@ from textwrap import dedent
 # with no model, so a GPU would sit idle while still consuming GPU quota
 # and adding a provisioning failure mode to every run. Switch this only if
 # you actually wire in local model weights.
+#
+# Back to "cpu" 2026-08-28, with MODE="search" below. This is not a guess
+# about what the search wants -- all three graded search-only submissions
+# ran on "cpu" (checked directly: 43204cd, 3b10384, 92656e2 all read
+# ACCELERATOR = "cpu"), and those are the runs that scored 0.19/0.19/0.26.
+# Going back to search while leaving the accelerator on rtx6000 would burn
+# GPU quota on an idle card and keep the vLLM provisioning failure surface
+# for a mode that never touches it.
 # ─────────────────────────────────────────────────────────────────────────────
-ACCELERATOR = "rtx6000"
+ACCELERATOR = "cpu"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT PLAYS THE GAMES
@@ -66,7 +74,28 @@ ACCELERATOR = "rtx6000"
 # `build()` refuses a GPU mode on a CPU accelerator: the agent would
 # otherwise spend minutes failing to load 28GB of weights before falling
 # back, having spent a submission slot to score what the search scores.
-MODE = "llm"
+# Back to "search" 2026-08-28, on the user's explicit instruction, after the
+# graded evidence finally reached n=2 on the LLM side. The two eras do not
+# overlap on the leaderboard:
+#
+#     search-only : 0.19 (07-25)  0.19 (07-26)  0.26 (07-27)
+#     LLM / TAAF  : 0.11 (08-11)  0.05 (08-28)
+#
+# The BEST LLM score is below the WORST search-only score. Until 08-28 this
+# comparison rested on a single 0.11 and could not be acted on; submission
+# 55840177 supplied the replication and it went down, not up. Note the
+# 0.11 -> 0.05 gap is mostly graded-run noise (the same config also moved
+# clears>=1 11/25 -> 7/25 locally), so the argument is the era separation,
+# NOT a downward trend within the LLM era.
+#
+# What this does NOT restore: the agent file has grown ~5900 lines since
+# 92656e2 (the commit behind 0.26), and while almost all of that is pure
+# LLM addition that MODE="search" never executes, 38 lines of the search
+# itself were changed or removed in the 07-28..07-30 window -- volatile-cell
+# masking, the node key, breadth widening. Those changes were never graded.
+# So this is "the current search," not "the 0.26 agent," and the local
+# rehearsal below is the check on how far apart those two are.
+MODE = "search"
 
 _MODES = ("search", "policy", "llm")
 
