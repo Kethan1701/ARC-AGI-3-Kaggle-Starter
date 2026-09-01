@@ -1088,6 +1088,70 @@ FATAL_SURVIVES_LEVEL = _env_int("ARC_FATAL_SURVIVES_LEVEL", 0)
 # without new evidence that changes this picture.
 FATAL_SURVIVES_MASK_CHANGE = _env_int("ARC_FATAL_SURVIVES_MASK_CHANGE", 0)
 
+# --- continuous volatility (measured 2026-09-01) ----------------------
+#
+# The mask is decided ONCE, off VOLATILE_WARMUP=25 samples, and frozen for
+# the rest of the run. Anything that only STARTS varying later -- a
+# counter that ticks past a digit, a trail, an animation, a progressive
+# reveal -- is never masked, stays in the state key permanently, and makes
+# every subsequent frame unique by construction.
+#
+# Measured consequence, and it is not subtle. New distinct states per
+# action, with the share of nodes that are their own strongly-connected
+# component: tr87 0.83 (99%), cn04 0.82 (96%), ar25 0.81 (99%), m0r0 0.69
+# (96%) -- against tn36 0.09 (14%) and vc33 0.04 (20%), which clear. In
+# the first group nearly every action lands on a state never seen and
+# never returned to, so "take an action never tried FROM THIS NODE", node
+# exhaustion, and BFS routing to the nearest node with untried actions are
+# all silently INERT: there is no graph, and probe-untried degenerates
+# into "try candidate 0, forever". That is the 85.3% probe share.
+#
+# So: keep watching after the freeze, and when cells are demonstrably
+# changing that the mask does not cover, fold them in and re-key.
+#
+# Three deliberate constraints, each answering something already measured:
+#
+#  * MONOTONE. Cells are only ever ADDED to `_volatile`. The key only gets
+#    coarser, so states may merge but never split, and the process
+#    terminates. Re-running the whole learner instead would re-derive the
+#    mask from a later window and could DROP cells that have gone quiet --
+#    making the key finer again, which is the opposite of the point.
+#  * BOUNDED. At most MASK_CONTINUOUS_LIMIT re-keys per game. Every re-key
+#    drops the graph, and an unbounded version would restart the search
+#    forever -- the failure STATUS_REOPEN_LIMIT already exists to prevent.
+#  * PAIRED WITH FATAL_SURVIVES_MASK_CHANGE. MASK_RELEARN_PER_LEVEL was
+#    measured and rejected (2026-08-11, sp80) for exactly one reason: a
+#    mask change calls `_reset_graph`, which drops `_fatal`/`_deaths`, and
+#    sp80 then respawned every ~28 actions, 480+ times, re-discovering and
+#    re-forgetting the same lethal move; level 2 went 3253 -> 11226
+#    actions. This flag re-keys the graph MORE often than that one did, so
+#    it inherits that failure unless fatal memory survives the transition.
+#    Do not run this without ARC_FATAL_SURVIVES_MASK_CHANGE=1, and check
+#    respawn counts, not just the aggregate -- a respawn loop on a level
+#    the agent never clears costs actions without moving the score, so the
+#    scorecard alone will not show it.
+MASK_CONTINUOUS = _env_int("ARC_MASK_CONTINUOUS", 0)
+# Samples between evaluations. Long enough that "changes almost every
+# frame" is a real rate and not a burst from one animation.
+MASK_CONTINUOUS_WINDOW = _env_int("ARC_MASK_CONTINUOUS_WINDOW", 200)
+# How many newly-varying cells justify paying for a re-key. One stray cell
+# is noise; a counter or a trail is many.
+MASK_CONTINUOUS_MIN = _env_int("ARC_MASK_CONTINUOUS_MIN", 8)
+MASK_CONTINUOUS_LIMIT = _env_int("ARC_MASK_CONTINUOUS_LIMIT", 3)
+# Change rate that counts as "not board". Separate from VOLATILE_THRESHOLD
+# so this can be moved without perturbing the original learner, whose
+# calibration is load-bearing everywhere else.
+#
+# Measured 2026-09-01: the 0.9 borrowed from the original learner fires
+# NEVER. In a 200-sample window after the freeze, ar25 has ~1000 non-masked
+# cells that change at all and a TOP rate of 24%; cn04 ~1000-1961 cells at
+# 32%; tr87 ~134 at 31%. There is no high-rate ticker to strip -- the
+# variation is broad and low-rate, which is the board, not a HUD. Lowering
+# this far enough to fire therefore masks genuine board state, and is only
+# worth running as an experiment: it answers "does a working graph help at
+# all", which is the load-bearing question for this whole direction.
+MASK_CONTINUOUS_RATE = _env_float("ARC_MASK_CONTINUOUS_RATE", VOLATILE_THRESHOLD)
+
 # The status band is what shares a row or column with the HUD without
 # ticking itself (see `status_band`). Capped for the same reason the mask
 # is: past a certain size the "band" is just the board, and re-opening
@@ -4856,6 +4920,14 @@ class MyAgent(Agent):
     # single in-place writer (`_node_breadth`, under NODE_WIDEN) rebinds
     # when it finds the map empty.
     _node_breadth: dict[int, int] = {}
+    # Post-freeze volatility watch (MASK_CONTINUOUS). `_post_prev` is None
+    # here, so the first call through `_watch_after_freeze` always takes
+    # the "first frame" branch and rebinds `_post_counts` before anything
+    # mutates it -- the shared dict below is never written to.
+    _post_counts: dict[int, int] = {}
+    _post_samples: int = 0
+    _post_prev: Optional[tuple[int, ...]] = None
+    _remasks: int = 0
     _memory: Optional["GameMemory"] = None
     _mem_start: Optional[tuple[int, ...]] = None
     _mem_path: list[int] = []
@@ -4947,6 +5019,11 @@ class MyAgent(Agent):
         self._col_changes: list[int] = []
         self._samples = 0
         self._mask_frozen = False
+        # Post-freeze volatility watch; see MASK_CONTINUOUS.
+        self._post_counts: dict[int, int] = {}
+        self._post_samples = 0
+        self._post_prev: Optional[tuple[int, ...]] = None
+        self._remasks = 0
         self._kept: Optional[tuple[int, ...]] = None   # flat indices in the key
         self._volatile: frozenset[int] = frozenset()   # flat indices excluded
         self._status_idx: tuple[int, ...] = ()         # the status readout
@@ -6747,7 +6824,7 @@ class MyAgent(Agent):
         adopted and every existing node id becomes invalid.
         """
         if self._mask_frozen:
-            return False
+            return self._watch_after_freeze(flat) if MASK_CONTINUOUS else False
 
         # Retain the warmup frames so a candidate mask can be judged by what
         # it does to them, not only by its size. Stored as bytes -- colours
@@ -6968,6 +7045,72 @@ class MyAgent(Agent):
             return False
         self._volatile = volatile
         self._kept = tuple(i for i in range(len(flat)) if i not in volatile)
+        return True
+
+    def _watch_after_freeze(self, flat: tuple[int, ...]) -> bool:
+        """Fold demonstrably-changing cells into a frozen mask. See
+        MASK_CONTINUOUS.
+
+        Returns True on the same contract as `_learn_mask`: the mask just
+        changed, every existing node id is invalid, and the caller must
+        re-key. Monotone -- cells are only added -- so the key only ever
+        gets coarser and this terminates.
+        """
+        if self._remasks >= MASK_CONTINUOUS_LIMIT:
+            return False
+
+        previous, self._post_prev = self._post_prev, flat
+        if previous is None or len(previous) != len(flat):
+            # First frame after the freeze, or the grid resized under us.
+            # Counts indexed for the old size would be meaningless.
+            self._post_counts = {}
+            self._post_samples = 0
+            return False
+
+        volatile = self._volatile
+        counts = self._post_counts
+        for index, (before, after) in enumerate(zip(previous, flat)):
+            if before != after and index not in volatile:
+                counts[index] = counts.get(index, 0) + 1
+
+        self._post_samples += 1
+        if self._post_samples < MASK_CONTINUOUS_WINDOW:
+            return False
+
+        # Same criterion the original learner uses, applied to a later
+        # window: a cell that changes on almost every frame is HUD, not
+        # board, whenever it started doing so.
+        cutoff = MASK_CONTINUOUS_RATE * self._post_samples
+        found = frozenset(i for i, n in counts.items() if n >= cutoff)
+        if SCC_REPORT:
+            # Which criterion is binding? "no cells changed at all" and
+            # "plenty changed, none at 90%" are different problems with
+            # different fixes, and the trigger firing zero times cannot
+            # distinguish them on its own.
+            top = sorted(counts.values(), reverse=True)[:5]
+            logger.info(
+                "%s: post-freeze window %d samples | %d non-masked cells "
+                "changed at all | top rates %s | >=%.0f%%: %d (need %d)",
+                self.game_id, self._post_samples, len(counts),
+                [f"{100.0 * n / self._post_samples:.0f}%" for n in top],
+                100.0 * MASK_CONTINUOUS_RATE, len(found), MASK_CONTINUOUS_MIN,
+            )
+        self._post_counts = {}
+        self._post_samples = 0
+        if len(found) < MASK_CONTINUOUS_MIN:
+            return False
+
+        self._remasks += 1
+        self._volatile = volatile | found
+        self._kept = tuple(
+            i for i in range(len(flat)) if i not in self._volatile
+        )
+        logger.info(
+            "%s: %d cells started changing after the mask froze; folding "
+            "them in (mask %d -> %d cells, re-key %d of %d)",
+            self.game_id, len(found), len(volatile), len(self._volatile),
+            self._remasks, MASK_CONTINUOUS_LIMIT,
+        )
         return True
 
     def _node_key(self, flat: tuple[int, ...]) -> int:
