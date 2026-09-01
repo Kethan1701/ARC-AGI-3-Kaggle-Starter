@@ -1188,6 +1188,18 @@ STATUS_REOPEN_LIMIT = _env_int("ARC_STATUS_REOPEN_LIMIT", 40)
 # 0 keeps it silent, which is what ships.
 BUDGET_REPORT_EVERY = _env_int("ARC_BUDGET_EVERY", 0)
 
+# Diagnostic only, and expensive enough (a Kosaraju pass over the whole
+# explored graph) that it must never run in a scored game. Rides along
+# with the budget report, so it needs ARC_BUDGET_EVERY set too.
+#
+# It answers one question the node count cannot: when the agent
+# "discovers" hundreds of states, is it getting anywhere? A state it can
+# always walk back from is not progress, it is a room it has already been
+# in. If the explored graph is ONE strongly-connected component then every
+# action so far has been reversible and nothing irreversible has happened
+# -- which is exactly what wandering looks like from the inside.
+SCC_REPORT = _env_int("ARC_SCC_REPORT", 0)
+
 FRAME_HISTORY = _env_int("ARC_FRAME_HISTORY", 8)
 KEEP_RECORDINGS = _env_int("ARC_KEEP_RECORDINGS", 0)
 
@@ -6198,8 +6210,88 @@ class MyAgent(Agent):
             presses,
             100.0 * self._class_counts["press-live"] / presses if presses else 0.0,
         )
+        if SCC_REPORT:
+            logger.info("%s: %s", self.game_id, self._scc_summary())
         self._why_counts.clear()
         self._class_counts.clear()
+
+    def _scc_summary(self) -> str:
+        """How much of the explored graph is one reversible room?
+
+        Diagnostic only; see SCC_REPORT. Kosaraju over `_edges` /
+        `_edges_rev`, iterative because the explored graph runs to ~1000
+        nodes and CPython's recursion limit is 1000.
+
+        A strongly-connected component is a set of states that can all
+        reach each other, i.e. a region the agent can wander inside and
+        always get back out of. Nothing inside one is irreversible. So
+        `largest` near 100% means the whole run has been a walk around a
+        single room, and `components` counts how many genuinely one-way
+        steps the agent has managed.
+        """
+        nodes = set(self._total)
+        for src, outs in self._edges.items():
+            nodes.add(src)
+            nodes.update(outs.values())
+        if not nodes:
+            return "scc: no graph yet"
+
+        # pass 1: finish order on the forward graph
+        order: list[int] = []
+        seen: set[int] = set()
+        for root in nodes:
+            if root in seen:
+                continue
+            stack = [(root, iter(self._edges.get(root, {}).values()))]
+            seen.add(root)
+            while stack:
+                node, it = stack[-1]
+                for nxt in it:
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(
+                            (nxt, iter(self._edges.get(nxt, {}).values()))
+                        )
+                        break
+                else:
+                    order.append(node)
+                    stack.pop()
+
+        # pass 2: components on the reverse graph, in reverse finish order
+        comp: dict[int, int] = {}
+        sizes: list[int] = []
+        for root in reversed(order):
+            if root in comp:
+                continue
+            label = len(sizes)
+            size = 0
+            stack = [root]
+            comp[root] = label
+            while stack:
+                node = stack.pop()
+                size += 1
+                for prev in self._edges_rev.get(node, ()):
+                    if prev not in comp:
+                        comp[prev] = label
+                        stack.append(prev)
+            sizes.append(size)
+
+        total = len(nodes)
+        largest = max(sizes) if sizes else 0
+        # There is no stored "current node" -- it is derived per call in
+        # choose_action -- so rebuild it from the last frame we saw.
+        here = (
+            self._node_key(self._last_flat)
+            if self._last_flat is not None
+            else None
+        )
+        mine = sizes[comp[here]] if here in comp else 0
+        singletons = sum(1 for s in sizes if s == 1)
+        return (
+            f"scc: {len(sizes)} components over {total} nodes | "
+            f"largest={largest} ({100.0 * largest / total:.0f}% of the graph) "
+            f"| singletons={singletons} | current_component={mine}"
+        )
 
     def _observe(self, node: int, latest_frame: FrameData) -> None:
         """Fold the outcome of the previous action into the graph."""
