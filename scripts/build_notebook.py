@@ -48,8 +48,16 @@ from textwrap import dedent
 # Going back to search while leaving the accelerator on rtx6000 would burn
 # GPU quota on an idle card and keep the vLLM provisioning failure surface
 # for a mode that never touches it.
+#
+# Back to "rtx6000" 2026-09-02 for one Phase A rehearsal, with MODE="llm"
+# below. This is not a re-opening of the LLM era on the old evidence: the
+# graded 0.05/0.11 runs were measured on a server whose own startup log
+# says "Maximum concurrency for 65,536 tokens per request: 11.77x" while
+# Swarm ran 25 games, i.e. 2.1x oversubscribed. See LLM_CONCURRENCY in
+# agent/my_agent.py and kops/history.log 2026-09-02 before changing this
+# back or forward.
 # ─────────────────────────────────────────────────────────────────────────────
-ACCELERATOR = "cpu"
+ACCELERATOR = "rtx6000"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT PLAYS THE GAMES
@@ -95,7 +103,21 @@ ACCELERATOR = "cpu"
 # masking, the node key, breadth widening. Those changes were never graded.
 # So this is "the current search," not "the 0.26 agent," and the local
 # rehearsal below is the check on how far apart those two are.
-MODE = "search"
+#
+# Back to "llm" 2026-09-02 for ONE Phase A rehearsal. The era comparison
+# above still stands on its own terms and is not being argued with -- what
+# changed is that the LLM era's runs are now known to have been served on
+# a 2.1x-oversubscribed KV cache. v46base measured prefix cache hit rate
+# 0.0%, prefill 2088 tok/s against generation 254 tok/s (so 8x of the
+# GPU's throughput went to re-reading conversations it had just evicted),
+# ~10 tok/s of thinking per game, a 613s median turn, and 6.7 turns per
+# game across the whole 7.5h budget, with 45% of turns cut off at the
+# tool-call cap. A 0.05 measured under that says nothing about the
+# architecture. This run tests the serving fix (LLM_CONCURRENCY,
+# LLM_CONTEXT_BUDGET), not the architecture, and it is Phase A only --
+# no submission slot is spent. If the prefix cache hit rate does not rise
+# materially above 0%, the theory is wrong and this goes back to "search".
+MODE = "llm"
 
 _MODES = ("search", "policy", "llm")
 
@@ -117,6 +139,29 @@ POLICY_MODEL_DIR = f"/kaggle/input/models/{POLICY_MODEL}"
 # what the agent puts in `"model"`, which is ARC_LLM_MODEL's default.
 SERVED_MODEL_NAME = "vrfai/Qwen3.6-27B-FP8"
 SERVER_PORT = 1234
+
+# How many games may hold the model at once, and how many tokens of
+# transcript each may carry. Both reach the agent through /tmp/llm.env.
+#
+# These are not tuning guesses; they are division. The server reports
+# "GPU KV cache size: 206,976 tokens" (50.7 GiB -- this hybrid
+# attention/Mamba model costs ~263 KB per token), and KV is spent as
+# `games in flight x context per game`. Against a 27,000s budget:
+#
+#     in flight   waves   min/game   context/game @70% KV
+#         25        1        450     ~7,600  (today, BY THRASHING)
+#         12        3        150     12,073
+#          8        4        112     18,110   <-- here
+#          6        5         90     24,147
+#       TAAF's own client-side cap:  32,768
+#
+# 8/18000 is chosen because it MORE THAN DOUBLES each game's live context
+# against today's thrashed ~7,600 while removing the preemption. Reduced
+# concurrency costs less than it sounds: 15 of the 25 games have never
+# scored anything, so splitting a scarce GPU 25 ways spends most of it on
+# games that pay zero.
+LLM_CONCURRENCY = 8
+LLM_CONTEXT_BUDGET = 18000
 
 # vLLM is installed into its OWN directory rather than over the image.
 #
@@ -542,11 +587,22 @@ def build() -> dict:
 
             if setup():
                 # Only now is the agent told to depend on it.
+                #
+                # /tmp/llm.env is the single injection point that reaches
+                # BOTH paths: the real run cell sources it in bash, and the
+                # Phase A smoke cell parses it into its subprocess env. A
+                # flag set in only one of those would rehearse a config the
+                # submission never runs, which is the "a commit deploys
+                # nothing" trap one level down.
                 with open('/tmp/llm.env', 'w') as f:
                     f.write(f'export ARC_LLM=1\\n')
                     f.write(f'export ARC_LLM_BASE_URL={{BASE}}\\n')
                     f.write(f'export ARC_LLM_MODEL={{SERVED}}\\n')
+                    f.write(f'export ARC_LLM_CONCURRENCY={LLM_CONCURRENCY}\\n')
+                    f.write(f'export ARC_LLM_CONTEXT_BUDGET={LLM_CONTEXT_BUDGET}\\n')
                 print('LLM ENABLED at', BASE)
+                print('concurrency', {LLM_CONCURRENCY},
+                      'context budget', {LLM_CONTEXT_BUDGET})
             """
         )
     )
