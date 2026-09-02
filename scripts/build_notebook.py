@@ -56,8 +56,12 @@ from textwrap import dedent
 # Swarm ran 25 games, i.e. 2.1x oversubscribed. See LLM_CONCURRENCY in
 # agent/my_agent.py and kops/history.log 2026-09-02 before changing this
 # back or forward.
+#
+# Back to "cpu" 2026-09-03. The Phase A rehearsals are done and the serving
+# fix did not move the score (see MODE below). Nothing in the LLM path is
+# waiting on GPU time any more, so the card would be idle quota.
 # ─────────────────────────────────────────────────────────────────────────────
-ACCELERATOR = "rtx6000"
+ACCELERATOR = "cpu"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT PLAYS THE GAMES
@@ -117,7 +121,29 @@ ACCELERATOR = "rtx6000"
 # LLM_CONTEXT_BUDGET), not the architecture, and it is Phase A only --
 # no submission slot is spent. If the prefix cache hit rate does not rise
 # materially above 0%, the theory is wrong and this goes back to "search".
-MODE = "llm"
+#
+# Back to "search" 2026-09-03, after TWO Phase A runs at the same config.
+# The stated exit condition was met in the direction that closes the line.
+# The serving fix WORKED, and replicated:
+#
+#                    prefix hit   KV usage   Running:8   generation
+#     v46base (25)      0.0%        92%          -        254 tok/s
+#     v48      (8)     85.7%      37.6%     626/750     196.5 tok/s
+#     v49      (8)     86.9%      38.1%     643/776     194.5 tok/s
+#
+# And it did not pay, because the arithmetic works against it. Total
+# generation throughput FELL 254 -> ~195 tok/s: dropping from 25 concurrent
+# sequences to 8 costs more in batching parallelism than the recovered
+# prefix cache returns. Spread over the same 25 games, effective thinking
+# per game went 10.2 -> 7.8 tok/s, i.e. DOWN. The new turn instrumentation
+# shows why in one number: median turn 1315s = 957s queued + 336s thinking,
+# so a game spends 73% of its life waiting for one of 8 slots.
+#
+# The scores agree: v48 0.9164, v49 0.4564 on an IDENTICAL config, against
+# v46base's unfixed 0.5088. v48 was noise. Do not re-run this at a middle
+# concurrency on the strength of the cache numbers -- the cache was never
+# the binding constraint.
+MODE = "search"
 
 _MODES = ("search", "policy", "llm")
 
