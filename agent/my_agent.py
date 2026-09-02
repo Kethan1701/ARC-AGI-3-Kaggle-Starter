@@ -2030,6 +2030,71 @@ def render_tool_result(outcome: dict[str, Any], *, limit: int = TOOL_OUTPUT_CHAR
     return text
 
 
+def estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough token count for a message list, at 4 chars per token.
+
+    Deliberately an estimate. It is used to keep the transcript clear of a
+    hard server limit and to hold the cut point still, and both survive a
+    sloppy count; running the real tokenizer over 25 growing transcripts
+    every turn would cost more than the budget saves.
+    """
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    total += len(part.get("text", ""))
+                else:
+                    # An image is not characters. Charge it a flat and
+                    # deliberately generous constant so a board can never
+                    # hide inside the budget -- a 256x256 frame lands
+                    # around 1k tokens on this model.
+                    total += 4 * 1024
+        for call in message.get("tool_calls") or ():
+            total += len(json.dumps(call, default=str))
+    return total // 4
+
+
+def trim_to_budget(
+    messages: list[dict[str, Any]],
+    budget: int,
+    headroom: float,
+) -> list[dict[str, Any]]:
+    """Drop whole oldest turns, but only once `budget` is exceeded.
+
+    Returns the list UNCHANGED whenever it fits, and that is the entire
+    point: an untouched list is a byte-identical prefix, which is the only
+    thing the server's prefix cache can pay out on. `evict_turns` trims on
+    every call by construction, so it moves the cut point every turn even
+    when nothing needed to go.
+
+    Keeps `messages[:2]` -- the system prompt and the first user turn --
+    for the same reason `evict_turns` does: the first turn carries the game
+    framing, and a model that loses it reasons about a board with no idea
+    what the game is.
+    """
+    if budget <= 0 or len(messages) <= 2:
+        return messages
+    if estimate_tokens(messages) <= budget:
+        return messages
+    target = max(1, int(budget * (1.0 - max(0.0, min(0.9, headroom)))))
+    head = messages[:2]
+    tail = list(messages[2:])
+    while tail and estimate_tokens(head + tail) > target:
+        # Drop a whole turn: the oldest message and everything after it up
+        # to the next user message. Halving a turn would leave a tool
+        # result with no call, which the server rejects.
+        del tail[0]
+        while tail and str(tail[0].get("role", "")).strip() != "user":
+            del tail[0]
+    return head + tail
+
+
 def evict_turns(
     messages: list[dict[str, Any]],
     keep_turns: int,
@@ -2428,6 +2493,68 @@ LLM_EVICT_TURNS = _env_int("ARC_LLM_EVICT_TURNS", 4)
 # long enough to approach 65536). See arc-agi-3-kaggle-gpu-infra memory
 # for the full v25/v26 numbers before changing this again.
 LLM_EVICT_SLACK = _env_int("ARC_LLM_EVICT_SLACK", 0)
+
+# How many games may hold the model at once. 0 = no limit, which is what
+# every run to date did.
+#
+# This is the knob the comment above needed and did not have. v25/v26
+# tested the prefix-cache theory by making the prefix STABLE, and the hit
+# rate never moved (v22 4.0%, v24 0.0%, v25 2.1%). That was one half of
+# the problem. A cache hit needs the prefix to be stable AND still
+# resident, and residency was never possible. vLLM says so itself, in its
+# own startup log, in every one of those runs:
+#
+#     GPU KV cache size: 206,976 tokens
+#     Maximum concurrency for 65,536 tokens per request: 11.77x
+#
+# against a Swarm that runs 25 games at once -- 2.1x oversubscribed. At
+# that pressure the server evicts and re-prefills continuously: v46base
+# (the graded 0.05) ran at 92% median KV usage, p90 98%, max 100%, with
+# 2088 tok/s of prefill against 254 tok/s of generation. That is ~10 tok/s
+# of actual thinking per game, a 613s median turn, and 6.7 turns per game
+# in 7.5 hours. Holding a prefix still cannot help when there is no room
+# to keep it, which is why stabilising it measured nothing.
+#
+# Bounding concurrency buys more context than it spends: 25 games sharing
+# 206,976 tokens hold ~7,600 each by thrashing, while 8 games hold ~18,000
+# each cleanly.
+#
+# This is a bound on IN-FLIGHT REQUESTS, deliberately not a wave
+# scheduler. The 2026-08-06 attempt at waves died on `ScorecardManager`,
+# which refuses a second `open_scorecard()` in competition mode and never
+# resets the flag (see scripts/score_competition.py's header). So: one
+# Swarm, one scorecard, all 25 threads started exactly as now -- they just
+# queue here. A queued game's transcript sits in client memory and costs
+# the GPU nothing.
+#
+# The slot is held for a WHOLE TURN, not per request. A turn's tool calls
+# share a long prefix and that is where the reuse is; releasing between
+# them invites another game to evict it.
+LLM_CONCURRENCY = _env_int("ARC_LLM_CONCURRENCY", 0)
+
+_LLM_SLOTS = threading.Semaphore(LLM_CONCURRENCY) if LLM_CONCURRENCY > 0 else None
+
+# Client-side context budget, in tokens. 0 = off, keeping the turn-count
+# eviction above.
+#
+# TAAF caps itself at 32768 against this same server's 65536 and trims by
+# TOKEN BUDGET rather than turn count, evicting extra turns once it does
+# trim so the next several requests append to an identical prefix. Their
+# comment is explicit about why: "Dropping a chunk leaves headroom so the
+# next several steps append without another eviction, keeping the prefix
+# (and its KV cache) stable."
+#
+# The unit is the whole point. LLM_EVICT_SLACK tried this idea denominated
+# in TURNS, and v26 hit six `Input length exceeds model's maximum context
+# length (65536)` rejections, because holding N more turns says nothing
+# about how many tokens they are. A token budget cannot overflow by
+# construction, which is what makes taking headroom safe.
+LLM_CONTEXT_BUDGET = _env_int("ARC_LLM_CONTEXT_BUDGET", 0)
+
+# How much of the budget to free when it does bind. Trimming to exactly
+# the budget would re-trim next turn and move the cut point again, which
+# is the v25 failure wearing a different hat.
+LLM_CONTEXT_HEADROOM = _env_float("ARC_LLM_CONTEXT_HEADROOM", 0.25)
 
 # Objects rendered into the prompt text. The full segmentation is always
 # in the namespace for the model's own code to walk; this caps only what
@@ -5945,10 +6072,21 @@ class MyAgent(Agent):
             self._llm_messages = [
                 {"role": "system", "content": build_system_prompt(available)}
             ]
+        elif LLM_CONTEXT_BUDGET > 0:
+            self._llm_messages = trim_to_budget(
+                self._llm_messages, LLM_CONTEXT_BUDGET, LLM_CONTEXT_HEADROOM
+            )
         else:
             self._llm_messages = evict_turns(self._llm_messages, LLM_EVICT_TURNS)
 
         # Exactly one image in flight: the board as it is now.
+        #
+        # This rewrites messages that are already in the prefix, which
+        # sounds like it defeats the budget above -- but it is idempotent
+        # past the newest turn: everything older was stripped on a previous
+        # pass and is already text. Only the immediately preceding turn
+        # actually changes, so the shared prefix still runs to the turn
+        # before that.
         strip_images(self._llm_messages)
         turn_text = build_turn_prompt(
             view,
@@ -5999,12 +6137,22 @@ class MyAgent(Agent):
         self._last_view = view
 
         try:
-            outcome = run_tool_conversation(
-                self._llm_messages,
-                namespace,
-                stop_check=self._turn_over,
-                label=f"{self.game_id} t{self._llm_turns + 1}",
-            )
+            # One slot for the whole turn. Acquired inside the `try` so a
+            # failure below still runs the `finally` and hands the slot
+            # back -- a leaked slot permanently shrinks the pool and would
+            # deadlock the swarm once every slot had leaked.
+            if _LLM_SLOTS is not None:
+                _LLM_SLOTS.acquire()
+            try:
+                outcome = run_tool_conversation(
+                    self._llm_messages,
+                    namespace,
+                    stop_check=self._turn_over,
+                    label=f"{self.game_id} t{self._llm_turns + 1}",
+                )
+            finally:
+                if _LLM_SLOTS is not None:
+                    _LLM_SLOTS.release()
         except Exception as exc:  # noqa: BLE001 - any transport failure counts
             # This used to retire the model on the FIRST failure, reasoning
             # that whatever broke would still be broken next time. That is
