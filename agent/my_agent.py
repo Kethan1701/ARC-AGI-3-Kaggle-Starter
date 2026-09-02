@@ -5055,6 +5055,10 @@ class MyAgent(Agent):
     _post_samples: int = 0
     _post_prev: Optional[tuple[int, ...]] = None
     _remasks: int = 0
+    # Seconds this turn spent waiting on _LLM_SLOTS, kept apart from the
+    # turn's own duration. Class-level because the tests build agents with
+    # __new__ and never run __init__.
+    _turn_queue_wait: float = 0.0
     _memory: Optional["GameMemory"] = None
     _mem_start: Optional[tuple[int, ...]] = None
     _mem_path: list[int] = []
@@ -5151,6 +5155,7 @@ class MyAgent(Agent):
         self._post_samples = 0
         self._post_prev: Optional[tuple[int, ...]] = None
         self._remasks = 0
+        self._turn_queue_wait = 0.0
         self._kept: Optional[tuple[int, ...]] = None   # flat indices in the key
         self._volatile: frozenset[int] = frozenset()   # flat indices excluded
         self._status_idx: tuple[int, ...] = ()         # the status readout
@@ -6141,8 +6146,20 @@ class MyAgent(Agent):
             # failure below still runs the `finally` and hands the slot
             # back -- a leaked slot permanently shrinks the pool and would
             # deadlock the swarm once every slot had leaked.
+            #
+            # The wait is timed separately because v48 made the combined
+            # number actively misleading: `started` is set before this, so
+            # the turn duration includes queue time, and the run read as
+            # "median turn 613s -> 1242s" -- which looked like the model
+            # got SLOWER when its per-game generation rate had in fact gone
+            # 10.2 -> 24.6 tok/s. Reporting one number for two different
+            # things cost a stop-rule criterion ("turns per game") its
+            # meaning. Splitting them is log-only: no behaviour changes, so
+            # this stays a valid replication of v48.
+            queued = time.monotonic()
             if _LLM_SLOTS is not None:
                 _LLM_SLOTS.acquire()
+            self._turn_queue_wait = time.monotonic() - queued
             try:
                 outcome = run_tool_conversation(
                     self._llm_messages,
@@ -6253,12 +6270,16 @@ class MyAgent(Agent):
         live = self._autoverify()
 
         logger.info(
-            "%s: model turn %d: %d actions in %.0fs (%s, %d tool calls, "
+            "%s: model turn %d: %d actions in %.0fs (%.0fs queued, %.0fs "
+            "thinking) (%s, %d tool calls, "
             "level %d, %d total) | predict %.2f live / %.2f claimed over "
             "%d transitions, %d verifies, %d/%d plans found, %d tours, "
             "%d goal misses, %d exhaustions",
             self.game_id, self._llm_turns, self._turn_actions,
-            time.monotonic() - started, outcome["stop"],
+            time.monotonic() - started,
+            self._turn_queue_wait,
+            time.monotonic() - started - self._turn_queue_wait,
+            outcome["stop"],
             outcome["tool_calls"], self._turn_level, self._steps,
             self._verify_live, self._verify_best,
             live["checked"] if live else 0, self._verify_calls,
