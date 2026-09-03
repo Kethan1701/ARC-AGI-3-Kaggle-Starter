@@ -246,7 +246,35 @@ MAX_CLICK_CANDIDATES = _env_int("ARC_MAX_CLICKS", 48)
 # permanently: when every reachable node is exhausted the breadth doubles
 # and the same nodes reopen, with cursors still valid because candidate
 # order is a pure function of the grid.
-BREADTH_INITIAL = _env_int("ARC_BREADTH", 12)
+#
+# 12 -> 6 on 2026-09-03, together with WIDEN_ROUTE_COST 0 -> 2. This pair
+# was measured on 2026-09-01 as `kaggle_runs/ab/b6r2` and then not
+# shipped, because it was the CONTROL arm of the per-node-breadth
+# experiment (n6r2 0.1361 vs b6r2 0.1362) and only the two arms were
+# compared to each other. Against the actual shipped default it wins:
+#
+#     default (b12, route cost 0)   0.1291   clears>=1 10
+#     b6r2                          0.1362   clears>=1 10
+#
+# and it wins in the one way this project has measured as transferring to
+# the graded set -- FEWER ACTIONS ON LEVELS ALREADY CLEARED -- on the two
+# games that carry ~79% of the score:
+#
+#     sp80 L1  78 -> 72 actions   (2.00x -> 1.85x baseline)
+#     tn36 L1  52 -> 46 actions   (1.62x -> 1.44x baseline)
+#
+# What it costs, recorded so the trade is not rediscovered as a surprise:
+# lf52 L1 516->990, r11l L1 112->242, cd82 L1 191->318, su15 L1 248->281,
+# and vc33 drops a level 2 (13 levels cleared -> 12). Every one of those
+# games is worth 0.01-0.40 out of a 3.23 total, because the metric is
+# quadratic and a clear at 16x baseline scores essentially nothing. The
+# trade is favourable BECAUSE of the quadratic, not in spite of it.
+# `clears>=1` -- the standing gate -- is unchanged at 10.
+#
+# Do not read this as "lower breadth is better." breadth6 alone is 0.1354
+# at clears>=1 9, and b6widen12 scores higher still (0.1412) while losing
+# a clear. The pairing with WIDEN_ROUTE_COST=2 is what holds the clears.
+BREADTH_INITIAL = _env_int("ARC_BREADTH", 6)
 BREADTH_MAX = _env_int("ARC_BREADTH_MAX", 256)
 
 # Consecutive repeats of an action that keeps producing new states.
@@ -539,7 +567,14 @@ LIVENESS_DEAD_RATE = _env_float("ARC_LIVENESS_DEAD_RATE", 0.10)
 #
 # The threshold is the route length at which commuting is judged not worth
 # it. 0 disables the rule entirely and reproduces v47 exactly.
-WIDEN_ROUTE_COST = _env_int("ARC_WIDEN_ROUTE_COST", 0)
+#
+# 0 -> 2 on 2026-09-03, as one change with ARC_BREADTH 12 -> 6; see
+# BREADTH_INITIAL for the evidence and the cost. It is the half of the
+# pair that holds `clears>=1` at 10: breadth 6 on its own drops it to 9.
+# At breadth 12 this flag is worth nothing on its own (b12r4 scores
+# 0.1284 against the 0.1291 default), which is why the two move together
+# and why neither should be reverted alone.
+WIDEN_ROUTE_COST = _env_int("ARC_WIDEN_ROUTE_COST", 2)
 
 # Deepen only the node that is actually stuck, instead of the whole level.
 #
